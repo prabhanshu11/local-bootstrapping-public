@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Restart Topbar
+Comment=Restart waybar if the top bar disappears
+Exec=bash -c '~/.local/bin/restart-waybar'
+Icon=view-refresh
+Type=Application
+Terminal=false

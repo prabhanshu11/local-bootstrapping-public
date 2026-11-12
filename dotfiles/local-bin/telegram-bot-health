@@ -1,0 +1,49 @@
+#!/bin/bash
+# Waybar module for Telegram Claude Bot status
+# Returns JSON: {"text": "icon", "tooltip": "status", "class": "state"}
+
+STATE_DIR="/tmp/telegram-claude-bot"
+BOT_PID="$STATE_DIR/bot.pid"
+
+# Check if watcher is running (via systemd or PID file)
+watcher_running=false
+if systemctl --user is-active telegram-watcher.service &>/dev/null; then
+    watcher_running=true
+elif [[ -f "$STATE_DIR/watcher.pid" ]]; then
+    pid=$(cat "$STATE_DIR/watcher.pid")
+    kill -0 "$pid" 2>/dev/null && watcher_running=true
+fi
+
+# Check if bot is running
+bot_running=false
+if [[ -f "$BOT_PID" ]]; then
+    pid=$(cat "$BOT_PID")
+    kill -0 "$pid" 2>/dev/null && bot_running=true
+fi
+
+# Get average boot time
+avg_boot="?"
+if [[ -f "$STATE_DIR/boot_times.json" ]]; then
+    avg_boot=$(python3 -c "
+import json
+from statistics import mean
+try:
+    data = json.load(open('$STATE_DIR/boot_times.json'))
+    times = data.get('times', [])[-10:]
+    print(f'{mean(times):.0f}' if times else '?')
+except:
+    print('?')
+" 2>/dev/null)
+fi
+
+# Determine status
+if $bot_running; then
+    # Bot is active
+    echo '{"text": "📱", "tooltip": "Telegram: Claude active", "class": "active"}'
+elif $watcher_running; then
+    # Watcher running, bot sleeping
+    echo "{\"text\": \"📴\", \"tooltip\": \"Telegram: sleeping (wake: ~${avg_boot}s)\", \"class\": \"idle\"}"
+else
+    # Everything stopped
+    echo '{"text": "❌", "tooltip": "Telegram: service stopped", "class": "stopped"}'
+fi

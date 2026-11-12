@@ -1,0 +1,14 @@
+[Unit]
+Description=btrfs data balance of / when chunks are allocated but half-empty (camera-gated, acts by itself)
+Documentation=file:///home/prabhanshu/Programs/local-bootstrapping/docs/issues/btrfs-commit-stall/desktop-space-permanent-1101.md
+ConditionPathExists=/usr/local/bin/btrfs-autobalance
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/btrfs-autobalance
+Nice=10
+IOSchedulingClass=idle
+# the script has its own 120 min deadline; this is the backstop
+TimeoutStartSec=150min
+StandardOutput=journal
+StandardError=journal

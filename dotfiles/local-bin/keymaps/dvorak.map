@@ -1,0 +1,88 @@
+# Dvorak keycode map
+# Format: character=keycode
+# Maps: which keycode produces this character in Dvorak
+#
+# Dvorak layout on QWERTY physical keyboard:
+#   QWERTY row 1: ` 1 2 3 4 5 6 7 8 9 0 - =
+#   Dvorak row 1: ` 1 2 3 4 5 6 7 8 9 0 [ ]
+#
+#   QWERTY row 2: q w e r t y u i o p [ ] \
+#   Dvorak row 2: ' , . p y f g c r l / = \
+#
+#   QWERTY row 3: a s d f g h j k l ; '
+#   Dvorak row 3: a o e u i d h t n s -
+#
+#   QWERTY row 4: z x c v b n m , . /
+#   Dvorak row 4: ; q j k x b m w v z
+
+# Letters - keycode that produces this letter in Dvorak
+a=30        # same position as QWERTY
+b=49        # QWERTY 'n' position
+c=23        # QWERTY 'i' position
+d=35        # QWERTY 'h' position
+e=32        # QWERTY 'd' position
+f=21        # QWERTY 'y' position
+g=22        # QWERTY 'u' position
+h=36        # QWERTY 'j' position
+i=34        # QWERTY 'g' position
+j=46        # QWERTY 'c' position
+k=47        # QWERTY 'v' position... wait no
+l=25        # QWERTY 'p' position
+m=50        # QWERTY 'm' position
+n=38        # QWERTY 'l' position
+o=31        # QWERTY 's' position
+p=19        # QWERTY 'r' position
+q=45        # QWERTY 'x' position
+r=24        # QWERTY 'o' position
+s=39        # QWERTY ';' position
+t=37        # QWERTY 'k' position
+u=33        # QWERTY 'f' position
+v=52        # QWERTY '.' position
+w=51        # QWERTY ',' position
+x=48        # QWERTY 'b' position
+y=20        # QWERTY 't' position
+z=53        # QWERTY '/' position
+
+# Numbers - same as QWERTY
+1=2
+2=3
+3=4
+4=5
+5=6
+6=7
+7=8
+8=9
+9=10
+0=11
+
+# Punctuation - different in Dvorak
+minus=40    # QWERTY "'" position produces '-' in Dvorak
+equal=27    # QWERTY ']' position produces '=' in Dvorak
+bracketleft=12   # QWERTY '-' position produces '[' in Dvorak
+bracketright=13  # QWERTY '=' position produces ']' in Dvorak
+semicolon=44     # QWERTY 'z' position produces ';' in Dvorak
+apostrophe=16    # QWERTY 'q' position produces "'" in Dvorak
+grave=41         # same as QWERTY
+backslash=43     # same as QWERTY
+comma=17         # QWERTY 'w' position produces ',' in Dvorak
+period=18        # QWERTY 'e' position produces '.' in Dvorak
+slash=26         # QWERTY '[' position produces '/' in Dvorak
+
+# Modifiers - same physical keys
+shift=42
+ctrl=29
+alt=56
+super=125
+
+# Special keys - same physical keys
+space=57
+enter=28
+tab=15
+backspace=14
+escape=1
+insert=110
+delete=111
+home=102
+end=107
+pageup=104
+pagedown=109

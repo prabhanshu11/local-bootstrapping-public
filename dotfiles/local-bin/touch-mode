@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# touch-mode — waybar "touch mode": a 25% taller top bar (26 -> 33 px) with
+# much bigger icons, for driving the laptop by its touchscreen. Toggled by the
+# TO/CH letter block in the bar's left section, one inch right of workspace
+# "1"; the letters are lit while touch mode is on. (The hand icon next to it
+# is mouse mode — see bar-touch.)
+#
+# HOW IT WORKS
+# ------------
+#   config.jsonc includes ~/.config/waybar/touch-mode.jsonc, which this script
+#   owns. Touch mode writes {"name": "waybar-touch", ...} into it. waybar adds
+#   the bar "name" as a CSS class on its window, and style.css scopes every
+#   touch rule under window#waybar.waybar-touch. The bar height comes from CSS
+#   min-height, not the config "height" key, so both modes live in style.css.
+#
+# WHY NOT THE OBVIOUS WAYS (all tested on waybar 0.15.0, 2026-09-24)
+# -----------------------------------------------------------------
+#   * CSS @import of a state file: a missing @import is FATAL to waybar (exit
+#     1). A machine that pulled the repo but never ran this would lose its bar.
+#     A missing config include is only a warning, and means "normal mode".
+#   * A cold restart: the repo CLAUDE.md ("Reload, Never Restart") records that
+#     a cold start can miss the first layer-surface .configure and lose a bar.
+#     So we SIGUSR2 (in-process reload, re-reads the include) and only
+#     cold-start if waybar is dead afterwards. Note: SIGUSR2 to a SECOND waybar
+#     instance aborts it (GApplication object_id != 0); the real bar is fine.
+#   * Overriding keys that config.jsonc already sets: waybar's include merge
+#     keeps the MAIN file's value on a clash, so tray icon-size lives only here.
+#   * The "name" also becomes the layer-shell namespace. Nothing matches on
+#     "waybar" today (no layerrules); "waybar-touch" still contains it anyway.
+#
+# Usage:
+#   touch-mode status    # waybar JSON for the toggle icon
+#   touch-mode toggle    # flip mode and restart waybar
+#   touch-mode on|off    # set mode and restart waybar
+#   touch-mode ensure    # write the state file if missing (install.sh), no restart
+
+set -uo pipefail
+
+STATE_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/waybar/touch-mode.jsonc"
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/touch-mode.lock"
+TOCH='TO\nCH'       # two lines in the label: a 2x2 letter block
+
+is_on() {
+    [[ -f "$STATE_FILE" ]] && grep -q '"waybar-touch"' "$STATE_FILE"
+}
+
+write_state() {
+    local mode=$1
+    mkdir -p "$(dirname "$STATE_FILE")"
+    if [[ $mode == on ]]; then
+        cat > "$STATE_FILE" <<'EOF'
+// Written by ~/.local/bin/touch-mode — do not edit by hand. Mode: ON
+{
+  "name": "waybar-touch",
+  "tray": { "icon-size": 22 }
+}
+EOF
+    else
+        cat > "$STATE_FILE" <<'EOF'
+// Written by ~/.local/bin/touch-mode — do not edit by hand. Mode: OFF
+{
+  "tray": { "icon-size": 14 }
+}
+EOF
+    fi
+}
+
+cold_start_waybar() {
+    if command -v omarchy-restart-waybar >/dev/null 2>&1; then
+        omarchy-restart-waybar
+    else
+        pkill -x waybar
+        sleep 0.3
+        hyprctl dispatch exec waybar >/dev/null 2>&1 || { setsid waybar >/dev/null 2>&1 & }
+    fi
+}
+
+reload_waybar() {
+    if pgrep -x waybar >/dev/null; then
+        pkill -SIGUSR2 -x waybar
+    else
+        cold_start_waybar
+    fi
+}
+
+set_mode() {
+    local mode=$1 previous=off
+    is_on && previous=on
+    write_state "$mode"
+    reload_waybar
+    # A bar that fails to come back is worse than the wrong mode: revert.
+    sleep 2
+    if ! pgrep -x waybar >/dev/null; then
+        write_state "$previous"
+        cold_start_waybar
+        notify-send -u critical "Touch mode" "waybar died switching touch mode to '$mode'; reverted to '$previous'" 2>/dev/null
+    fi
+}
+
+case "${1:-status}" in
+    status)
+        if is_on; then
+            printf '{"text":"%s","class":"on","tooltip":"Touch mode ON\\nTap to return to the normal bar"}\n' "$TOCH"
+        else
+            printf '{"text":"%s","class":"off","tooltip":"Touch mode OFF\\nTap for a taller bar with big icons"}\n' "$TOCH"
+        fi
+        ;;
+    toggle|on|off)
+        want=$1
+        if [[ $want == toggle ]]; then
+            if is_on; then want=off; else want=on; fi
+        fi
+        # This runs as waybar's own on-click child, and waybar is about to
+        # rebuild its modules (or be cold-started): detach first so we are not
+        # taken down with it. flock -n drops a second tap made mid-reload.
+        if [[ -z "${TOUCH_MODE_DETACHED:-}" ]]; then
+            TOUCH_MODE_DETACHED=1 setsid -f "$0" "$want" >/dev/null 2>&1
+            exit 0
+        fi
+        exec 9>"$LOCK_FILE"
+        flock -n 9 || exit 0
+        set_mode "$want"
+        ;;
+    ensure)
+        [[ -f "$STATE_FILE" ]] || write_state off
+        ;;
+    *)
+        echo "usage: touch-mode status|toggle|on|off|ensure" >&2
+        exit 2
+        ;;
+esac

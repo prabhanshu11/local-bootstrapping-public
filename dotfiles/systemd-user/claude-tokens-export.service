@@ -1,0 +1,10 @@
+[Unit]
+Description=claude-tokens-export: Claude Code tokens per day -> ~/.local/state/claude-tokens/<host>.json (laptop also pushes to the desktop)
+Documentation=file:///home/prabhanshu/Programs/local-bootstrapping/dotfiles/local-bin/claude-tokens-export
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/bin/claude-tokens-export
+TimeoutStartSec=300
+Nice=10
+IOSchedulingClass=idle

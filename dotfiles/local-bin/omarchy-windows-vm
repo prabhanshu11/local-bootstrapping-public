@@ -1,0 +1,33 @@
+#!/bin/bash
+# Wrapper for Omarchy's Windows VM helper.
+#
+# Omarchy's installer template writes `restart: always`, which makes the 8GB
+# Windows VM come back after Docker/boot even when it was manually stopped.
+# Keep the upstream command behavior, but normalize the compose/runtime policy
+# to restart=no before and after every invocation.
+
+set -u
+
+ORIGINAL="$HOME/.local/share/omarchy/bin/omarchy-windows-vm"
+COMPOSE_FILE="$HOME/.config/windows/docker-compose.yml"
+
+disable_restart_policy() {
+  if [[ -f "$COMPOSE_FILE" ]]; then
+    sed -i -E 's/^([[:space:]]*)restart:[[:space:]]*always[[:space:]]*$/\1restart: "no"/' "$COMPOSE_FILE"
+  fi
+
+  if docker inspect omarchy-windows >/dev/null 2>&1; then
+    docker update --restart=no omarchy-windows >/dev/null 2>&1 || true
+  fi
+}
+
+if [[ ! -x "$ORIGINAL" ]]; then
+  echo "Original Omarchy Windows VM command not found: $ORIGINAL" >&2
+  exit 127
+fi
+
+disable_restart_policy
+"$ORIGINAL" "$@"
+status=$?
+disable_restart_policy
+exit "$status"

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# hypr-close-ordered — close the active window, then focus the next window on the
+# SAME workspace in a predictable order, so holding/spamming Super+W walks windows
+# deterministically instead of following the dwindle tree sibling.
+#
+#   hypr-close-ordered opened   (default) next = newest-opened window (LIFO by creation)
+#   hypr-close-ordered mru                next = most-recently-used window (Windows Alt+Tab order)
+#
+# Order sources (no plugin needed): `hyprctl clients -j` lists windows in creation
+# order; `.focusHistoryID` is the MRU rank (0 = focused now, 1 = previous, ...).
+# If the window refuses to die within ~200 ms (e.g. a "save changes?" prompt),
+# focus is left alone. A lock serialises overlapping presses.
+set -u
+mode="${1:-opened}"
+
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/hypr-close-ordered.lock"
+flock -w 1 9 || exit 0
+
+active=$(hyprctl activewindow -j)
+addr=$(jq -r '.address // empty' <<<"$active")
+[[ -z "$addr" ]] && exit 0
+ws=$(jq -r '.workspace.id' <<<"$active")
+
+filter='[.[] | select(.workspace.id==$ws and .address!=$a and .mapped and (.hidden|not))]'
+case "$mode" in
+  mru) pick='min_by(.focusHistoryID)' ;;
+  *)   pick='last' ;;
+esac
+next=$(hyprctl clients -j | jq -r --arg a "$addr" --argjson ws "$ws" "$filter | $pick | .address // empty")
+
+hyprctl dispatch killactive >/dev/null
+[[ -z "$next" ]] && exit 0
+
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if ! hyprctl clients -j | jq -e --arg a "$addr" 'any(.[]; .address==$a)' >/dev/null; then
+    hyprctl dispatch focuswindow "address:$next" >/dev/null
+    exit 0
+  fi
+  sleep 0.02
+done

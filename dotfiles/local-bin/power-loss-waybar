@@ -1,0 +1,88 @@
+#!/bin/bash
+# power-loss-waybar - Waybar custom module for power-loss-monitor
+# Outputs JSON: {"text":"...", "tooltip":"...", "class":"..."}
+# Runs once at waybar start (Waybar config uses interval="once") since boot type
+# doesn't change mid-session. Do not use interval=0; current Waybar treats that
+# as a tight update loop and hover tooltips never get time to appear.
+
+STATE_DIR="$HOME/.local/state/power-monitor"
+LAST_RESULT_FILE="$STATE_DIR/last-result"
+HISTORY_FILE="$STATE_DIR/history.log"
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+emit_json() {
+    local text="$1" class="$2" tooltip="$3"
+    tooltip=$(json_escape "$tooltip")
+    printf '{"text":"%s","class":"%s","tooltip":"%s"}\n' "$text" "$class" "$tooltip"
+}
+
+if [[ ! -f "$LAST_RESULT_FILE" ]]; then
+    emit_json "" "unknown" "Power monitor: no data yet"
+    exit 0
+fi
+
+# Read state (5 lines: boot_id, event_type, timestamp, gap, full_result)
+mapfile -t state < "$LAST_RESULT_FILE"
+event_type="${state[1]:-UNKNOWN}"
+timestamp="${state[2]:-unknown}"
+gap="${state[3]:-unknown}"
+signals="${state[4]:-}"
+
+# Count power losses and find last one
+power_loss_count=0
+last_power_loss="never"
+if [[ -f "$HISTORY_FILE" ]]; then
+    power_loss_count=$(grep -c "POWER_LOSS" "$HISTORY_FILE" 2>/dev/null || echo "0")
+    last_pl_line=$(grep "POWER_LOSS" "$HISTORY_FILE" 2>/dev/null | tail -1)
+    if [[ -n "$last_pl_line" ]]; then
+        last_power_loss=$(echo "$last_pl_line" | awk '{print $1, $2}')
+    fi
+fi
+
+# Build recent history for tooltip (last 5 boots)
+recent=""
+if [[ -f "$HISTORY_FILE" ]]; then
+    while IFS= read -r line; do
+        ts=$(echo "$line" | awk '{print $1, $2}')
+        evt=$(echo "$line" | awk '{print $3}')
+        g=$(echo "$line" | awk '{print $5}')
+        case "$evt" in
+            POWER_LOSS)    recent+="  ⚡ $ts $evt $g\n" ;;
+            REBOOT)        recent+="  ↻  $ts $evt $g\n" ;;
+            *)             recent+="  ✓  $ts $evt $g\n" ;;
+        esac
+    done < <(tail -5 "$HISTORY_FILE")
+fi
+
+case "$event_type" in
+    POWER_LOSS)
+        text="⚡"
+        class="power-loss"
+        tooltip="Boot: POWER LOSS\nTime: $timestamp\nOffline gap: $gap\nSignals: $signals\n\nTotal power losses: $power_loss_count\n\nRecent boots:\n$recent"
+        ;;
+    REBOOT)
+        text="󰜉"
+        class="reboot"
+        tooltip="Boot: Clean reboot\nTime: $timestamp\nOffline gap: $gap\n\nPower losses: $power_loss_count\nLast: $last_power_loss\n\nRecent boots:\n$recent"
+        ;;
+    CLEAN_SHUTDOWN)
+        text="󰤄"
+        class="clean"
+        tooltip="Boot: Clean shutdown\nTime: $timestamp\nOffline gap: $gap\n\nPower losses: $power_loss_count\nLast: $last_power_loss\n\nRecent boots:\n$recent"
+        ;;
+    *)
+        text=""
+        class="unknown"
+        tooltip="Boot type: $event_type\nTime: $timestamp"
+        ;;
+esac
+
+emit_json "$text" "$class" "$tooltip"

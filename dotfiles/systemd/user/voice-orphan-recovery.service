@@ -1,0 +1,13 @@
+[Unit]
+Description=Recover orphaned voice recordings
+Documentation=https://github.com/prabhanshu11/omarchy-voice-typing
+After=network.target voice-gateway.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/Programs/omarchy-voice-typing/scripts/orphan-recovery.sh
+# Don't spam logs if it fails
+StandardOutput=journal
+StandardError=journal
+# Allow enough time for large backlogs
+TimeoutStartSec=600

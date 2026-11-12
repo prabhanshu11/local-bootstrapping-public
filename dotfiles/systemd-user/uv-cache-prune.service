@@ -1,0 +1,10 @@
+[Unit]
+Description=uv cache prune (unused entries only, never clean)
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+ExecStart=%h/.local/bin/disk-upkeep uv-prune
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=2h

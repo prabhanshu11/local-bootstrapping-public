@@ -1,0 +1,21 @@
+[Unit]
+Description=disk-health-logger: week-long low-impact log of btrfs commit stalls and pressure
+Documentation=file://%h/Programs/local-bootstrapping/docs/issues/btrfs-commit-stall/README.md
+
+[Service]
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=%h/.local/bin/disk-health-logger run
+Restart=always
+RestartSec=5
+# Must never be the thing that slows the machine: lowest CPU and I/O priority,
+# small memory ceiling, no swap (so its own sampling never waits on swap-in).
+Nice=19
+CPUWeight=1
+IOSchedulingClass=idle
+MemoryMax=64M
+MemorySwapMax=0
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

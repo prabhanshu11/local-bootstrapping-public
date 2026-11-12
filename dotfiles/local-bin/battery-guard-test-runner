@@ -1,0 +1,93 @@
+#!/bin/bash
+# battery-guard-test-runner — one unattended firing of the battery-guard test plan.
+# Run by battery-guard-test.timer every 30 min. Survives closed chats, reboots, suspends.
+#
+#   shell (this script)  picks the stage from the plan's Status table, runs
+#                        battery-guard-test-stage, saves the evidence to a file
+#   headless claude      reads plan + evidence, judges PASS/FAIL, appends to the
+#                        Results log, updates the Status table, commits that one file.
+#                        Its only tools: Read, Edit, and git in this repo.
+#   Stage G (AC drain, added 2026-09-24) runs on AC like E.
+#
+# Costs nothing while idle: claude is only called after a stage actually ran.
+# Turns itself off when the plan is done, a stage FAILs, claude errors, or on GIVE_UP.
+set -u
+
+REPO="${BGT_REPO:-$HOME/Programs/local-bootstrapping}"   # BGT_* = rehearsal overrides
+PLAN="$REPO/docs/issues/laptop-low-battery-suspend-TESTPLAN.md"
+STAGE_BIN="$HOME/.local/bin/battery-guard-test-stage"
+CLAUDE="$HOME/.local/bin/claude"
+OUT="$HOME/.local/state/battery-guard-test"
+GIVE_UP="2026-10-08"
+mkdir -p "$OUT"
+
+say()  { /usr/bin/logger -t battery-guard-test -- "$*"; echo "$*"; }
+note() { /usr/bin/notify-send -u "${2:-normal}" -a battery-guard "battery-guard tests" "$1" 2>/dev/null || true; }
+finish() {  # message, urgency
+    say "STOPPING: $1"; note "$1" "${2:-normal}"
+    rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/battery-guard.TEST.state"
+    /usr/bin/systemctl --user disable --now battery-guard-test.timer
+    exit 0
+}
+
+exec 9>"$OUT/lock"; /usr/bin/flock -n 9 || { say "another firing is running"; exit 0; }
+[[ -r /sys/class/power_supply/BAT0/capacity ]] || exit 0
+
+status_of() { grep -E "^\| $1 " "$PLAN" | head -1 | awk -F'|' '{gsub(/ /,"",$3); print $3}'; }
+declare -A S
+for s in E A B C D F G; do S[$s]="$(status_of "$s")"; done
+say "status: E=${S[E]} A=${S[A]} B=${S[B]} C=${S[C]} D=${S[D]} F=${S[F]} G=${S[G]}"
+
+for s in E A B C D F G; do
+    [[ "${S[$s]}" == FAIL ]] && finish "Stage $s FAILED — tests paused. See the Results log in the test plan." critical
+done
+ok() { [[ "$1" == PASS || "$1" == SKIPPED* ]]; }
+if ok "${S[E]}" && ok "${S[A]}" && ok "${S[B]}" && ok "${S[C]}" && ok "${S[D]}" && ok "${S[F]}" && ok "${S[G]}"; then
+    finish "All stages passed. Testing is complete."
+fi
+[[ "$(date +%F)" < "$GIVE_UP" ]] || finish "Give-up date $GIVE_UP reached. Open stages: $(for s in E A B C D F G; do ok "${S[$s]}" || printf '%s ' "$s"; done)"
+
+# Pick the stage. E runs anywhere; G needs AC; A-D need battery (the stage script re-checks).
+stage=""
+on_batt=0
+[[ "$(cat /sys/class/power_supply/AC/online)" == "0" ]] && (( $(cat /sys/class/power_supply/BAT0/capacity) >= 35 )) && on_batt=1
+if ! ok "${S[E]}"; then stage=E
+elif ! ok "${S[G]}" && [[ "$(cat /sys/class/power_supply/AC/online)" == "1" ]]; then stage=G
+elif (( on_batt )); then
+    for s in A B C D; do ok "${S[$s]}" || { stage=$s; break; }; done
+fi
+# F is passive: only worth a claude call once a real upper-limit suspend is in the journal.
+if [[ -z "$stage" ]] && ! ok "${S[F]}"; then
+    "$STAGE_BIN" F | grep -q "suspending now (upper limit" && stage=F
+fi
+[[ -n "$stage" || -n "${BGT_REHEARSAL_EVIDENCE:-}" ]] || { say "nothing runnable (AC=$(cat /sys/class/power_supply/AC/online))"; exit 0; }
+
+ev="$OUT/$(date +%Y%m%d-%H%M%S)-stage-$stage.log"
+if [[ -n "${BGT_REHEARSAL_EVIDENCE:-}" ]]; then
+    # Rehearsal: judge canned evidence, run nothing. Use with BGT_REPO pointing at a scratch clone.
+    stage="$BGT_STAGE"; ev="$OUT/rehearsal-stage-$stage.log"; cp "$BGT_REHEARSAL_EVIDENCE" "$ev"; rc=0
+    say "REHEARSAL: judging canned evidence for stage $stage"
+else
+    say "running stage $stage → $ev"
+    "$STAGE_BIN" "$stage" >"$ev" 2>&1
+    rc=$?
+    if [[ $stage != F ]]; then { echo; echo "=== passive stage F check"; "$STAGE_BIN" F; } >>"$ev" 2>&1; fi
+fi
+if (( rc == 3 )); then say "stage $stage: preconditions changed, not attempted"; exit 0; fi
+
+prompt="You are one unattended firing of a test plan. Read $PLAN in full, then read the evidence file $ev, which is the complete output of stage $stage (run by a shell script moments ago; you cannot and must not run the stage yourself).
+1. Judge stage $stage strictly against that stage's PASS criteria in the plan: PASS, FAIL, or NOT-ATTEMPTED (stage D only, when the laptop suspended because nobody plugged in; after 2 such results set D to SKIPPED-needs-user). Quote the exact evidence lines that decide it. Lines tagged [TEST] come from test runs; untagged guard lines are real events.
+2. Judge passive stage F from the 'passive stage F check' section: PASS only if an untagged 'suspending now (upper limit' line is followed by a clean 'PM: suspend entry' and 'PM: suspend exit'.
+3. With the Edit tool, append a dated entry to the 'Results log (append only)' section (stage, verdict, deciding lines, any number the stage asks for, anything surprising) and update the Status table rows you judged. The Status cell must be exactly one of: TODO, PASS, FAIL, SKIPPED-needs-user. Never delete or rewrite earlier log entries.
+4. Commit only that file: git -C $REPO add docs/issues/laptop-low-battery-suspend-TESTPLAN.md, then git -C $REPO commit -m '<message>' with a last line 'Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>'. Never push. Never touch any other file.
+5. Reply with 5 lines at most: stage, verdict, deciding evidence, new Status table summary."
+
+say "calling claude to judge stage $stage"
+cd "$REPO" || exit 1
+if ! "$CLAUDE" -p "$prompt" --model opus --max-turns 25 --add-dir "$OUT" \
+        --allowedTools "Read" "Edit" "Bash(git -C $REPO add:*)" "Bash(git -C $REPO commit:*)" "Bash(git -C $REPO status:*)" "Bash(git -C $REPO log:*)" \
+        </dev/null >"$ev.claude.txt" 2>&1; then
+    finish "claude could not judge stage $stage (evidence kept at $ev). Tests paused so the laptop is not suspended repeatedly." critical
+fi
+say "stage $stage judged: $(tail -5 "$ev.claude.txt" | tr '\n' ' ' | cut -c1-300)"
+note "Stage $stage done: $(status_of "$stage"). $(grep -cE '^\| [A-F] .*\| (TODO) ' "$PLAN") stage(s) left."

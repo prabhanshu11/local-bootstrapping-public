@@ -1,0 +1,15 @@
+[Unit]
+Description=wall-guard: keep the HDMI-A-1 wall (Star Trek kiosk) unobscured
+Documentation=file:///home/prabhanshu/Programs/local-bootstrapping/docs/wall-guard.md
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+# The script discovers XDG_RUNTIME_DIR / HYPRLAND_INSTANCE_SIGNATURE itself
+# and exits 0 on any host other than omarchy-desktop.
+ExecStart=%h/.local/bin/wall-guard
+TimeoutStartSec=30
+Nice=5
+
+[Install]
+WantedBy=default.target

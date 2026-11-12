@@ -1,0 +1,16 @@
+[Unit]
+Description=voice-labels: fix wrongly transcribed words + words-to-concentrate-on list (http://127.0.0.1:8771)
+Documentation=file://%h/Programs/omarchy-voice-typing/docs/local-stt.md
+After=default.target
+
+[Service]
+Environment=PYTHONUNBUFFERED=1
+# Localhost only; the bar card's link opens it. Labels: ~/Programs/voice-stt/labels
+Environment=VOICE_LABELS_HOST=127.0.0.1
+Environment=VOICE_LABELS_PORT=8771
+ExecStart=/usr/bin/python3 %h/Programs/omarchy-voice-typing/stt/webapp/app.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Detect uncommitted git changes in Programs repos
+Documentation=https://github.com/prabhanshu11/local-bootstrapping
+
+[Service]
+Type=oneshot
+ExecStart=%h/Programs/local-bootstrapping/scripts/drift-detector.sh
+# Don't fail if no display for notifications
+Environment=DISPLAY=:0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus

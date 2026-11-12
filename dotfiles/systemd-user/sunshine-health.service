@@ -1,0 +1,11 @@
+[Unit]
+Description=Sunshine streaming server health check
+After=graphical-session.target sunshine.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/streaming-health sunshine check-fix
+SuccessExitStatus=1
+
+[Install]
+WantedBy=default.target

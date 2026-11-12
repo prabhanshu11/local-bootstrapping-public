@@ -1,0 +1,2 @@
+# MacroSilicon MS2109 USB HDMI Capture Card - Disable autosuspend
+SUBSYSTEM=="usb", ATTR{idVendor}=="534d", ATTR{idProduct}=="2109", ATTR{power/control}="on"

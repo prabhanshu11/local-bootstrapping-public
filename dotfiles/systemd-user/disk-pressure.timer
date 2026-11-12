@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly root free-space check that acts (disk-upkeep pressure)
+
+[Timer]
+OnBootSec=15min
+OnCalendar=*-*-* *:17:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

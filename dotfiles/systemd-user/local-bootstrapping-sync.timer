@@ -1,0 +1,23 @@
+[Unit]
+Description=Timer for local-bootstrapping sync (every 10 minutes)
+
+[Timer]
+# OnActiveSec, not OnBootSec: in a USER manager OnBootSec counts from system boot, so a
+# session that starts later finds it already past, the service never runs, and
+# OnUnitActiveSec has nothing to count from: the timer sits "elapsed" forever.
+# That happened 2026-10-06 -> 2026-11-09 (34 days, laptop; datalake docs/incidents/
+# 2026-11-09-nas-photos-unreachable-away.md row 9). OnActiveSec counts from the
+# timer's own start, so every (re)start schedules a first run.
+OnActiveSec=2min
+
+# Then every 10 minutes
+OnUnitActiveSec=10min
+
+# Add some randomization to avoid thundering herd
+RandomizedDelaySec=30
+
+# Persist timer across reboots
+Persistent=true
+
+[Install]
+WantedBy=timers.target

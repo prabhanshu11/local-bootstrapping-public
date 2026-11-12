@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# Wrapper that adds timeout feedback and popup fallback to sudo commands.
+# After 3 failed fingerprint/YubiKey attempts, opens a popup terminal
+# for manual password entry.
+#
+# Usage: sudo-with-notify "description" [delay] -- sudo command args...
+# Examples:
+#   sudo-with-notify "Installing package" -- sudo pacman -S --noconfirm package
+#   sudo-with-notify "Quick check" 1 -- sudo -v
+#   sudo-with-notify "System update" 3 -- sudo pacman -Syu
+
+if [ $# -lt 3 ]; then
+    echo "Usage: sudo-with-notify \"description\" [delay] -- sudo command args..."
+    echo "Example: sudo-with-notify \"Installing package\" -- sudo pacman -S package"
+    exit 1
+fi
+
+# The helpers (sudo-notify, sudo-popup-auth) live next to this script in
+# ~/.local/bin, which is not on PATH everywhere: the claude window lb-drift
+# opens on the desktop had a PATH without it (2026-10-05), so the beep and the
+# password popup both failed with "command not found" and he never knew sudo
+# was waiting on him.
+export PATH="$HOME/.local/bin:$PATH"
+
+description="$1"
+shift
+
+# Check if second argument is a number (delay) or the separator
+if [[ "$1" =~ ^[0-9]+$ ]]; then
+    delay="$1"
+    shift
+else
+    delay=2  # Default delay
+fi
+
+# Find the -- separator
+if [[ "$1" != "--" ]]; then
+    echo "Error: Expected '--' separator before command"
+    echo "Usage: sudo-with-notify \"description\" [delay] -- sudo command args..."
+    exit 1
+fi
+shift  # skip the --
+
+if [ $# -eq 0 ]; then
+    echo "Error: No command specified after '--'"
+    exit 1
+fi
+
+# Check if sudo credentials are already cached
+if sudo -n true 2>/dev/null; then
+    exec "$@"
+fi
+
+MAX_ATTEMPTS=3
+authenticated=false
+
+for attempt in $(seq 1 $MAX_ATTEMPTS); do
+    # Notification with delay
+    sudo-notify "$description (attempt $attempt/$MAX_ATTEMPTS)" "$delay"
+
+    # Try to authenticate (validate only — don't run the actual command yet)
+    # This lets fingerprint/YubiKey do its thing without side effects
+    _t0=$(date +%s)
+    if sudo -v 2>/dev/null; then
+        authenticated=true
+        break
+    fi
+    # A hardware prompt waits for a touch (~15-35 s). Failing in under 2 s means the
+    # hardware stage never engaged (2026-10-01: pam_u2f rp id = pam://$(hostname); the
+    # desktop rename omarchy -> omarchy-desktop made the key answer NO_CREDENTIALS instantly).
+    # Every such miss also falls through to pam_unix and counts towards pam_faillock
+    # (deny=10 in 120 s -> even the correct password is refused), so stop retrying.
+    if [ $(( $(date +%s) - _t0 )) -lt 2 ]; then
+        echo "[sudo-with-notify] Hardware auth failed instantly (no touch prompt) — not retrying." >&2
+        echo "[sudo-with-notify] Check: hostname vs pam_u2f origin/appid, authfile, key plugged in; see docs/issues/hostname-rename-breaks-fido-sudo-2026-10-01.md" >&2
+        break
+    fi
+
+    # Auth failed — play failure beep
+    if [[ -z "$SSH_TTY" ]] || [[ "$SUDO_NOTIFY_AUDIO" == "1" ]]; then
+        (ffplay -nodisp -autoexit -t 0.3 -f lavfi -i "sine=frequency=1200:duration=0.3" >/dev/null 2>&1 &)
+    fi
+
+    if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+        notify-send -u critical -t 8000 -h string:x-canonical-private-synchronous:sudo-auth "Authentication Failed" "Attempt $attempt/$MAX_ATTEMPTS — retrying..." 2>/dev/null || true
+        # Brief pause so fprintd resets before next attempt
+        sleep 1
+    fi
+done
+
+# Authenticated on hardware — take the notification down (never leave sticky
+# criticals behind; they pin mako's surface to one monitor, see sudo-notify).
+[ "$authenticated" = true ] && sudo-notify --clear
+
+# If all 3 attempts failed — fall back to popup or tmux depending on context
+if [ "$authenticated" = false ]; then
+    signal_file="/tmp/sudo-auth-signal"
+    rm -f "$signal_file"
+
+    # Detect whether we're in an SSH session or have no local display
+    if [[ -n "$SSH_TTY" ]] || { [[ -z "$DISPLAY" ]] && [[ -z "$WAYLAND_DISPLAY" ]]; }; then
+        # SSH or headless — create tmux session and signal the local wrapper to handle it.
+        # The local wrapper (sudo-with-notify-remote) will open a terminal on the user's
+        # machine showing this tmux session, so the password prompt appears where the user is.
+        echo "[sudo-with-notify] Hardware auth failed after $MAX_ATTEMPTS attempts."
+        echo "[sudo-with-notify] No local display — requesting tmux fallback."
+
+        tmux_session="sudo-auth"
+        result_file="/tmp/sudo-auth-result"
+        tmux_signal="/tmp/sudo-with-notify-needs-tmux"
+        cmd_file="/tmp/sudo-auth-cmd.sh"
+        out_file="/tmp/sudo-auth-output"
+        rm -f "$result_file" "$tmux_signal" "$cmd_file" "$out_file"
+
+        # Kill any stale tmux session with this name
+        tmux kill-session -t "$tmux_session" 2>/dev/null || true
+
+        # sudo timestamps are per-tty, so a credential cached in the tmux pane is only usable
+        # from that same pane. Therefore the tmux session runs THE ACTUAL COMMAND right after
+        # `sudo -v`, in the same pane, and records: AUTH_OK -> DONE <rc> (or FAIL).
+        # Output is teed to $out_file so the local wrapper can print it afterwards.
+        { echo '#!/usr/bin/env bash'; printf 'cd %q\n' "$PWD"; printf '%q ' "$@"; echo; } > "$cmd_file"
+        chmod 700 "$cmd_file"
+        # The pane logic lives in a bash runner file (tmux's default-shell may not be bash).
+        run_file="/tmp/sudo-auth-run.sh"
+        cat > "$run_file" <<EOF
+#!/usr/bin/env bash
+echo "Enter sudo password for: ${description//\"/}"
+if sudo -v; then
+    echo AUTH_OK > "$result_file"
+    echo "--- authenticated, running the command ---"
+    bash "$cmd_file" 2>&1 | tee "$out_file"; rc=\${PIPESTATUS[0]}
+    echo "DONE \$rc" > "$result_file"
+    echo "--- command exited \$rc; this window closes in 5s ---"; sleep 5
+else
+    echo FAIL > "$result_file"; echo "Auth failed. This window closes in 10s..."; sleep 10
+fi
+EOF
+        chmod 700 "$run_file"
+        tmux new-session -d -s "$tmux_session" "bash $run_file"
+
+        # Write signal file so the local wrapper knows to open a terminal
+        jq -n --arg session "$tmux_session" \
+              --arg host "$(hostname)" \
+              --arg desc "$description" \
+              --arg result_file "$result_file" \
+            '{"session": $session, "host": $host, "description": $desc, "result_file": $result_file}' \
+            > "$tmux_signal"
+
+        echo "[sudo-with-notify] tmux session '$tmux_session' created. Signal written."
+        # Exit 2 = "tmux fallback needed" — the local wrapper handles opening the terminal
+        exit 2
+    else
+        # Local display available — use GUI popup
+        notify-send -u critical -t 15000 -h string:x-canonical-private-synchronous:sudo-auth "Opening Auth Popup" "3 attempts failed. Opening terminal for manual password entry." 2>/dev/null || true
+
+        sudo-popup-auth "$description" &
+        popup_pid=$!
+
+        echo "[sudo-with-notify] Popup opened (PID $popup_pid). Waiting for user to authenticate..."
+
+        # Poll every 5s for up to 30 minutes
+        max_wait=1800
+        elapsed=0
+        while [ $elapsed -lt $max_wait ]; do
+            if [ -f "$signal_file" ]; then
+                auth_result=$(cat "$signal_file" 2>/dev/null)
+                rm -f "$signal_file"
+                auth_ok=$(echo "$auth_result" | jq -r '.authenticated' 2>/dev/null)
+                if [ "$auth_ok" = "true" ]; then
+                    echo "[sudo-with-notify] User authenticated via popup."
+                    authenticated=true
+                else
+                    echo "[sudo-with-notify] User closed popup without authenticating."
+                fi
+                break
+            fi
+
+            if ! kill -0 "$popup_pid" 2>/dev/null; then
+                echo "[sudo-with-notify] Popup exited without signal file."
+                break
+            fi
+
+            sleep 5
+            elapsed=$((elapsed + 5))
+        done
+
+        kill "$popup_pid" 2>/dev/null
+        wait "$popup_pid" 2>/dev/null
+
+        if [ "$authenticated" = false ]; then
+            notify-send -u critical -t 15000 -h string:x-canonical-private-synchronous:sudo-auth "Authentication Failed" "Popup auth timed out or failed." 2>/dev/null || true
+            exit 1
+        fi
+    fi
+fi
+
+# Credentials are cached — run the actual command
+sudo-notify --clear
+"$@"
+exit $?

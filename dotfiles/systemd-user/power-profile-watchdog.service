@@ -1,0 +1,11 @@
+[Unit]
+Description=CPU clamp watchdog — log telemetry, release a stuck frequency clamp
+After=graphical-session.target
+# Separate from power-profile-monitor.service: that one enforces the AC/battery
+# POLICY every 5 min and returns early under a manual override. This one runs
+# every 60s regardless of the override, because a clamp during a manually chosen
+# performance/balanced profile is exactly the case worth healing.
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/power-profile-monitor watchdog

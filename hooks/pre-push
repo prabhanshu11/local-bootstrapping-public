@@ -1,0 +1,32 @@
+#!/bin/bash
+# pre-push hook — Runs validate-configs.sh before allowing push
+#
+# Prevents "Sync Blocked" errors on other machines by catching
+# validation failures (bad JSON, shell syntax errors in Python scripts
+# misdetected as bash, broken systemd units, etc.) before they
+# reach origin/master.
+#
+# Bypass with: git push --no-verify (emergency only)
+
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+VALIDATE="$REPO_ROOT/scripts/validate-configs.sh"
+
+if [[ ! -x "$VALIDATE" ]]; then
+    echo "WARNING: validate-configs.sh not found or not executable, skipping"
+    exit 0
+fi
+
+echo "Running pre-push validation..."
+if ! "$VALIDATE" 2>&1; then
+    echo ""
+    echo "══════════════════════════════════════════════════════"
+    echo "  PUSH BLOCKED: validate-configs.sh failed"
+    echo "  Fix the errors above before pushing."
+    echo "  Emergency bypass: git push --no-verify"
+    echo "══════════════════════════════════════════════════════"
+    exit 1
+fi
+
+echo "Pre-push validation passed."

@@ -1,0 +1,8 @@
+[Unit]
+Description=Datalake Health Check and Auto-Heal
+After=datalake.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Programs/datalake
+ExecStart=/bin/bash -c 'if systemctl --user is-active --quiet datalake.service; then if ! curl -f -s http://localhost:8766/health > /dev/null 2>&1; then systemctl --user restart datalake.service; fi; fi'

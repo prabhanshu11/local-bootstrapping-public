@@ -1,0 +1,6 @@
+[Unit]
+Description=Internet guard: revert the home-LAN dongle if it ever breaks internet via wlan0
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/internet-guard

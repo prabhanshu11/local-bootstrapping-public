@@ -1,0 +1,11 @@
+[Unit]
+Description=Check and adjust power profile every 5 minutes
+
+[Timer]
+# Calendar spec, not OnUnitActiveSec — see power-profile-watchdog.timer for the
+# dead-timer trap this avoids.
+OnCalendar=*-*-* *:0/5:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

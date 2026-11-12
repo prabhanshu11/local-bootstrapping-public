@@ -1,0 +1,27 @@
+[Unit]
+Description=Voice Gateway (canonical bin/voice-gateway — Rust/Go via build.sh)
+Documentation=https://github.com/prabhanshu11/omarchy-voice-typing
+After=network.target
+
+[Service]
+Type=simple
+# Kill any orphan process using port 8765 before starting
+ExecStartPre=-/usr/bin/fuser -k 8765/tcp
+ExecStart=%h/Programs/omarchy-voice-typing/bin/voice-gateway
+# Clean up on stop
+ExecStopPost=-/usr/bin/fuser -k 8765/tcp
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=%h/Programs/omarchy-voice-typing
+
+# Load API keys from .env file and pass password store
+EnvironmentFile=%h/Programs/omarchy-voice-typing/.env
+ExecStartPre=/bin/bash -c 'systemctl --user set-environment DEEPGRAM_API_KEY="$(pass show api/deepgram 2>/dev/null || echo "")"'
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voice-gateway
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,61 @@
+#!/bin/bash
+# Improved sudo notification with hardware detection and dual sounds
+# Usage: sudo-notify-improved "description of sudo action"
+
+set -euo pipefail
+
+MESSAGE="${1:-Sudo authentication required}"
+
+# Audio output priority (from CLAUDE.md)
+# Auto12 BT speakers > Jabra > laptop speakers
+
+# Hardware detection
+detect_fido_key() {
+    # Check if FIDO key is attached via lsusb
+    # Common FIDO devices: Yubico, Nitrokey, SoloKeys
+    lsusb 2>/dev/null | grep -iE "(yubico|nitrokey|solo|fido|u2f)" >/dev/null 2>&1
+    return $?
+}
+
+play_sound_attach_key() {
+    # Sound 1: Lower pitch (500Hz) - "Please attach FIDO key"
+    # 3 short beeps
+    beep -f 500 -l 150 -n -d 100 -n -f 500 -l 150 -n -d 100 -n -f 500 -l 150 2>/dev/null || true
+}
+
+play_sound_touch_key() {
+    # Sound 2: Higher pitch (1000Hz) - "Please touch FIDO key"
+    # Single longer beep
+    beep -f 1000 -l 300 2>/dev/null || true
+}
+
+# Detect FIDO key status
+if detect_fido_key; then
+    # FIDO key detected - play "touch" sound
+    play_sound_touch_key
+
+    notify-send -u critical "🔐 Touch FIDO Key" \
+        "Authentication required:\n$MESSAGE\n\n✅ FIDO key detected - please touch" 2>/dev/null || true
+
+    echo "✅ FIDO key detected - please touch to authenticate"
+else
+    # FIDO key not detected - play "attach" sound
+    play_sound_attach_key
+
+    notify-send -u critical "🔌 Attach FIDO Key" \
+        "Authentication required:\n$MESSAGE\n\n⚠️ FIDO key not detected - please attach and touch" 2>/dev/null || true
+
+    echo "⚠️ FIDO key not detected - please attach first"
+
+    # Wait for key to be attached (up to 10 seconds)
+    for i in {1..10}; do
+        sleep 1
+        if detect_fido_key; then
+            play_sound_touch_key
+            notify-send -u normal "✅ FIDO Key Detected" \
+                "Key attached - please touch to authenticate" 2>/dev/null || true
+            echo "✅ FIDO key now detected - please touch"
+            break
+        fi
+    done
+fi

@@ -1,0 +1,9 @@
+[Unit]
+Description=Clipboard health check and auto-repair
+After=graphical-session.target elephant.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/clipboard-health --fix
+# Don't fail if the script returns non-zero (issues found but couldn't fix)
+SuccessExitStatus=1

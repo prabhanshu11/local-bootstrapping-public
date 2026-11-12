@@ -1,0 +1,17 @@
+[Unit]
+Description=bar-touch: touch-native waybar (tap popups, long-press cards) and touchscreen mouse mode
+Documentation=file://%h/Programs/local-bootstrapping/docs/touch-bar.md
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/.local/bin/bar-touch daemon
+Restart=on-failure
+RestartSec=2
+# Apps launched from the bar are children of this daemon: never kill them on
+# restart, only the daemon itself.
+KillMode=process
+
+[Install]
+WantedBy=graphical-session.target

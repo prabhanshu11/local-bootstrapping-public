@@ -1,0 +1,375 @@
+#!/usr/bin/env bash
+# kbd-backlight — ThinkPad keyboard backlight: control, keep-on watchdog, waybar widget.
+#
+# WHY THIS EXISTS
+# ---------------
+# On the ThinkPad T14 Gen 1 (BIOS N2XET43W / EC N2XHT27W) the keyboard backlight
+# switches itself off a few seconds after Fn+Space. Diagnosed 2026-08-07:
+#
+#   * /sys/class/leds/tpacpi::kbd_backlight/brightness STAYS at its set value
+#     the whole time (polled 2s x 12 — never moved off 1).
+#   * brightness_hw_changed also stays put, so the kernel is never told.
+#   * No TLP, no powertop, no laptop-mode. hypridle is INACTIVE and its
+#     shortest listener is 900s anyway.
+#   * systemd-backlight@leds:tpacpi::kbd_backlight ran once at boot and exited.
+#   * trigger is [none].
+#
+# => Nothing in Linux turns it off. The embedded controller does it on its own
+#    inactivity timer, without notifying the kernel. There is no kernel module
+#    parameter and no BIOS setting for this timeout on this model, so the only
+#    available fix is to re-issue the ACPI set-level call periodically.
+#    Writing the SAME value to sysfs is NOT a no-op: the LED class always calls
+#    down into thinkpad_acpi's brightness_set, which re-runs the EC method and
+#    restarts the EC's timer.
+#
+# RESOURCE BUDGET (hard requirement)
+# ----------------------------------
+#   * sleep-based loop, never a busy loop; interval floor of 2s, default 5s.
+#   * the daemon only exists while keep-on is ARMED. Disarming stops the unit,
+#     so the disarmed cost is exactly zero.
+#   * logs go to stdout -> the journal (rotated). Never to a file in $HOME.
+#     Messages are edge-triggered, not per-tick.
+#   * the unit carries MemoryMax/CPUQuota as a belt-and-braces cap.
+#
+# DOES NOT FIGHT THE USER
+# -----------------------
+# thinkpad_acpi DOES report user Fn+Space presses into sysfs (that is what
+# brightness_hw_changed is for). So each tick compares sysfs against the
+# remembered level: if they differ, the user pressed Fn+Space, and we adopt
+# their choice instead of stomping it. Adopting level 0 disarms keep-on and
+# exits — "I pressed it off" always wins.
+#
+# Usage:
+#   kbd-backlight status            # waybar JSON
+#   kbd-backlight get               # print current level
+#   kbd-backlight set <0..max>
+#   kbd-backlight cycle             # 0 -> 1 -> 2 -> 0
+#   kbd-backlight keep on|off|toggle
+#   kbd-backlight daemon            # the watchdog (run by kbd-backlight-keeper.service)
+
+set -uo pipefail
+
+LED_NAME="tpacpi::kbd_backlight"
+LED_DIR="/sys/class/leds/$LED_NAME"
+BRIGHTNESS_FILE="$LED_DIR/brightness"
+MAX_FILE="$LED_DIR/max_brightness"
+
+STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/kbd-backlight"
+KEEP_FLAG="$STATE_DIR/keep-on"
+LEVEL_FILE="$STATE_DIR/level"
+INTERVAL_FILE="$STATE_DIR/interval"
+
+SERVICE="kbd-backlight-keeper.service"
+WAYBAR_SIGNAL=11          # must match "signal" in waybar/config.jsonc
+DEFAULT_INTERVAL=5        # seconds; floor enforced at 2
+DEFAULT_LEVEL=1
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+have_device() { [[ -e $BRIGHTNESS_FILE ]]; }
+
+# `read <` instead of $(cat …): a builtin with no fork. The daemon calls
+# current_level() every tick, so this is the difference between 2 forks per
+# tick and none.
+slurp() {
+    local __v=""
+    read -r __v < "$1" 2>/dev/null
+    printf '%s' "$__v"
+}
+
+max_level() {
+    local m
+    m=$(slurp "$MAX_FILE")
+    [[ $m =~ ^[0-9]+$ ]] && (( m > 0 )) || m=2
+    printf '%s' "$m"
+}
+
+current_level() {
+    local v
+    v=$(slurp "$BRIGHTNESS_FILE")
+    [[ $v =~ ^[0-9]+$ ]] || v=0
+    printf '%s' "$v"
+}
+
+# Write a level. Direct sysfs first (works from a systemd --user unit once the
+# udev rule has made the attribute group-writable by `input`); fall back to
+# brightnessctl, which reaches logind's SetBrightness over D-Bus and therefore
+# only works from inside a real login session.
+write_level() {
+    local v=$1
+    # -w guard first: without it bash itself prints "Permission denied" for the
+    # failed redirection, and that message escapes the command's own 2>/dev/null
+    # (it is the shell speaking, not printf) — which would spam the journal once
+    # per tick on any machine missing the udev rule.
+    if [[ -w $BRIGHTNESS_FILE ]] && { printf '%s' "$v" > "$BRIGHTNESS_FILE"; } 2>/dev/null; then
+        return 0
+    fi
+    brightnessctl --device="$LED_NAME" --class=leds set "$v" >/dev/null 2>&1 && return 0
+    return 1
+}
+
+keep_armed() { [[ -e $KEEP_FLAG ]]; }
+
+saved_level() {
+    local v
+    v=$(cat "$LEVEL_FILE" 2>/dev/null)
+    [[ $v =~ ^[0-9]+$ ]] || v=$DEFAULT_LEVEL
+    printf '%s' "$v"
+}
+
+save_level() {
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    printf '%s\n' "$1" > "$LEVEL_FILE" 2>/dev/null
+}
+
+poll_interval() {
+    local i
+    i=$(cat "$INTERVAL_FILE" 2>/dev/null)
+    [[ $i =~ ^[0-9]+$ ]] && (( i >= 2 )) || i=$DEFAULT_INTERVAL
+    printf '%s' "$i"
+}
+
+nudge_waybar() {
+    pkill "-RTMIN+$WAYBAR_SIGNAL" -x waybar 2>/dev/null
+    return 0
+}
+
+notify() {
+    command -v notify-send >/dev/null 2>&1 && \
+        notify-send -a "Keyboard backlight" -t 2000 "$1" "${2:-}" 2>/dev/null
+    return 0
+}
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+cmd_get() {
+    have_device || { echo "no $LED_NAME on this machine" >&2; return 1; }
+    current_level
+    echo
+}
+
+cmd_set() {
+    have_device || { echo "no $LED_NAME on this machine" >&2; return 1; }
+    local want=$1 max
+    max=$(max_level)
+    [[ $want =~ ^[0-9]+$ ]] || { echo "usage: kbd-backlight set <0..$max>" >&2; return 2; }
+    (( want > max )) && want=$max
+
+    if ! write_level "$want"; then
+        echo "failed to write $BRIGHTNESS_FILE (udev rule not installed?)" >&2
+        nudge_waybar
+        return 1
+    fi
+
+    # Keep the remembered level in step so the watchdog re-asserts what the
+    # user just chose, and let level 0 mean "off, stop holding it on".
+    save_level "$want"
+    if keep_armed && (( want == 0 )); then
+        cmd_keep off quiet
+    fi
+    nudge_waybar
+}
+
+cmd_cycle() {
+    have_device || { echo "no $LED_NAME on this machine" >&2; return 1; }
+    local cur max next
+    cur=$(current_level); max=$(max_level)
+    next=$(( (cur + 1) % (max + 1) ))
+    cmd_set "$next"
+}
+
+# Scroll wheel: step without wrapping, so flicking up repeatedly can't drop the
+# light back to off.
+cmd_step() {
+    have_device || { echo "no $LED_NAME on this machine" >&2; return 1; }
+    local dir=$1 cur max next
+    cur=$(current_level); max=$(max_level)
+    if [[ $dir == up ]]; then
+        next=$(( cur + 1 )); (( next > max )) && next=$max
+    else
+        next=$(( cur - 1 )); (( next < 0 )) && next=0
+    fi
+    (( next == cur )) && return 0
+    cmd_set "$next"
+}
+
+cmd_keep() {
+    local action=${1:-toggle} quiet=${2:-}
+    have_device || { echo "no $LED_NAME on this machine" >&2; return 1; }
+
+    case $action in
+        toggle) keep_armed && action=off || action=on ;;
+    esac
+
+    mkdir -p "$STATE_DIR" 2>/dev/null
+
+    case $action in
+        on)
+            local lvl
+            lvl=$(current_level)
+            # Arming while the light is off is meaningless — hold it at the
+            # last non-zero level instead, or fall back to 1.
+            if (( lvl == 0 )); then
+                lvl=$(saved_level)
+                (( lvl == 0 )) && lvl=$DEFAULT_LEVEL
+            fi
+            save_level "$lvl"
+            : > "$KEEP_FLAG"
+            write_level "$lvl" || true
+            systemctl --user start "$SERVICE" >/dev/null 2>&1
+            [[ $quiet == quiet ]] || notify "Keep-on armed" "Holding level $lvl"
+            ;;
+        off)
+            rm -f "$KEEP_FLAG"
+            # The daemon also exits on its own once the flag is gone; stopping
+            # is just so it happens now rather than up to one interval later.
+            systemctl --user stop "$SERVICE" >/dev/null 2>&1
+            [[ $quiet == quiet ]] || notify "Keep-on disarmed" "Backlight will time out again"
+            ;;
+        *)
+            echo "usage: kbd-backlight keep on|off|toggle" >&2
+            return 2
+            ;;
+    esac
+    nudge_waybar
+}
+
+# The watchdog. Exits 0 (not a failure) whenever there is nothing to do, so
+# Restart=on-failure can never turn a missing device into a restart storm.
+cmd_daemon() {
+    if ! have_device; then
+        echo "no $LED_NAME on this machine — nothing to keep on, exiting cleanly"
+        return 0
+    fi
+    if ! keep_armed; then
+        echo "keep-on is not armed — exiting cleanly"
+        return 0
+    fi
+
+    local interval want cur max failed=0 asserts=0
+    interval=$(poll_interval)
+    max=$(max_level)
+    want=$(saved_level)
+    (( want > max )) && want=$max
+
+    echo "keeping $LED_NAME at level $want, re-asserting every ${interval}s"
+
+    while keep_armed; do
+        # Inline read, not cur=$(current_level): command substitution forks a
+        # subshell, and this runs every tick forever. Builtin `read` does not.
+        cur=""
+        read -r cur < "$BRIGHTNESS_FILE" 2>/dev/null
+        [[ $cur =~ ^[0-9]+$ ]] || cur=0
+
+        # sysfs disagreeing with what we hold means the USER pressed Fn+Space
+        # (thinkpad_acpi reports hardware changes; the EC timeout does not).
+        # Adopt their choice rather than fighting it.
+        if [[ $cur != "$want" ]]; then
+            echo "user changed level $want -> $cur, adopting"
+            want=$cur
+            save_level "$want"
+            if (( want == 0 )); then
+                echo "user switched the backlight off — disarming keep-on"
+                rm -f "$KEEP_FLAG"
+                nudge_waybar
+                break
+            fi
+            nudge_waybar
+        fi
+
+        if write_level "$want"; then
+            if (( failed == 1 )); then
+                echo "writes recovered after $asserts failures"
+                failed=0; asserts=0
+            fi
+        else
+            # Edge-triggered logging only: one line per failure episode, never
+            # one per tick, so the journal cannot be flooded.
+            (( asserts++ ))
+            if (( failed == 0 )); then
+                failed=1
+                echo "cannot write $BRIGHTNESS_FILE and brightnessctl fallback failed;" \
+                     "install the udev rule (system/udev-rules/99-kbd-backlight.rules)." \
+                     "Suppressing further write errors."
+            fi
+        fi
+
+        sleep "$interval"
+    done
+
+    echo "keep-on disarmed — exiting"
+    return 0
+}
+
+cmd_status() {
+    # Machines without the LED (the desktop) emit empty text so waybar hides
+    # the module entirely.
+    if ! have_device; then
+        printf '{"text":"","tooltip":"","class":"unavailable"}\n'
+        return 0
+    fi
+
+    local cur max armed icon classes tip svc interval
+    cur=$(current_level)
+    max=$(max_level)
+    interval=$(poll_interval)
+    keep_armed && armed=1 || armed=0
+
+    # Solid keyboard glyph at both on-levels: the outline variant (U+F0D48)
+    # is unreadable at the bar's 12px. Level is carried by colour (CSS class),
+    # exactly like the screen-backlight module does it.
+    case $cur in
+        0) icon="󰨞"; classes='"off"' ;;
+        1) icon="󰌌"; classes='"low"' ;;
+        *) icon="󰌌"; classes='"high"' ;;
+    esac
+
+    if (( armed )); then
+        # Colour the pin inline with Pango rather than via a .keep CSS class:
+        # a class would repaint the whole label and destroy the level colour.
+        # Single quotes inside the attribute keep the JSON free of escapes.
+        icon="${icon}<span foreground='#a6e3a1'>󰐃</span>"
+        svc=$(systemctl --user is-active "$SERVICE" 2>/dev/null)
+        if [[ $svc == active ]]; then
+            tip="Keyboard backlight: $cur/$max — HELD ON\nRe-asserting every ${interval}s\n\nLeft click: release hold\nRight click / scroll: change level"
+        else
+            classes="$classes,\"error\""
+            tip="Keyboard backlight: $cur/$max — hold armed but watchdog is $svc\nRun: systemctl --user start $SERVICE\n\nLeft click: release hold"
+        fi
+    else
+        tip="Keyboard backlight: $cur/$max — will time out (EC firmware)\n\nLeft click: hold it on\nRight click / scroll: change level"
+    fi
+
+    # Escape for JSON: the tooltip is the only free-form field and it only ever
+    # contains our own literal text, so escaping newlines is sufficient.
+    tip=${tip//$'\n'/\\n}
+    printf '{"text":"%s","alt":"%s","tooltip":"%s","class":[%s]}\n' \
+        "$icon" "$cur" "$tip" "$classes"
+}
+
+# ── dispatch ─────────────────────────────────────────────────────────────────
+
+case "${1:-status}" in
+    status)  cmd_status ;;
+    get)     cmd_get ;;
+    set)     cmd_set "${2:-}" ;;
+    cycle)   cmd_cycle ;;
+    up)      cmd_step up ;;
+    down)    cmd_step down ;;
+    keep)    cmd_keep "${2:-toggle}" "${3:-}" ;;
+    daemon)  cmd_daemon ;;
+    *)
+        cat >&2 <<EOF
+usage: kbd-backlight <command>
+
+  status            waybar JSON
+  get               print current level
+  set <0..max>      set level
+  cycle             0 -> 1 -> 2 -> 0
+  up | down         step one level, no wrap
+  keep on|off|toggle    arm/disarm the keep-on watchdog
+  daemon            run the watchdog (systemd runs this)
+EOF
+        exit 2
+        ;;
+esac

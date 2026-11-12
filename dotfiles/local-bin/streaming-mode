@@ -1,0 +1,30 @@
+#!/bin/bash
+# streaming-mode - Enable/disable headless streaming display
+
+case "${1:-status}" in
+    on)
+        if ! hyprctl monitors | grep -q "HEADLESS-1"; then
+            hyprctl output create headless HEADLESS-1
+            # Position FAR away to prevent cursor from accidentally entering
+            hyprctl keyword monitor "HEADLESS-1,1920x1080@60,-9999x-9999,1"
+            hyprctl keyword workspace "10, monitor:HEADLESS-1, default:true"
+            notify-send "Streaming" "Headless display enabled (workspace 10)" || true
+        fi
+        ;;
+    off)
+        if hyprctl monitors | grep -q "HEADLESS-1"; then
+            hyprctl output remove HEADLESS-1
+            notify-send "Streaming" "Headless display disabled" || true
+        fi
+        ;;
+    toggle)
+        if hyprctl monitors | grep -q "HEADLESS-1"; then
+            streaming-mode off
+        else
+            streaming-mode on
+        fi
+        ;;
+    status)
+        hyprctl monitors | grep -q "HEADLESS-1" && echo "enabled" || echo "disabled"
+        ;;
+esac

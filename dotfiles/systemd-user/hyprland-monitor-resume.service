@@ -1,0 +1,18 @@
+[Unit]
+Description=Re-apply Hyprland monitor layout after resume from suspend
+Documentation=file:///home/prabhanshu/Programs/local-bootstrapping/dotfiles/hypr/scripts/monitor-resume-watch.sh
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.config/hypr/scripts/monitor-resume-watch.sh
+Restart=on-failure
+RestartSec=10
+# A crash-loop here would hammer the system bus; cap it.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin"
+
+[Install]
+WantedBy=graphical-session.target

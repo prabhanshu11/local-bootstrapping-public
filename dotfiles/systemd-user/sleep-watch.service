@@ -1,0 +1,14 @@
+[Unit]
+Description=Verify every suspend, whoever asked (sleep-watch: logind PrepareForSleep -> verdict -> post-mortem)
+# See the sleep-watch header and docs/issues/laptop-suspend-fails-freeze-2026-10-03.md §sleep-watch.
+# It never inhibits, blocks or delays a sleep and never kills anything.
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sleep-watch
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=default.target

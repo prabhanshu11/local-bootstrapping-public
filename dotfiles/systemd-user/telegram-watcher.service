@@ -1,0 +1,14 @@
+[Unit]
+Description=Telegram Watcher (wakes Claude bot on demand)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Programs/phone-file-transfer
+ExecStart=%h/Programs/phone-file-transfer/telegram-watcher.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,159 @@
+#!/bin/bash
+# Send keyboard shortcut using correct keycodes for current layout
+#
+# Usage:
+#   layout-send "ctrl+v"           # Send Ctrl+V
+#   layout-send "ctrl+shift+v"     # Send Ctrl+Shift+V
+#   layout-send "super+alt+d"      # Send Super+Alt+D
+#   layout-send --layout us "ctrl+v"  # Force US layout mapping
+#
+# This solves the Dvorak/QWERTY keycode mismatch problem:
+# - ydotool sends keycodes (physical positions)
+# - But we want to send characters
+# - This script looks up correct keycode for character in current layout
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+KEYMAPS_DIR="/home/prabhanshu/.local/bin/keymaps"
+
+# Ensure ydotool socket is set
+if [[ -z "${YDOTOOL_SOCKET:-}" ]]; then
+    export YDOTOOL_SOCKET="/run/user/$(id -u)/.ydotool_socket"
+fi
+
+# Parse arguments
+FORCE_LAYOUT=""
+SHORTCUT=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --layout)
+            FORCE_LAYOUT="$2"
+            shift 2
+            ;;
+        --help|-h)
+            echo "Usage: layout-send [--layout LAYOUT] SHORTCUT"
+            echo ""
+            echo "Examples:"
+            echo "  layout-send 'ctrl+v'        # Paste"
+            echo "  layout-send 'ctrl+shift+v'  # Terminal paste"
+            echo "  layout-send 'shift+insert'  # Alternative paste"
+            echo ""
+            echo "Options:"
+            echo "  --layout LAYOUT  Force specific layout (us, dvorak)"
+            exit 0
+            ;;
+        *)
+            SHORTCUT="$1"
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$SHORTCUT" ]]; then
+    echo "Error: No shortcut specified" >&2
+    echo "Usage: layout-send [--layout LAYOUT] SHORTCUT" >&2
+    exit 1
+fi
+
+# Detect layout
+detect_layout() {
+    if [[ -n "$FORCE_LAYOUT" ]]; then
+        echo "$FORCE_LAYOUT"
+        return
+    fi
+
+    local layout
+    layout=$(hyprctl devices -j 2>/dev/null | jq -r '
+        .keyboards[] |
+        select(.main == true or (.name | ascii_downcase | contains("keyboard"))) |
+        .active_keymap' 2>/dev/null | head -1)
+
+    case "$layout" in
+        *[Dd]vorak*)
+            echo "dvorak"
+            ;;
+        *)
+            echo "us"
+            ;;
+    esac
+}
+
+# Load keymap for layout
+load_keymap() {
+    local layout="$1"
+    local mapfile="$KEYMAPS_DIR/${layout}.map"
+
+    if [[ ! -f "$mapfile" ]]; then
+        echo "Error: Keymap not found: $mapfile" >&2
+        exit 1
+    fi
+
+    # Read keymap into associative array
+    declare -gA KEYMAP
+    while IFS='=' read -r key value; do
+        # Skip comments and empty lines
+        [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
+        # Strip inline comments and whitespace from value
+        value="${value%%#*}"
+        value="${value%% *}"
+        value="${value%%$'\t'*}"
+        KEYMAP["$key"]="$value"
+    done < "$mapfile"
+}
+
+# Get keycode for key name
+get_keycode() {
+    local key="$1"
+    key="${key,,}"  # lowercase
+
+    if [[ -n "${KEYMAP[$key]:-}" ]]; then
+        echo "${KEYMAP[$key]}"
+    else
+        echo "Error: Unknown key: $key" >&2
+        exit 1
+    fi
+}
+
+# Parse shortcut and send via ydotool
+send_shortcut() {
+    local shortcut="$1"
+    local -a keys
+    local -a press_cmds
+    local -a release_cmds
+
+    # Split shortcut by '+'
+    IFS='+' read -ra keys <<< "$shortcut"
+
+    # Build ydotool key commands
+    for key in "${keys[@]}"; do
+        key="${key,,}"  # lowercase
+        key="${key// /}"  # trim whitespace
+
+        local keycode
+        keycode=$(get_keycode "$key")
+
+        # Press: keycode:1, Release: keycode:0
+        press_cmds+=("${keycode}:1")
+        release_cmds=("${keycode}:0" "${release_cmds[@]}")  # prepend for LIFO release
+    done
+
+    # Execute: press all, then release all (in reverse order)
+    local all_cmds=("${press_cmds[@]}" "${release_cmds[@]}")
+
+    # Debug output
+    if [[ "${DEBUG:-}" == "1" ]]; then
+        echo "Layout: $(detect_layout)" >&2
+        echo "Shortcut: $shortcut" >&2
+        echo "ydotool key ${all_cmds[*]}" >&2
+    fi
+
+    ydotool key "${all_cmds[@]}"
+}
+
+# Main
+LAYOUT=$(detect_layout)
+declare -A KEYMAP
+load_keymap "$LAYOUT"
+send_shortcut "$SHORTCUT"

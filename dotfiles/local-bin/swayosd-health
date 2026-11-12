@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# swayosd-health — detect and repair a swayosd-server that is alive but deaf.
+#
+# Why this exists (2026-07-25):
+#   swayosd-server.service already restarts the process if it SIGSEGVs (that was
+#   the July 19 fix). But there is a SECOND failure mode that process
+#   supervision cannot see: the process stays alive while silently losing its
+#   D-Bus name.
+#
+#   swayosd-client talks to `org.erikreider.swayosd-server` on the session bus.
+#   GTK separately registers `org.erikreider.swayosd` for the GApplication.
+#   After an external-monitor hotplug the GTK4/Wayland output handling can trip
+#   (`gdk_monitor_set_scale: assertion 'scale > 0.' failed`) and the process
+#   ends up holding ONLY the GApplication name. systemd sees a healthy running
+#   process and never restarts it, while every volume key and every waybar
+#   scroll tick fails with:
+#       org.freedesktop.DBus.Error.ServiceUnknown: The name is not activatable
+#
+#   Observed live: server up 5 days, volume dead ~2 of them, zero crashes.
+#
+# So: poll the NAME, not the process.
+#
+# THIRD failure mode (2026-08-07): the process stays alive AND keeps both
+#   D-Bus names, but the GTK main loop wedges — observed after a GPU reset
+#   (`vkWaitForFences(): VK_ERROR_DEVICE_LOST` spam in the journal). Every
+#   swayosd-client call then hangs forever instead of erroring. Name polling is
+#   blind to this, and so are Peer.Ping / Introspect (GDBus answers those from
+#   its worker thread, verified live against a wedged server). The only probe
+#   that detects it is a method dispatched through the main loop — we call
+#   org.gtk.Actions.DescribeAll on the GApplication object with a timeout.
+#
+# So: poll the name AND prove the main loop still dispatches.
+
+set -uo pipefail
+
+# Overridable only so the unhealthy branch can be exercised on demand:
+#   SWAYOSD_HEALTH_BUS_NAME=org.invalid.nope swayosd-health
+# Normal operation never sets these.
+BUS_NAME="${SWAYOSD_HEALTH_BUS_NAME:-org.erikreider.swayosd-server}"
+UNIT="${SWAYOSD_HEALTH_UNIT:-swayosd-server.service}"
+
+log() { echo "swayosd-health: $*"; }
+
+name_owned() {
+    busctl --user list --acquired 2>/dev/null | grep -qF "$BUS_NAME"
+}
+
+# Proves the GTK main loop is dispatching, not just that the process holds a
+# name. DescribeAll is read-only (no OSD popup, no volume change) but is
+# handled in the main loop, so it times out when the server is wedged (e.g.
+# after VK_ERROR_DEVICE_LOST). Peer.Ping would NOT work here — GDBus answers
+# it from a worker thread even when the main loop is dead.
+main_loop_responds() {
+    timeout 3 busctl --user call org.erikreider.swayosd /org/erikreider/swayosd \
+        org.gtk.Actions DescribeAll >/dev/null 2>&1
+}
+
+# Only meaningful once the unit is actually meant to be up. During boot, or on a
+# machine where the graphical session is down, an unowned name is expected and
+# restarting would just fight the startup sequence.
+if ! systemctl --user is-active --quiet "$UNIT"; then
+    log "$UNIT not active — nothing to check"
+    exit 0
+fi
+
+if name_owned; then
+    if main_loop_responds; then
+        log "healthy — $BUS_NAME is owned and the main loop responds"
+        exit 0
+    fi
+    log "UNHEALTHY — $BUS_NAME is owned but the main loop is not dispatching"
+    log "            (wedged, e.g. after GPU reset); every client call would"
+    log "            hang forever. Restarting."
+else
+    log "UNHEALTHY — $UNIT is running but $BUS_NAME has no owner; volume keys and"
+    log "            waybar scroll would fail with ServiceUnknown. Restarting."
+fi
+
+systemctl --user restart "$UNIT" || {
+    log "restart failed"
+    exit 1
+}
+
+# The name is acquired a beat after the process starts; give it a moment.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.5
+    if name_owned && main_loop_responds; then
+        log "recovered — $BUS_NAME reacquired and responding"
+        exit 0
+    fi
+done
+
+log "restarted but $BUS_NAME still unowned/unresponsive after 5s"
+exit 1

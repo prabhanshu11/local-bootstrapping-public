@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# hypr-alt-tab — Windows-style Alt+Tab for Hyprland: most-recently-used order,
+# hold Alt and tap Tab to go deeper, release Alt to settle, Esc to cancel.
+#
+#   hypr-alt-tab start    first Alt+Tab: snapshot MRU, jump to the previous window
+#   hypr-alt-tab next     Tab again while Alt is held (→ also works)
+#   hypr-alt-tab prev     ← while Alt is held (Alt+Shift is the layout toggle, so no Shift+Tab)
+#   hypr-alt-tab commit   Alt released: fix up the MRU so it matches Windows
+#   hypr-alt-tab cancel   Esc: go back to the window you started from
+#
+# Scope is the current desktop: every workspace visible on a monitor right now,
+# i.e. both halves of a workspace-pair desktop (single monitor: that workspace).
+# MRU rank is Hyprland's own `.focusHistoryID` (0 = focused now), no daemon needed.
+# The submap (bindings-alt-tab.conf) is entered by the bind itself, not here, so
+# a quick tap-and-release can never leave it stuck; a lock serialises the calls.
+# Debug: hyprctl keyword env HYPR_ALT_TAB_LOG,/path/to/log (empty value = off).
+set -u
+cmd="${1:-start}"
+state="${XDG_RUNTIME_DIR:-/tmp}/hypr-alt-tab.state"
+
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/hypr-alt-tab.lock"
+flock -w 2 9 || exit 0
+[[ -n "${HYPR_ALT_TAB_LOG:-}" ]] && echo "$(date +%T.%N) $cmd submap=$(hyprctl submap)" >>"$HYPR_ALT_TAB_LOG"
+
+focus() { hyprctl --batch "dispatch focuswindow address:$1 ; dispatch bringactivetotop" >/dev/null; }
+
+# state file: line 1 = selected index, lines 2.. = MRU addresses (index 0 = origin)
+load() { mapfile -t lines <"$state" 2>/dev/null || lines=(); idx=${lines[0]:-0}; mru=("${lines[@]:1}"); }
+save() { printf '%s\n' "$idx" "${mru[@]}" >"$state"; }
+
+case "$cmd" in
+  start)
+    visible=$(hyprctl monitors -j | jq -c '[.[] | select(.disabled|not) | .activeWorkspace.id]')
+    mapfile -t mru < <(hyprctl clients -j | jq -r --argjson ws "$visible" '
+      [.[] | select(.mapped and (.hidden|not) and (.workspace.id as $w | $ws | index($w)))]
+      | sort_by(.focusHistoryID) | .[].address')
+    idx=0
+    if (( ${#mru[@]} > 1 )); then idx=1; focus "${mru[1]}"; fi
+    save
+    ;;
+  next|prev)
+    load
+    n=${#mru[@]}
+    (( n > 1 )) || exit 0
+    if [[ $cmd == next ]]; then idx=$(( (idx + 1) % n )); else idx=$(( (idx - 1 + n) % n )); fi
+    focus "${mru[idx]}"
+    save
+    ;;
+  commit|cancel)
+    hyprctl dispatch submap reset >/dev/null
+    load
+    # Cycling focused windows 1..k in turn, which scrambles the focus history.
+    # Windows ends with the pick first and everything else in its old order
+    # (cancel: the old order untouched), so replay that order in one batch,
+    # oldest first. A plain Alt+Tab tap (pick 1) is already right.
+    (( ${#mru[@]} > 0 )) || exit 0
+    [[ $cmd == cancel ]] && idx=0
+    if (( idx != 1 )); then
+      want=("${mru[idx]}")
+      for i in "${!mru[@]}"; do (( i != idx )) && want+=("${mru[i]}"); done
+      batch=""
+      for (( i = ${#want[@]} - 1; i >= 0; i-- )); do batch+="dispatch focuswindow address:${want[i]} ; "; done
+      hyprctl --batch "${batch}dispatch bringactivetotop" >/dev/null
+    fi
+    rm -f "$state"
+    ;;
+  *)
+    echo "usage: hypr-alt-tab start|next|prev|commit|cancel" >&2; exit 2 ;;
+esac

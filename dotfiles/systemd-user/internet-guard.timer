@@ -1,0 +1,9 @@
+[Unit]
+Description=Internet guard every 2 min
+
+[Timer]
+OnCalendar=*:0/2
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

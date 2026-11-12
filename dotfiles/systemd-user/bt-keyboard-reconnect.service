@@ -1,0 +1,11 @@
+[Unit]
+Description=Bluetooth keyboard auto-reconnect
+After=bluetooth.target
+
+[Service]
+ExecStart=/home/prabhanshu/.local/bin/bt-keyboard-reconnect
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Recover Wi-Fi links that associate but never receive an IP
+Documentation=file:///home/prabhanshu/Programs/local-bootstrapping/docs/wifi-dormant-wedge.md
+After=iwd.service systemd-networkd.service
+Wants=iwd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/wifi-wedge-watchdog
+# The script escalates to `systemctl restart iwd`, so it must not be tied to
+# iwd's own cgroup lifecycle.
+StandardOutput=journal
+StandardError=journal

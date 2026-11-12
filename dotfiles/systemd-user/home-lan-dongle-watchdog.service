@@ -1,0 +1,6 @@
+[Unit]
+Description=Keep the USB Wi-Fi dongle on the home LAN SSID (laptop dual Wi-Fi)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/home-lan-dongle-watchdog

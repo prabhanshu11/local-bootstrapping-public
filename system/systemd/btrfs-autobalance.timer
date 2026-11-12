@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly check: balance / when unallocated < 8 GiB and data slack >= 12 GiB
+
+[Timer]
+OnBootSec=20min
+OnCalendar=*-*-* *:47:00
+RandomizedDelaySec=2min
+Persistent=true
+Unit=btrfs-autobalance.service
+
+[Install]
+WantedBy=timers.target

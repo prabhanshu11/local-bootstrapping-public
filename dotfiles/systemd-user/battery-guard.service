@@ -1,0 +1,11 @@
+[Unit]
+Description=Battery guard — forced suspend at the upper and lower battery limits
+After=graphical-session.target
+# See the battery-guard script header and docs/issues/laptop-low-battery-suspend.md
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/battery-guard
+# The script sleeps through its grace period, then sleep-verified may take
+# up to 3 attempts (~60-120 s each when a freeze fails) before it returns.
+TimeoutStartSec=900

@@ -1,0 +1,227 @@
+#!/bin/bash
+# hyprwhspr-toggle - Robust voice typing toggle
+#
+# Fixes paste buffering issues by:
+# 1. Killing any pending ydotool key processes before new recordings
+# 2. NOT touching clipboard (user's clipboard is sacred)
+# 3. Switching BT headphones to HFP profile for mic access
+#
+# The "buffered paste" issue happens when:
+# - ydotool key commands are queued in the socket
+# - Previous paste operations haven't completed
+# - New recording triggers before old paste finishes
+#
+# BT profile switching:
+# - A2DP profile = high quality playback, NO mic
+# - HFP/HSP profile = bidirectional audio with mic (lower quality)
+# - Must switch to HFP before recording, back to A2DP after
+# - WirePlumber autoswitch is too slow (race condition with hyprwhspr verification)
+#
+# This script kills pending ydotool key operations but NEVER touches clipboard.
+#
+# Usage: hyprwhspr-toggle
+# Replaces: hyprwhspr toggle
+
+set -euo pipefail
+
+RECORDING_STATUS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/hyprwhspr/recording_status"
+RECORDING_CONTROL_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/hyprwhspr/recording_control"
+
+# Logging — all output goes to stderr (captured by journalctl via voice-toggle.service)
+log() { echo "[TOGGLE] [$(date '+%H:%M:%S')] $*" >&2; }
+
+# Rate-limiting for BT profile switches to prevent xHCI controller crashes.
+# Rapid A2DP↔HFP cycling can overflow the xHCI stop-endpoint command queue,
+# causing the controller to die and taking down WiFi+BT on the same USB bus.
+# See: reset-usb-wifi for recovery when this happens anyway.
+BT_SWITCH_LOCKFILE="/tmp/hyprwhspr-bt-switch.lock"
+BT_SWITCH_MIN_INTERVAL=5  # seconds between profile switches
+
+# Check if currently recording.
+# Checks the recording_status file with a staleness guard: if hyprwhspr restarted
+# (e.g. after SIGKILL) but the file still says "true", it's stale. Compare the file's
+# mtime against the hyprwhspr process start time — if the process is newer than the
+# file, the file is a leftover from a crashed session.
+is_recording() {
+    [[ -f "$RECORDING_STATUS_FILE" ]] || return 1
+    [[ "$(cat "$RECORDING_STATUS_FILE" 2>/dev/null)" == "true" ]] || return 1
+
+    # Staleness check: if hyprwhspr PID started after the status file was written,
+    # the file is stale from a crash. Clean it up and report not recording.
+    local pid
+    pid=$(pgrep -f 'hyprwhspr-patch/main.py' | head -1)
+    if [[ -n "$pid" ]]; then
+        local file_mtime proc_start
+        file_mtime=$(stat -c %Y "$RECORDING_STATUS_FILE" 2>/dev/null || echo 0)
+        proc_start=$(stat -c %Y "/proc/$pid" 2>/dev/null || echo 0)
+        if (( proc_start > file_mtime )); then
+            log "Stale recording_status detected (process newer than file), clearing"
+            rm -f "$RECORDING_STATUS_FILE"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+# Kill any pending ydotool key processes (prevents buffered pastes)
+kill_pending_ydotool_keys() {
+    pkill -9 -f "^ydotool key" 2>/dev/null || true
+    pkill -9 -f "ydotool key [0-9]" 2>/dev/null || true
+}
+
+# Get the active Bluetooth headset card (if any)
+get_bt_card() {
+    pactl list cards short 2>/dev/null | grep "bluez" | awk '{print $2}' | head -1
+}
+
+# Get the current BT profile
+get_bt_profile() {
+    local card="$1"
+    pactl list cards 2>/dev/null | grep -A100 "Name: $card" | grep "Active Profile:" | head -1 | sed 's/.*Active Profile: //'
+}
+
+# Check if enough time has passed since last BT profile switch
+bt_switch_allowed() {
+    if [[ ! -f "$BT_SWITCH_LOCKFILE" ]]; then
+        return 0  # No previous switch recorded
+    fi
+    local last_switch now elapsed
+    last_switch=$(stat -c %Y "$BT_SWITCH_LOCKFILE" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    elapsed=$((now - last_switch))
+    if [[ $elapsed -lt $BT_SWITCH_MIN_INTERVAL ]]; then
+        log "BT profile switch rate-limited (${elapsed}s < ${BT_SWITCH_MIN_INTERVAL}s cooldown)"
+        return 1
+    fi
+    return 0
+}
+
+# Record that a BT profile switch just happened
+bt_switch_record() {
+    touch "$BT_SWITCH_LOCKFILE"
+}
+
+# Switch BT profile to HFP for mic access (before recording)
+switch_to_hfp() {
+    local card
+    card=$(get_bt_card)
+    [[ -z "$card" ]] && return 0
+
+    local profile
+    profile=$(get_bt_profile "$card")
+
+    # A playback-only device (no headset-* profile, e.g. FiiO BR13) has no mic:
+    # nothing to switch to, the laptop mic records (2026-09-25).
+    if ! pactl list cards | awk -v c="Name: $card" '
+            index($0, c) {in_card=1; next}
+            /^Card #/ {in_card=0}
+            in_card && $1 ~ /^headset-/ && /available: yes/ {found=1}
+            END {exit !found}'; then
+        return 0
+    fi
+
+    # Only switch if currently on A2DP (no mic)
+    if [[ "$profile" == a2dp-* ]]; then
+        if ! bt_switch_allowed; then
+            return 0
+        fi
+        pactl set-card-profile "$card" headset-head-unit 2>/dev/null || true
+        bt_switch_record
+        # Wait for PipeWire to initialize the HFP source.
+        # Recording already started (start sent before switch_to_hfp), so this
+        # only affects when mic audio starts flowing — capture records silence until ready.
+        sleep 1.5
+    fi
+}
+
+# Switch BT profile back to A2DP for high-quality playback (after recording)
+switch_to_a2dp() {
+    local card
+    card=$(get_bt_card)
+    [[ -z "$card" ]] && return 0
+
+    local profile
+    profile=$(get_bt_profile "$card")
+
+    # Only switch if currently on HFP
+    if [[ "$profile" == headset-* ]]; then
+        if ! bt_switch_allowed; then
+            return 0
+        fi
+        pactl set-card-profile "$card" a2dp-sink 2>/dev/null || true
+        bt_switch_record
+    fi
+}
+
+# Target window: voice typing types into the window that was focused when the
+# recording STARTED, even if focus moves while speaking (the user taps the bar,
+# other windows, popups). Chosen by the user 2026-09-27 ("Where I started")
+# after text landed in the wrong window. The hyprwhspr patch (main.py) reads
+# this file, refocuses the window just before typing, then deletes it.
+# HYPRWHSPR_TARGET_WINDOW (an address, set by bar-touch when its card opened)
+# wins over the active window: a touch on the card must not change the target.
+TARGET_WINDOW_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/hyprwhspr/target_window"
+
+capture_target_window() {
+    local json="" src="toggle"
+    if [[ -n "${HYPRWHSPR_TARGET_WINDOW:-}" ]]; then
+        json=$(hyprctl clients -j 2>/dev/null | jq -c --arg a "$HYPRWHSPR_TARGET_WINDOW" \
+            'map(select(.address == $a)) | .[0] // empty' 2>/dev/null) || json=""
+        src="bar-touch"
+        [[ -z "$json" ]] && log "HYPRWHSPR_TARGET_WINDOW=$HYPRWHSPR_TARGET_WINDOW is gone, using the active window"
+    fi
+    if [[ -z "$json" ]]; then
+        json=$(hyprctl activewindow -j 2>/dev/null | jq -c 'select(.address? and .class != "mic-osd")' 2>/dev/null) || json=""
+        src="toggle"
+    fi
+    if [[ -z "$json" ]]; then
+        rm -f "$TARGET_WINDOW_FILE"
+        log "Target window: none focused (text goes wherever focus is at the end)"
+        return 0
+    fi
+    jq -c --arg src "$src" --argjson ts "$(date +%s.%N)" \
+        '{address, class, title, workspace: .workspace.name, source: $src, captured_at: $ts}' \
+        <<<"$json" > "$TARGET_WINDOW_FILE.tmp" 2>/dev/null \
+        && mv -f "$TARGET_WINDOW_FILE.tmp" "$TARGET_WINDOW_FILE" \
+        && log "Target window ($src): $(jq -r '"\(.class) / \(.title) \(.address)"' "$TARGET_WINDOW_FILE")" \
+        || rm -f "$TARGET_WINDOW_FILE.tmp"
+    return 0
+}
+
+# Lockfile to prevent concurrent toggle invocations.
+# During BT switch (3s sleep), recording_status still says "false",
+# so a second toggle press would send another "start" to the FIFO.
+# mkdir is atomic on Linux — no race conditions.
+TOGGLE_LOCKFILE="/tmp/hyprwhspr-toggle.lock"
+
+# Main toggle logic
+main() {
+    # Prevent concurrent toggle invocations (BT switch takes 3s)
+    if ! mkdir "$TOGGLE_LOCKFILE" 2>/dev/null; then
+        echo "[TOGGLE] Already running, ignoring duplicate invocation" >&2
+        exit 0
+    fi
+    trap 'rmdir "$TOGGLE_LOCKFILE" 2>/dev/null' EXIT
+
+    if is_recording; then
+        # Currently recording - stop it
+        kill_pending_ydotool_keys
+        echo "stop" > "$RECORDING_CONTROL_FILE"
+        # Switch back to A2DP after a short delay (let hyprwhspr finish text injection)
+        (sleep 3 && switch_to_a2dp) &
+    else
+        # Not recording - start new recording
+        kill_pending_ydotool_keys
+        # Remember where the text must go before anything can move focus (~10 ms).
+        capture_target_window || true
+        # Start recording IMMEDIATELY for instant feedback — no waiting for BT switch.
+        # Audio capture begins right away (silence/noise until BT mic activates).
+        echo "start" > "$RECORDING_CONTROL_FILE"
+        # BT profile switch runs after start — blocks this script (holds lockfile)
+        # but recording is already in progress so user gets instant OSD feedback.
+        switch_to_hfp
+    fi
+}
+
+main "$@"

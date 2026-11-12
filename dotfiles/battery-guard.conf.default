@@ -1,0 +1,64 @@
+# ~/.config/battery-guard.conf — HIS file. Battery limits and what happens when a
+# suspend fails. Written ONCE by `battery-guard --init-conf` (2026-10-03) with the
+# values that were in effect that day. Agents and scripts never edit it — with ONE
+# exception: on 2026-10-06 an agent set the values below from his answers that day
+# (the block marked "set by him 2026-10-06"). Change it by hand; battery-guard and
+# sleep-verified obey it on the next tick. Lines are bash `KEY=value`; delete a
+# line to get the default from the scripts back. Background: local-bootstrapping
+# docs/issues/laptop-low-battery-suspend.md and
+# docs/issues/laptop-suspend-fails-freeze-2026-10-03.md (§ 2026-10-06 decisions)
+
+# set by him 2026-10-06 (4 % is the new zero)
+# His words: "sleep after a higher percentage then ... since The battery is old and
+# it falls immediately after 4%. We need to assume that 4% is the new zero." and,
+# on raising the lower limit from 7 %: "yes raise it". Every limit moved up.
+
+# --- battery-guard: the two limits (percent, one decimal allowed) -------------
+# One sticky notification when the battery falls to this percent.
+WARN=30
+# Suspend ONCE per discharge at this percent (wake it and keep working).
+UPPER=25
+# Suspend EVERY time it is found awake at or below this displayed percent.
+LOWER=12
+# Seconds of "plug in to cancel" warning before a forced suspend.
+GRACE=180
+# Seconds before retrying when a forced suspend did NOT happen (verified by sleep-verified).
+GRACE_RETRY=30
+
+# --- battery-guard: draining while plugged in (charger too weak) ---------------
+# Percent of full capacity lost over the window that counts as "draining on AC".
+AC_DRAIN_PCT=1
+# Window in seconds for that measurement.
+AC_DRAIN_WINDOW=600
+# Power profile set while draining on AC (only ever lowered from performance).
+AC_DRAIN_PROFILE=balanced
+
+# --- sleep-verified: what to do when a suspend fails ---------------------------
+# 1 = abort his own hung FUSE mounts (gvfs, document portal) that block the
+#     freeze, then retry once. 0 = never.
+UNSTICK_FUSE=1
+# Kill the processes the kernel names as refusing to freeze, then retry once:
+#   never | lower (only at battery-guard's LOWER limit) | always (also when he suspends)
+KILL_BLOCKERS=lower
+# The last resort: none | hibernate | poweroff. Taken (a) at once when a LOWER-limit
+# suspend still fails after the whole ladder, and (b) directly by battery-guard on
+# a discharging tick at or below LAST_RESORT_PCT (displayed), after a
+# LAST_RESORT_GRACE-second card (no time left at 8 % for a suspend that may fail).
+# hibernate refuses (log + Telegram, laptop stays on / falls back to the lower-limit
+# suspend) while resume= is not on the kernel command line.
+LAST_RESORT=hibernate
+LAST_RESORT_PCT=8
+LAST_RESORT_GRACE=30
+# 1 = remount the gvfs / document-portal mounts it aborted, after the suspend.
+REMOUNT_AFTER_UNSTICK=1
+
+# --- activity grace ("if I am back at the keyboard ... the sleep should be interrupted")
+# When a sleep nobody verified fails, sleep-watch retries it after this many seconds
+# unless a key, the mouse or the touchscreen is used (sticky card says so).
+RETRY_GRACE=60
+# watcher       = activity cancels sleep-watch's retry only
+# watcher+upper = also cancels battery-guard's UPPER-limit grace (counts as woken)
+# never         = no grace, retry at once (the 2026-10-03 behaviour)
+# The LOWER limit never cancels on activity (2026-09-17: it "should again suspend
+# without my permission").
+ACTIVITY_CANCELS=watcher

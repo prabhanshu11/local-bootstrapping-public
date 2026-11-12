@@ -1,0 +1,40 @@
+#!/bin/bash
+# hypr-unlock - Restore hyprlock after Hyprland start
+#
+# After starting Hyprland, the screen is blank because hyprlock doesn't
+# show the fingerprint prompt. This script enables session lock restore
+# and launches hyprlock so the fingerprint/password prompt appears.
+#
+# Usage:
+#   hypr-unlock              # unlock with hyprlock
+#   hypr-unlock --restart-idle  # also restart hypridle
+
+# Auto-detect Hyprland instance signature
+HYPR_DIR="/run/user/$(id -u)/hypr"
+if [ ! -d "$HYPR_DIR" ]; then
+    echo "Error: Hyprland not running (no $HYPR_DIR)" >&2
+    exit 1
+fi
+
+# Find the instance signature (first directory in /run/user/UID/hypr/)
+INSTANCE_SIG=$(ls "$HYPR_DIR" | head -1)
+if [ -z "$INSTANCE_SIG" ]; then
+    echo "Error: No Hyprland instance found in $HYPR_DIR" >&2
+    exit 1
+fi
+
+export HYPRLAND_INSTANCE_SIGNATURE="$INSTANCE_SIG"
+
+# Enable session lock restore
+hyprctl keyword misc:allow_session_lock_restore 1
+
+# Launch hyprlock
+hyprctl dispatch exec hyprlock
+
+# Optionally restart hypridle
+if [ "${1:-}" = "--restart-idle" ]; then
+    killall hypridle 2>/dev/null
+    hypridle &
+    disown
+    echo "hypridle restarted"
+fi

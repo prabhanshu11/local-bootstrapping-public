@@ -1,0 +1,10 @@
+[Unit]
+Description=wall-guard every 2 minutes (desktop wall)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# prefill-shell <workdir> <command text...>
+# Opens an interactive bash in <workdir> with <command text> pre-typed on the
+# prompt, NOT executed: he reads the comment and presses Enter himself.
+# Used after a crash to hand back `claude --resume <id>  # what it was` per
+# window (2026-10-06 failed hibernate, 2026-10-18 ghostty segfault).
+# Launch on a workspace with:
+#   (absolute path: hyprctl exec has no ~/.local/bin on PATH)
+#   hyprctl dispatch exec "[workspace N silent] ghostty -e /home/prabhanshu/.local/bin/prefill-shell '<dir>' '<cmd>'"
+# Mechanism: readline binds the terminal's "device status" reply (ESC [ 0 n)
+# to the command text, then asks for the status (ESC [ 5 n); the reply types
+# the text onto the prompt. A harmless ^[[0n may echo once.
+cd "$1" || exit 1
+shift
+cmd="$*"
+rc=$(mktemp)
+cat > "$rc" <<RC
+[ -f ~/.bashrc ] && source ~/.bashrc
+bind '"\e[0n": "$(printf '%s' "$cmd" | sed 's/"/\\"/g')"'
+printf '\e[5n'
+rm -f "$rc"
+RC
+exec bash --rcfile "$rc" -i

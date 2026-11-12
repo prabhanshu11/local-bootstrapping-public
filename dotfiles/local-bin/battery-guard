@@ -1,0 +1,443 @@
+#!/bin/bash
+# battery-guard — forced suspend at two battery limits, so the laptop never
+# runs itself flat while awake.
+#
+# Why: the only stock low-battery action was UPower at 2%, and it routed into
+# suspend-then-hibernate, which fails on this machine. The laptop died awake
+# on 2026-09-13 and 2026-09-16. Suspend itself is cheap here (measured
+# 0.4-1.0 %/h), so parking in suspend with charge left is safe for hours.
+# See docs/issues/laptop-low-battery-suspend.md.
+#
+# Behaviour while on battery:
+#   <= WARN   one notification
+#   <= UPPER  suspend ONCE per discharge (after GRACE seconds). Wake it and you
+#             can keep working.
+#   <= LOWER  suspend after GRACE seconds EVERY time it is found awake.
+# Plugging in clears the state and cancels a pending suspend.
+#
+# Behaviour while PLUGGED IN but draining (2026-09-18: the laptop drew more
+# than its 60 W USB-C charger could give for 14 h, ran 100% -> 0% with the
+# charger connected, and died; status read "Not charging"/"Charging" the
+# whole way, so nothing that keys on "Discharging" — this guard, UPower —
+# ever acted):
+#   energy_now fell >= AC_DRAIN_PCT % of energy_full over the last
+#   AC_DRAIN_WINDOW s  ->  "AC drain" mode: one critical notification, power
+#   profile dropped to balanced (with power-profile-monitor's override file so
+#   its 5-minute auto-switch does not flip it back), then the SAME two limits:
+#   <= UPPER suspend once, <= LOWER suspend every time. Cancelled during the
+#   grace if the charger catches up (energy rising) or it is unplugged (the
+#   on-battery rules take over next tick). Cleared when energy rises again.
+#
+# 2026-10-03: every suspend goes through sleep-verified, which proves the laptop
+# actually slept (suspend_stats), unsticks hung FUSE mounts, and reports a
+# failure. 01:39 that night a process stuck in FUSE made every suspend fail
+# silently; this guard set upper_done BEFORE its attempt, never retried, and the
+# laptop died at 0 %. Now: upper_done only after a verified sleep; a failed
+# attempt retries next tick after GRACE_RETRY s; the lower limit also catches
+# 7.x % (displayed percent <= LOWER). docs/issues/laptop-suspend-fails-freeze-2026-10-03.md
+#
+# 2026-10-06, his words: "sleep after a higher percentage then. if a policy where
+# there are two sleeps not possible we have can hibernate, but since The battery
+# is old and it falls immediately after 4%. We need to assume that 4% is the new
+# zero." / raise the lower limit: "yes raise it" / "give me some grace period if
+# I am back at the keyboard or do something then the sleep should be interrupted."
+# So: every limit shifted up (WARN 30, UPPER 25, LOWER 12), and a LAST_RESORT
+# (hibernate) at LAST_RESORT_PCT (8): on a discharging tick at <= 8 % (displayed)
+# it hibernates directly after a LAST_RESORT_GRACE (30 s) card — no time left at
+# 8 % for the 5-minute-style notice or for a suspend that may fail — and
+# sleep-verified takes it at once when a LOWER-limit suspend fails after its whole
+# ladder. When hibernate is not available (no resume= on the kernel command line)
+# the <= 8 % tick falls back to the lower-limit suspend. ACTIVITY_CANCELS=
+# watcher+upper also lets a key/mouse/touch cancel the UPPER grace (counts as
+# "woken": upper_done); the LOWER limit never cancels on activity (2026-09-17:
+# it "should again suspend without my permission").
+#
+# Limits and knobs: ~/.config/battery-guard.conf is HIS file (written once by
+# `battery-guard --init-conf` from dotfiles/battery-guard.conf.default when
+# absent; agents never edit it afterwards — the one exception, 2026-10-06, set
+# the values above on his answers). It overrides the defaults below.
+#
+# Run by battery-guard.timer once a minute. Test without draining:
+#   BATTERY_GUARD_FAKE_CAPACITY=24 BATTERY_GUARD_FAKE_STATUS=Discharging battery-guard --dry-run
+# AC-drain test (12 ticks, one simulated minute apart, on a scratch state file):
+#   S=/tmp/bg.test; rm -f $S; for i in $(seq 0 11); do
+#     BATTERY_GUARD_STATE=$S BATTERY_GUARD_FAKE_AC=1 BATTERY_GUARD_FAKE_NOW=$((1000000+i*60)) \
+#     BATTERY_GUARD_FAKE_ENERGY=$((40000000-i*100000)) battery-guard --dry-run; done
+
+set -u
+
+WARN=30
+UPPER=25
+LOWER=12
+GRACE=180
+LAST_RESORT=hibernate # none|hibernate|poweroff (sleep-verified carries it out and verifies it)
+LAST_RESORT_PCT=8     # displayed percent; 4 % is the new zero on this battery
+LAST_RESORT_GRACE=30  # s of notice before the direct last resort
+ACTIVITY_CANCELS=watcher  # watcher|watcher+upper|never — +upper: activity cancels the UPPER grace
+AC_DRAIN_PCT=1        # % of energy_full lost over the window = draining on AC
+AC_DRAIN_WINDOW=600   # seconds; 2026-09-18 drained 1-2 % per 10 min
+AC_DRAIN_PROFILE=balanced
+GRACE_RETRY=30        # s before retrying after a suspend that did NOT happen
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/battery-guard.conf"
+# shellcheck disable=SC1090
+[[ -r "$CONF" ]] && source "$CONF"
+
+DRY_RUN=0
+[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
+if [[ "${1:-}" == "--init-conf" ]]; then
+    # His conf, written once with today's effective values; never overwritten.
+    tmpl="$(dirname "$(readlink -f "$0")")/../battery-guard.conf.default"
+    if [[ -e "$CONF" ]]; then
+        echo "battery-guard: $CONF exists — left untouched (it is his file)"; exit 0
+    fi
+    [[ -r "$tmpl" ]] || { echo "battery-guard: template $tmpl missing" >&2; exit 1; }
+    install -D -m 644 "$tmpl" "$CONF" && echo "battery-guard: wrote $CONF"
+    exit 0
+fi
+SLEEP_VERIFIED="${BATTERY_GUARD_SLEEP_CMD:-$HOME/.local/bin/sleep-verified}"
+ACTIVITY_CMD="${BATTERY_GUARD_ACTIVITY_CMD:-$HOME/.local/bin/input-activity-wait}"
+SNAPSHOT="$HOME/.local/bin/laptop-state-snapshot"
+
+BAT=/sys/class/power_supply/BAT0
+AC="${BATTERY_GUARD_AC:-/sys/class/power_supply/AC}"   # env: unit tests only
+# BATTERY_GUARD_STATE: tests point this at a scratch file so a fake-capacity run
+# cannot mark the real discharge's upper limit as used.
+STATE="${BATTERY_GUARD_STATE:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/battery-guard.state}"
+# power-profile-monitor honours this file: while it exists its 5-minute
+# auto-switch leaves the profile alone. Removed by udev on the next AC change.
+PROFILE_OVERRIDE=/tmp/power-profile-override
+
+# Thresholds support one decimal place (e.g. UPPER=21.5). Convert to tenths
+# for integer arithmetic: "21.5" -> 215, "25" -> 250.
+to_tenths() {
+    local v="$1"
+    if [[ "$v" == *"."* ]]; then
+        local frac="${v#*.}"
+        printf '%d' "$(( ${v%.*} * 10 + ${frac:0:1} ))"
+    else
+        printf '%d' "$(( v * 10 ))"
+    fi
+}
+
+[[ -r "$BAT/capacity" ]] || exit 0   # no battery (desktop)
+
+capacity="${BATTERY_GUARD_FAKE_CAPACITY:-$(<"$BAT/capacity")}"
+status="${BATTERY_GUARD_FAKE_STATUS:-$(<"$BAT/status")}"
+voltage_uv="$(cat "$BAT/voltage_now" 2>/dev/null || echo 0)"
+energy_full_uwh="$(cat "$BAT/energy_full" 2>/dev/null || echo 0)"
+now="${BATTERY_GUARD_FAKE_NOW:-$(date +%s)}"
+
+read_energy() { echo "${BATTERY_GUARD_FAKE_ENERGY:-$(cat "$BAT/energy_now" 2>/dev/null || echo 0)}"; }
+energy_uwh="$(read_energy)"
+
+# Precise percentage in tenths from energy values (sysfs capacity is integer-only).
+# When a fake capacity is set, use it (the test controls percentage directly).
+if [[ -n "${BATTERY_GUARD_FAKE_CAPACITY:-}" ]]; then
+    pct_x10=$(to_tenths "$capacity")
+elif (( energy_full_uwh > 0 )); then
+    pct_x10=$(( energy_uwh * 1000 / energy_full_uwh ))
+else
+    pct_x10=$(to_tenths "$capacity")
+fi
+WARN_X10=$(to_tenths "$WARN")
+UPPER_X10=$(to_tenths "$UPPER")
+LOWER_X10=$(to_tenths "$LOWER")
+LR_X10=$(to_tenths "$LAST_RESORT_PCT")
+# The lower limit is the DISPLAYED percent: 7.2 % shows as "7 %" and counts as
+# at the limit (2026-10-03 01:55 skipped 7.2 % because the test was <= 7.0).
+at_lower() { (( pct_x10 < LOWER_X10 + 10 )); }
+# Same displayed-percent rule for the last resort: 8.9 % shows as "8 %".
+at_last_resort() { [[ "$LAST_RESORT" != none ]] && (( pct_x10 < LR_X10 + 10 )); }
+# What the cards say after the two limits.
+lr_text() { [[ "$LAST_RESORT" != none ]] && printf ', %s at %s%%' "$LAST_RESORT" "$LAST_RESORT_PCT"; }
+
+# Always the real charger — the grace-period recheck must see a real plug-in even in a test.
+on_ac() { [[ "$(cat "$AC/online" 2>/dev/null || echo 0)" == "1" ]]; }
+# Which rule set applies. A fake status means "pretend on battery" (the
+# original test hook); BATTERY_GUARD_FAKE_AC=1 means "pretend plugged in".
+ac_mode() {
+    [[ -n "${BATTERY_GUARD_FAKE_AC:-}" ]] && return 0
+    [[ -n "${BATTERY_GUARD_FAKE_STATUS:-}" ]] && return 1
+    on_ac
+}
+
+# Fake runs are tagged so the journal separates tests from real events.
+TAG=""
+[[ -n "${BATTERY_GUARD_FAKE_CAPACITY:-}${BATTERY_GUARD_FAKE_ENERGY:-}" ]] && TAG="[TEST] "
+log() { /usr/bin/logger -t battery-guard -- "${TAG}$*"; [[ $DRY_RUN == 1 ]] && echo "${TAG}$*"; return 0; }
+
+notify() {  # urgency, title, body
+    [[ $DRY_RUN == 1 || "${BATTERY_GUARD_NOTIFY:-1}" == 0 ]] && return 0
+    /usr/bin/notify-send -u "$1" -a battery-guard "$2" "$3" 2>/dev/null || true
+}
+# The low-battery warning must not vanish: mako expires normal-urgency
+# notifications after 5 s (2026-10-01 he saw the 24% warning for ~1-2 s).
+# It stays until plugged in or dismissed; its id is kept so plugging in clears it.
+WARN_ID_FILE="${STATE}.warn-id"
+notify_sticky() {  # title, body
+    [[ $DRY_RUN == 1 ]] && return 0
+    /usr/bin/notify-send -u normal -t 0 -p -a battery-guard "$1" "$2" 2>/dev/null >"$WARN_ID_FILE" || true
+}
+dismiss_sticky() {
+    [[ -s "$WARN_ID_FILE" ]] || return 0
+    /usr/bin/makoctl dismiss -n "$(<"$WARN_ID_FILE")" >/dev/null 2>&1 || true
+    rm -f "$WARN_ID_FILE"
+}
+
+# State: on-battery keys (reset whenever plugged in) + AC-drain keys (reset
+# whenever unplugged). hist = "ts:energy_uwh ..." samples from the last window.
+warned=0
+upper_done=0
+ac_drain=0
+ac_upper_done=0
+profile_set=0
+retry_pending=0
+hist=""
+# shellcheck disable=SC1090
+[[ -r "$STATE" ]] && source "$STATE"
+save_state() {
+    # A dry run never touches the real state file; with an explicit scratch file it may.
+    [[ $DRY_RUN == 1 && -z "${BATTERY_GUARD_STATE:-}" ]] && return 0
+    printf 'warned=%s\nupper_done=%s\nac_drain=%s\nac_upper_done=%s\nprofile_set=%s\nretry_pending=%s\nhist=%q\n' \
+        "$warned" "$upper_done" "$ac_drain" "$ac_upper_done" "$profile_set" "$retry_pending" "$hist" >"$STATE"
+}
+
+log "capacity=${capacity}% (${pct_x10}/10) status=${status} voltage=$((voltage_uv / 1000))mV energy=$((energy_uwh / 1000))mWh ac_drain=${ac_drain} warned=${warned} upper_done=${upper_done} retry_pending=${retry_pending}"
+
+set_profile() {  # balanced | restore
+    if [[ "$1" == restore ]]; then
+        [[ "$profile_set" == 1 ]] || return 0
+        profile_set=0
+        [[ $DRY_RUN == 1 ]] && { log "would restore the power profile (remove override)"; return 0; }
+        rm -f "$PROFILE_OVERRIDE"   # power-profile-monitor's next tick picks the profile again
+        log "power profile override removed"
+        return 0
+    fi
+    [[ $DRY_RUN == 1 ]] && { log "would set power profile ${AC_DRAIN_PROFILE}"; profile_set=1; return 0; }
+    local cur
+    cur="$(/usr/bin/powerprofilesctl get 2>/dev/null || true)"
+    # Only ever step DOWN: performance -> balanced. Stage G on 2026-09-24 caught the
+    # first version raising power-saver to balanced.
+    if [[ "$cur" == performance ]] && /usr/bin/powerprofilesctl set "$AC_DRAIN_PROFILE" 2>/dev/null; then
+        touch "$PROFILE_OVERRIDE"
+        profile_set=1
+        log "power profile ${cur} -> ${AC_DRAIN_PROFILE} (override file set)"
+    else
+        log "power profile unchanged (current='${cur}', only performance is lowered)"
+    fi
+}
+
+# Grace wait. With activity=1, input-activity-wait listens for him (key, mouse,
+# touch; the first second ignored): returns 4 = he is back, 0 = waited it out.
+grace_wait() {  # seconds, activity (0|1)
+    local secs="$1" act="$2" t0 out rc left
+    if [[ $act == 1 && -x "$ACTIVITY_CMD" ]]; then
+        t0=$(date +%s)
+        out="$("$ACTIVITY_CMD" --seconds "$secs" --settle 1 2>&1)"; rc=$?
+        (( rc == 0 )) && { log "grace: ${out:-activity}"; return 4; }
+        (( rc == 1 )) && return 0
+        log "input-activity-wait failed (exit ${rc}: ${out:0:120}); plain grace"
+        left=$(( secs - ($(date +%s) - t0) ))
+        (( left > 0 )) && sleep "$left"
+        return 0
+    fi
+    sleep "$secs"
+    return 0
+}
+
+# Returns 0 = it slept (verified), 1 = cancelled during the grace (plugged in /
+# charging caught up), 3 = the suspend did not happen (sleep-verified reported
+# FAILED; retried next tick), 4 = cancelled because he was back (activity during
+# an UPPER grace, ACTIVITY_CANCELS=watcher+upper only).
+FS_GRACE=""        # set by the last-resort fallback: grace override
+FS_EXTRA=()        # extra sleep-verified flags (--no-last-resort after a failed hibernate)
+forced_suspend() {  # label, mode (battery|ac), reason key (upper|lower)
+    local label="$1" mode="${2:-battery}" key="${3:-upper}" e0 e1 grace="$GRACE" rc=0 act=0
+    local -a extra=()
+    [[ "$retry_pending" == 1 ]] && grace="$GRACE_RETRY"
+    [[ -n "$FS_GRACE" ]] && grace="$FS_GRACE"
+    [[ $key == lower* ]] && extra=(--urgent)   # KILL_BLOCKERS=lower acts only here
+    extra+=("${FS_EXTRA[@]}")
+    [[ $key == upper* && "$ACTIVITY_CANCELS" == watcher+upper ]] && act=1
+    if [[ $DRY_RUN == 1 ]]; then
+        log "would suspend ($label, capacity=${capacity}%) after ${grace}s grace$( ((act)) && echo ' (activity cancels)') via sleep-verified --reason ${key} ${extra[*]}"
+        return 0
+    fi
+    local note="" howto="Plug in to cancel."
+    [[ "$retry_pending" == 1 ]] && note=" — retry after a failed suspend"
+    (( act )) && howto="Plug in, or press a key / move the mouse / touch the screen to cancel."
+    log "suspending in ${grace}s ($label, capacity=${capacity}%)${note}"
+    if [[ "$retry_pending" == 1 ]]; then
+        notify critical "Battery ${capacity}% — the last suspend FAILED, retrying in ${grace}s" \
+            "${howto} Save your work. ($label)"
+    elif [[ $mode == ac ]]; then
+        notify critical "Battery ${capacity}% and falling on the charger — suspending in ${grace}s" \
+            "The charger cannot keep up. Cancels if charging catches up. ($label)"
+    else
+        notify critical "Battery ${capacity}% — suspending in ${grace}s" "${howto} ($label)"
+    fi
+    e0="$(read_energy)"
+    grace_wait "$grace" "$act"
+    if (( $? == 4 )); then
+        log "suspend cancelled: activity during the grace — he is back ($label counts as woken)"
+        notify normal "Suspend cancelled: you're back" "Battery ${capacity}%. ($label)"
+        retry_pending=0
+        return 4
+    fi
+    if [[ $mode == ac ]]; then
+        if ! on_ac; then
+            log "suspend cancelled: unplugged during grace (battery rules take over)"
+            return 1
+        fi
+        e1="$(read_energy)"
+        if (( e1 > e0 )); then
+            log "suspend cancelled: charging caught up during grace (${e0} -> ${e1} uWh)"
+            return 1
+        fi
+    elif on_ac; then
+        log "suspend cancelled: AC connected during grace"
+        return 1
+    fi
+    log "suspending now ($label)"
+    # Every suspend here fires a resume, and every resume runs
+    # monitor-resume-watch.sh -> monitor-persist.sh --once, which reapplies the
+    # eDP-1 monitor layout. Frequent forced suspends (e.g. the battery-guard
+    # test runner cycling through low-battery stages) turned what used to be a
+    # rare event into a routine one, and exposed a bug where that reapply
+    # reset the display's rotation transform without resyncing the
+    # elan-touchscreen's transform — silently desyncing touch input from the
+    # screen (fixed 2026-09-22 in monitor-persist.sh's resync_screen_flip()).
+    # If you change suspend frequency/triggers here, be aware you're also
+    # changing how often monitor-persist.sh runs, and watch for regressions
+    # in anything it resets but doesn't fully reapply.
+    if [[ -x "$SLEEP_VERIFIED" ]]; then
+        "$SLEEP_VERIFIED" --reason "$key" "${extra[@]}" || rc=$?
+    else
+        log "sleep-verified missing at $SLEEP_VERIFIED — bare systemctl suspend, unverified"
+        /usr/bin/systemctl suspend; rc=0
+    fi
+    if (( rc == 0 )); then
+        retry_pending=0
+        log "suspend verified ($label)"
+        return 0
+    fi
+    retry_pending=1
+    log "suspend FAILED ($label, sleep-verified exit ${rc}) — retrying next tick after ${GRACE_RETRY}s"
+    return 3
+}
+
+# ---------------------------------------------------------------- plugged in
+if ac_mode; then
+    warned=0; upper_done=0
+    dismiss_sticky
+    if (( energy_uwh > 0 && energy_full_uwh > 0 )); then
+        # Keep the last 2 windows of samples; find the newest one at least a window old.
+        kept=""; ref_e=0; ref_t=0
+        for s in $hist; do
+            t="${s%%:*}"; e="${s##*:}"
+            (( t < now - 2 * AC_DRAIN_WINDOW )) && continue
+            kept="${kept:+$kept }$s"
+            (( t <= now - AC_DRAIN_WINDOW && t > ref_t )) && { ref_t=$t; ref_e=$e; }
+        done
+        hist="${kept:+$kept }${now}:${energy_uwh}"
+        drop=$(( energy_full_uwh * AC_DRAIN_PCT / 100 ))
+        if (( ref_t > 0 )); then
+            if (( ac_drain == 0 && energy_uwh <= ref_e - drop )); then
+                ac_drain=1; ac_upper_done=0
+                log "draining on AC: ${ref_e} -> ${energy_uwh} uWh over $((now - ref_t))s (capacity=${capacity}%, status=${status})"
+                notify critical "Charger cannot keep up — battery ${capacity}% and falling while plugged in" \
+                    "Lost $(( (ref_e - energy_uwh) / 1000 )) mWh in $(( (now - ref_t) / 60 )) min. Reduce load or use a stronger charger. Will suspend at ${UPPER}% and again at ${LOWER}%$(lr_text)."
+                set_profile balanced
+            elif (( ac_drain == 1 && energy_uwh > ref_e )); then
+                ac_drain=0; ac_upper_done=0
+                log "AC drain cleared: ${ref_e} -> ${energy_uwh} uWh over $((now - ref_t))s"
+                set_profile restore
+            fi
+        fi
+    fi
+    save_state
+    if (( ac_drain == 1 )); then
+        if at_lower; then
+            forced_suspend "lower limit ${LOWER}% on AC" ac lower-ac
+            save_state
+        elif (( pct_x10 <= UPPER_X10 )) && [[ "$ac_upper_done" != 1 ]]; then
+            # Marked done only once the sleep is verified (or he cancelled by being
+            # back, = woken); a failure retries next tick.
+            forced_suspend "upper limit ${UPPER}% on AC" ac upper-ac; rc=$?
+            (( rc == 0 || rc == 4 )) && ac_upper_done=1
+            save_state
+        fi
+    else
+        retry_pending=0; save_state
+    fi
+    exit 0
+fi
+
+# ---------------------------------------------------------------- on battery
+if (( ac_drain == 1 )) || [[ -n "$hist" ]]; then
+    ac_drain=0; ac_upper_done=0; hist=""
+    set_profile restore
+    save_state
+fi
+if [[ "$status" != "Discharging" ]]; then
+    exit 0
+fi
+
+# The last resort, directly (2026-10-06): at <= LAST_RESORT_PCT there is no time
+# left for a suspend that may fail. Only when sleep-verified says it can (hibernate
+# needs resume=); otherwise, or if the hibernate fails, the lower-limit suspend.
+if at_last_resort; then
+    if [[ $DRY_RUN == 1 ]]; then
+        if "$SLEEP_VERIFIED" --last-resort --check >/dev/null 2>&1; then
+            log "would ${LAST_RESORT} (last resort ${LAST_RESORT_PCT}%, capacity=${capacity}%) after ${LAST_RESORT_GRACE}s notice via sleep-verified --last-resort"
+            exit 0
+        fi
+        log "last resort ${LAST_RESORT} not available (sleep-verified --last-resort --check); lower-limit suspend instead"
+    elif "$SLEEP_VERIFIED" --last-resort --check >/dev/null 2>&1; then
+        log "last resort: ${LAST_RESORT} in ${LAST_RESORT_GRACE}s (capacity=${capacity}%, <= ${LAST_RESORT_PCT}%)"
+        verb=hibernating; [[ "$LAST_RESORT" == poweroff ]] && verb="powering off"
+        notify critical "Battery ${capacity}% — ${verb} in ${LAST_RESORT_GRACE}s" \
+            "4 % is the new zero: no time left for a suspend that may fail. Plug in to cancel. Save your work."
+        sleep "$LAST_RESORT_GRACE"
+        if on_ac; then
+            log "last resort cancelled: AC connected during the notice"
+            exit 0
+        fi
+        "$SLEEP_VERIFIED" --last-resort --reason last-resort; rc=$?
+        if (( rc == 0 )); then
+            retry_pending=0; save_state
+            log "last resort ${LAST_RESORT} verified (capacity=${capacity}%)"
+            exit 0
+        fi
+        log "last resort ${LAST_RESORT} FAILED (sleep-verified exit ${rc}) — lower-limit suspend now, no second last resort"
+        FS_GRACE=0; FS_EXTRA=(--no-last-resort)
+    else
+        log "last resort ${LAST_RESORT} not available (no resume= on the kernel command line?) — lower-limit suspend instead"
+    fi
+fi
+
+if at_lower; then
+    forced_suspend "lower limit ${LOWER}%" battery lower
+    save_state
+elif (( pct_x10 <= UPPER_X10 )); then
+    if [[ "$upper_done" != 1 ]]; then
+        warned=1
+        save_state
+        # upper_done only after a VERIFIED sleep (2026-10-03: it was set before
+        # the attempt, the attempt failed, and nothing ever retried) — or when he
+        # cancelled the grace by being back (ACTIVITY_CANCELS=watcher+upper).
+        forced_suspend "upper limit ${UPPER}%" battery upper; rc=$?
+        (( rc == 0 || rc == 4 )) && upper_done=1
+        save_state
+    fi
+elif (( pct_x10 <= WARN_X10 )); then
+    if [[ "$warned" != 1 ]]; then
+        warned=1
+        save_state
+        log "warning at ${capacity}%"
+        # What was open, so a failed suspend or a dead battery loses nothing.
+        [[ $DRY_RUN == 0 && -x "$SNAPSHOT" ]] && timeout 10 "$SNAPSHOT" --quiet >/dev/null 2>&1
+        notify_sticky "Battery ${capacity}%" "Will suspend at ${UPPER}%, and again at ${LOWER}%$(lr_text). Stays until you plug in."
+    fi
+fi
+exit 0

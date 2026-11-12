@@ -1,0 +1,16 @@
+{
+  "description": "Memory check hook that warns about high memory usage before executing Bash commands",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/memory-check-hook.sh"
+          }
+        ],
+        "matcher": "Bash"
+      }
+    ]
+  }
+}

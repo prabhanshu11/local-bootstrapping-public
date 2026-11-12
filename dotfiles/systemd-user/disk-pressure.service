@@ -1,0 +1,11 @@
+[Unit]
+Description=Root SSD under 50 GB free: run the lane-reaper and uv cache prune, then tell him what was done
+Documentation=file:///home/prabhanshu/Programs/local-bootstrapping/docs/issues/btrfs-commit-stall/desktop-space-permanent-1101.md
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+ExecStart=%h/.local/bin/disk-upkeep pressure
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=4h

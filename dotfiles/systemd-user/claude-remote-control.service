@@ -1,0 +1,30 @@
+[Unit]
+Description=Claude Code Remote Control server (phone-initiated sessions on this machine)
+Documentation=https://code.claude.com/docs/en/remote-control
+# Why this exists:
+# `claude remote-control` exits PERMANENTLY after ~10 min of network errors
+# ("Persistent errors for 10 minutes, giving up.") and never restarts itself.
+# On 2026-07-31 an upstream ISP outage killed it at 12:48 and phone access to
+# the laptop stayed dead for ~12 hours until a human re-ran it. See
+# docs/issues/remote-control-dies-on-network-outage.md.
+#
+# NO start limit (StartLimitIntervalSec=0): an outage can last hours, and a
+# rate limit that gives up would recreate the exact failure this unit exists
+# to prevent. A fast crash-loop is bounded by RestartSec=30.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Single owner: kill any hand-started server so two never fight over sessions.
+# The leading '-' makes "no process found" non-fatal.
+ExecStartPre=-/usr/bin/pkill -f "claude remote-control"
+ExecStart=%h/.local/bin/claude-rc-server
+Restart=always
+RestartSec=30
+# Best-effort phone alert on abnormal exit. Can't send while the uplink is down
+# (same pipe), so in practice this reports crashes, not outages — by the time
+# an outage ends, systemd has already restarted the server.
+ExecStopPost=-/bin/bash -c 'if [ "$SERVICE_RESULT" != "success" ]; then timeout 20 %h/Programs/phone-file-transfer/telegram-send.py -m "claude-remote-control exited ($SERVICE_RESULT, exit=$EXIT_STATUS); systemd restarts it in 30s" >/dev/null 2>&1; fi'
+
+[Install]
+WantedBy=default.target

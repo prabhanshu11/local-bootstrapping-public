@@ -1,0 +1,504 @@
+#!/bin/bash
+# Waybar module for monitor-chooser
+# Returns JSON: text, class, tooltip with ASCII art layout diagram
+
+CHOOSER="$HOME/Programs/local-bootstrapping/apps/monitor-chooser/bin/monitor-chooser"
+SIDE_FILE="$HOME/.config/hypr/monitor-side"
+MONITORS_CONF="$HOME/.config/hypr/monitors.conf"
+# Fallback external geometry when hyprctl can't report one (rare)
+FALLBACK_WIDTH=2560
+FALLBACK_HEIGHT=1440
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+emit_json() {
+    local text="$1" class="$2" tooltip="$3"
+    tooltip=$(json_escape "$tooltip")
+    printf '{"text":"%s","class":"%s","tooltip":"%s"}\n' "$text" "$class" "$tooltip"
+}
+
+get_monitors_json() {
+    # 'monitors all' so MIRRORED monitors are included (plain 'monitors -j' omits
+    # them); drop monitors disabled via the "Ignore" choice.
+    hyprctl monitors all -j 2>/dev/null | jq -c '[.[] | select(.disabled == false)]' 2>/dev/null
+}
+
+build_ascii_layout() {
+    local monitors_json="$1"
+    local count name width height x mirror_of
+
+    count=$(echo "$monitors_json" | jq 'length')
+
+    if [[ "$count" -le 1 ]]; then
+        # Single monitor
+        name=$(echo "$monitors_json" | jq -r '.[0].name')
+        width=$(echo "$monitors_json" | jq -r '.[0].width')
+        height=$(echo "$monitors_json" | jq -r '.[0].height')
+        cat <<EOF
+┌─────────────┐
+│             │
+│   $name   │
+│  ${width}x${height}  │
+│             │
+└─────────────┘
+     Laptop
+EOF
+        return
+    fi
+
+    # Check for mirror mode
+    local has_mirror=false
+    for i in $(seq 0 $((count - 1))); do
+        mirror_of=$(echo "$monitors_json" | jq -r ".[$i].mirrorOf")
+        if [[ "$mirror_of" != "none" && "$mirror_of" != "" ]]; then
+            has_mirror=true
+            break
+        fi
+    done
+
+    if $has_mirror; then
+        local primary secondary
+        for i in $(seq 0 $((count - 1))); do
+            mirror_of=$(echo "$monitors_json" | jq -r ".[$i].mirrorOf")
+            name=$(echo "$monitors_json" | jq -r ".[$i].name")
+            if [[ "$mirror_of" == "none" || "$mirror_of" == "" ]]; then
+                primary="$name"
+            else
+                secondary="$name"
+            fi
+        done
+        cat <<EOF
+┌─────────────────┐
+│  ╔═══════════╗  │
+│  ║  MIRRORED ║  │
+│  ║  $primary  ║  │
+│  ╚═══════════╝  │
+│   $secondary    │
+└─────────────────┘
+EOF
+        return
+    fi
+
+    # Extended mode - sort by x position
+    local sorted
+    sorted=$(echo "$monitors_json" | jq -c 'sort_by(.x) | .[]')
+
+    local line1="  " line2="  " line3="  " line4="  " line5="  " labels="  "
+
+    while IFS= read -r mon; do
+        name=$(echo "$mon" | jq -r '.name')
+        width=$(echo "$mon" | jq -r '.width')
+        height=$(echo "$mon" | jq -r '.height')
+        local res="${width}x${height}"
+
+        # Determine label
+        local label
+        if [[ "$name" == eDP-* ]]; then
+            label="Laptop"
+        else
+            label="External"
+        fi
+
+        local pad=${#name}
+        [[ ${#res} -gt $pad ]] && pad=${#res}
+        [[ ${#label} -gt $pad ]] && pad=${#label}
+        pad=$((pad + 2))
+
+        line1+="┌$(printf '─%.0s' $(seq 1 $pad))┐ "
+        line2+="│$(printf ' %*s ' $((pad - 2)) "$name")│ "
+        line3+="│$(printf ' %*s ' $((pad - 2)) "$res")│ "
+        line4+="└$(printf '─%.0s' $(seq 1 $pad))┘ "
+        labels+=" $(printf '%*s' $((pad)) "$label")  "
+    done <<< "$sorted"
+
+    printf '%s\n%s\n%s\n%s\n%s' "$line1" "$line2" "$line3" "$line4" "$labels"
+}
+
+do_status() {
+    local monitors_json count
+    monitors_json=$(get_monitors_json)
+
+    if [[ -z "$monitors_json" || "$monitors_json" == "null" ]]; then
+        emit_json "󰍹" "error" "Monitors: Cannot read Hyprland state"
+        return
+    fi
+
+    count=$(echo "$monitors_json" | jq 'length')
+
+    # Build detailed tooltip
+    local ascii_art
+    ascii_art=$(build_ascii_layout "$monitors_json")
+
+    local details=""
+    for i in $(seq 0 $((count - 1))); do
+        local name width height refresh mirror_of scale
+        name=$(echo "$monitors_json" | jq -r ".[$i].name")
+        width=$(echo "$monitors_json" | jq -r ".[$i].width")
+        height=$(echo "$monitors_json" | jq -r ".[$i].height")
+        refresh=$(echo "$monitors_json" | jq -r ".[$i].refreshRate" | cut -d. -f1)
+        mirror_of=$(echo "$monitors_json" | jq -r ".[$i].mirrorOf")
+        scale=$(echo "$monitors_json" | jq -r ".[$i].scale")
+        local ws_name
+        ws_name=$(echo "$monitors_json" | jq -r ".[$i].activeWorkspace.name")
+
+        details+="$name: ${width}x${height}@${refresh}Hz"
+        [[ "$scale" != "1" ]] && details+=" (${scale}x)"
+        details+=" [ws $ws_name]"
+        [[ "$mirror_of" != "none" && "$mirror_of" != "" ]] && details+=" mirror→$mirror_of"
+        details+=$'\n'
+    done
+
+    local tooltip
+    tooltip="${ascii_art}
+${details}
+Desktops span both screens (workspace pairs):
+  Super+1..0            switch desktop everywhere
+  Super+Shift+1..0      move window to desktop
+  Super+Shift+Alt+1..0  move window silently
+  Super+Tab / +Shift    next / previous desktop
+  Super+Ctrl+Tab        jump back to last desktop
+
+Left-click: Change layout
+Right-click: Mirror toggle
+Middle-click: Toggle external left/right
+Scroll up/down: External left/right"
+
+    # Determine icon and class
+    local text class
+    if [[ "$count" -eq 1 ]]; then
+        text="󰍹"
+        class="single"
+    else
+        # Check if mirrored
+        local any_mirror=false
+        for i in $(seq 0 $((count - 1))); do
+            local mof
+            mof=$(echo "$monitors_json" | jq -r ".[$i].mirrorOf")
+            if [[ "$mof" != "none" && "$mof" != "" ]]; then
+                any_mirror=true
+                break
+            fi
+        done
+
+        if $any_mirror; then
+            text="󱡶"
+            class="mirror"
+        else
+            text="󰍺"
+            class="extended"
+        fi
+    fi
+
+    emit_json "$text" "$class" "$tooltip"
+}
+
+restart_waybar() {
+    killall waybar 2>/dev/null || true
+    sleep 0.3
+    if ! hyprctl dispatch exec waybar >/dev/null 2>&1; then
+        waybar >/dev/null 2>&1 & disown
+    fi
+}
+
+# After monitors move, waybar's layer surfaces keep stale anchors and the
+# bars render off-screen (2026-08-01 incident). SIGUSR2 makes waybar
+# re-create its bars in-process — reliable, unlike a full restart which
+# can lose a bar to a missed initial .configure. Restart only if dead.
+reload_or_restart_waybar() {
+    if pgrep -x waybar >/dev/null 2>&1; then
+        pkill -SIGUSR2 -x waybar
+    else
+        restart_waybar
+    fi
+}
+
+validate_display_and_topbar() {
+    local active_count
+    active_count=$(hyprctl monitors all -j 2>/dev/null | jq '[.[] | select(.disabled == false and .width > 0 and .height > 0)] | length' 2>/dev/null)
+
+    if [[ -z "$active_count" || "$active_count" -lt 1 ]]; then
+        return 1
+    fi
+
+    if ! pgrep -x waybar >/dev/null 2>&1; then
+        restart_waybar
+        sleep 0.8
+    fi
+
+    pgrep -x waybar >/dev/null 2>&1
+}
+
+reset_safe_display() {
+    hyprctl keyword monitor "eDP-1,1920x1080@60.01,0x0,1.00" >/dev/null 2>&1 || true
+    restart_waybar
+    notify-send "Monitor" "Display safety reset applied"
+}
+
+persist_side() {
+    local side="$1" ext_mon="$2"
+    local last_extend
+
+    if [[ "$side" == "external-left" || "$side" == "external-right" ]]; then
+        last_extend="$side"
+    else
+        last_extend=$(sed -n '3p' "$SIDE_FILE" 2>/dev/null)
+        case "$last_extend" in
+            external-left|external-right) ;;
+            *) last_extend="external-right" ;;
+        esac
+    fi
+
+    mkdir -p "$(dirname "$SIDE_FILE")"
+    printf '%s\n%s\n%s\n' "$side" "$ext_mon" "$last_extend" > "$SIDE_FILE"
+}
+
+persist_monitor_config() {
+    local side="$1" ext_mon="$2" ext_mode="$3" ext_w="$4" ext_h="$5" laptop_y="$6"
+
+    mkdir -p "$(dirname "$MONITORS_CONF")"
+
+    case "$side" in
+        external-left)
+            cat > "$MONITORS_CONF" <<EOF
+# Laptop display with external monitor on the left.
+
+monitor=$ext_mon,$ext_mode,0x0,1.0
+monitor=eDP-1,1920x1080@60.01,${ext_w}x${laptop_y},1.0
+EOF
+            ;;
+        external-right)
+            cat > "$MONITORS_CONF" <<EOF
+# Laptop display with external monitor on the right.
+
+monitor=eDP-1,1920x1080@60.01,0x${laptop_y},1.0
+monitor=$ext_mon,$ext_mode,1920x0,1.0
+EOF
+            ;;
+        mirror)
+            cat > "$MONITORS_CONF" <<EOF
+# Laptop display mirrored to external monitor.
+
+monitor=eDP-1,1920x1080@60.01,0x0,1.0
+monitor=$ext_mon,preferred,auto,1.0,mirror,eDP-1
+EOF
+            ;;
+        ignore)
+            cat > "$MONITORS_CONF" <<EOF
+# Laptop display only; external monitor disabled.
+
+monitor=eDP-1,1920x1080@60.01,0x0,1.0
+monitor=$ext_mon,disabled
+EOF
+            ;;
+    esac
+}
+
+get_external_monitor() {
+    hyprctl monitors all -j 2>/dev/null | jq -r '.[] | select(.name != "eDP-1") | .name' | head -1
+}
+
+get_monitor_field() {
+    local mon="$1" field="$2"
+    hyprctl monitors all -j 2>/dev/null | jq -r --arg mon "$mon" --arg field "$field" '.[] | select(.name == $mon) | .[$field]' | head -1
+}
+
+# Current active mode as "WxH@RR" — used to PIN the mode in monitors.conf.
+# "preferred" is never persisted for the external: a flaky reconnect can
+# renegotiate to 1080p, which then shifts/overlaps the layout (2026-08-01).
+get_current_mode() {
+    local mon="$1"
+    hyprctl monitors all -j 2>/dev/null | jq -r --arg mon "$mon" \
+        '.[] | select(.name == $mon and .width > 0) |
+         "\(.width)x\(.height)@\((.refreshRate * 100 | round) / 100)"' | head -1
+}
+
+# Best mode the connector reports — hyprland orders availableModes best-first.
+get_best_mode() {
+    local mon="$1"
+    hyprctl monitors all -j 2>/dev/null | jq -r --arg mon "$mon" \
+        '.[] | select(.name == $mon) | .availableModes[0] // empty' | head -1 \
+        | sed 's/Hz$//'
+}
+
+# Pinning the LIVE mode is only safe if the live mode isn't itself a downgrade.
+# After a resume from suspend hyprland's atomic modeset test for the native mode
+# can fail; it silently falls back (2560x1440 -> 1920x1080) and never retries.
+# Pinning that freezes the downgrade into monitors.conf permanently — which is
+# exactly what happened on 2026-08-07. So prefer the best mode whenever the live
+# one is strictly smaller. An explicit pick belongs in monitor-chooser's picker,
+# which has its own intent-aware guard; this widget only ever applies presets.
+get_mode_to_pin() {
+    local mon="$1" cur best cur_px best_px
+    cur=$(get_current_mode "$mon")
+    best=$(get_best_mode "$mon")
+
+    [[ -n "$best" ]] || { printf '%s' "$cur"; return; }
+    [[ -n "$cur" ]] || { printf '%s' "$best"; return; }
+
+    cur_px=$(( ${cur%%x*} * $(x=${cur#*x}; echo "${x%%@*}") ))
+    best_px=$(( ${best%%x*} * $(x=${best#*x}; echo "${x%%@*}") ))
+
+    if (( cur_px < best_px )); then
+        printf '%s' "$best"
+    else
+        printf '%s' "$cur"
+    fi
+}
+
+apply_external_side() {
+    local side="$1"
+    local ext_mon ext_mode ext_w ext_h laptop_y
+
+    ext_mon=$(get_external_monitor)
+    if [[ -z "$ext_mon" ]]; then
+        notify-send "Monitor" "No external monitor detected"
+        return 1
+    fi
+
+    ext_mode=$(get_mode_to_pin "$ext_mon")
+    [[ -n "$ext_mode" ]] || ext_mode="preferred"
+
+    # Geometry MUST come from the mode we are about to write, not from live
+    # state. Reading them separately is how monitors.conf ended up pinning a
+    # 1920x1080 mode while eDP-1 kept the 2560x180 offset computed for 1440p —
+    # a 640px dead gap between the screens (2026-08-07).
+    if [[ "$ext_mode" == "preferred" ]]; then
+        ext_w=$(get_monitor_field "$ext_mon" width)
+        ext_h=$(get_monitor_field "$ext_mon" height)
+    else
+        ext_w=${ext_mode%%x*}
+        ext_h=${ext_mode#*x}; ext_h=${ext_h%%@*}
+    fi
+    [[ "$ext_w" =~ ^[0-9]+$ && "$ext_w" -gt 0 ]] || ext_w=$FALLBACK_WIDTH
+    [[ "$ext_h" =~ ^[0-9]+$ && "$ext_h" -gt 0 ]] || ext_h=$FALLBACK_HEIGHT
+
+    laptop_y=0
+    if [[ "$ext_h" -gt 1080 ]]; then
+        laptop_y=$(((ext_h - 1080) / 2))
+    fi
+
+    case "$side" in
+        external-left)
+            hyprctl --batch "keyword monitor $ext_mon,$ext_mode,0x0,1 ; keyword monitor eDP-1,1920x1080@60.01,${ext_w}x${laptop_y},1.00 ; dispatch focusmonitor $ext_mon" >/dev/null 2>&1
+            ;;
+        external-right)
+            hyprctl --batch "keyword monitor eDP-1,1920x1080@60.01,0x${laptop_y},1.00 ; keyword monitor $ext_mon,$ext_mode,1920x0,1 ; dispatch focusmonitor $ext_mon" >/dev/null 2>&1
+            ;;
+        *)
+            notify-send "Monitor" "Unknown side: $side"
+            return 1
+            ;;
+    esac
+
+    reload_or_restart_waybar
+    sleep 1
+
+    if validate_display_and_topbar; then
+        persist_side "$side" "$ext_mon"
+        persist_monitor_config "$side" "$ext_mon" "$ext_mode" "$ext_w" "$ext_h" "$laptop_y"
+        notify-send "Monitor" "${ext_mon}: ${side#external-}"
+        return 0
+    fi
+
+    reset_safe_display
+    return 1
+}
+
+do_click() {
+    if [[ -x "$CHOOSER" ]]; then
+        # Get list of non-laptop monitors
+        local ext_mon
+        ext_mon=$(hyprctl monitors all -j 2>/dev/null | jq -r '.[] | select(.name != "eDP-1") | .name' | head -1)
+        if [[ -n "$ext_mon" ]]; then
+            ghostty --class=monitor-chooser --title="Monitor Chooser" -e "$CHOOSER" "$ext_mon" &
+        else
+            # No external: open the layout editor (resolution picker still useful)
+            ghostty --class=monitor-chooser --title="Monitor Chooser" -e "$CHOOSER" --layout &
+        fi
+    else
+        notify-send "Monitor Chooser" "Binary not found.\nRun: ~/Programs/local-bootstrapping/apps/monitor-chooser/build.sh"
+    fi
+}
+
+do_mirror_toggle() {
+    local monitors_json ext_mon mirror_of
+    monitors_json=$(get_monitors_json)
+
+    ext_mon=$(echo "$monitors_json" | jq -r '.[] | select(.name != "eDP-1") | .name' | head -1)
+    if [[ -z "$ext_mon" ]]; then
+        notify-send "Monitor" "No external monitor"
+        return
+    fi
+
+    # Check if already mirroring. get_monitors_json now uses 'hyprctl monitors all',
+    # so a mirrored monitor IS in the list and carries a non-"none" mirrorOf field.
+    local all_count
+    all_count=$(echo "$monitors_json" | jq 'length')
+
+    local is_mirrored=false
+    for i in $(seq 0 $((all_count - 1))); do
+        mirror_of=$(echo "$monitors_json" | jq -r ".[$i].mirrorOf")
+        if [[ "$mirror_of" != "none" && "$mirror_of" != "" ]]; then
+            is_mirrored=true
+            break
+        fi
+    done
+
+    if $is_mirrored; then
+        # Switch back to the last extended side, defaulting to external-right.
+        local saved_side
+        saved_side=$(sed -n '3p' "$SIDE_FILE" 2>/dev/null)
+        case "$saved_side" in
+            external-left|external-right) apply_external_side "$saved_side" ;;
+            *) apply_external_side "external-right" ;;
+        esac
+        return
+    else
+        # Switch to mirror
+        hyprctl keyword monitor "$ext_mon,preferred,auto,1,mirror,eDP-1"
+        hyprctl keyword monitor "eDP-1,1920x1080@60,0x0,1"
+        persist_side "mirror" "$ext_mon"
+        # mirror config always uses "preferred"; geometry args are unused here
+        persist_monitor_config "mirror" "$ext_mon" "preferred" "$FALLBACK_WIDTH" "$FALLBACK_HEIGHT" 0
+        notify-send "Monitor" "Mirrored: $ext_mon → eDP-1"
+    fi
+
+    # Re-anchor waybar on the changed layout
+    reload_or_restart_waybar
+    sleep 1
+    validate_display_and_topbar || reset_safe_display
+}
+
+do_toggle_side() {
+    local saved_side
+    saved_side=$(sed -n '1p' "$SIDE_FILE" 2>/dev/null)
+
+    case "$saved_side" in
+        external-right) apply_external_side "external-left" ;;
+        external-left) apply_external_side "external-right" ;;
+        *)
+            saved_side=$(sed -n '3p' "$SIDE_FILE" 2>/dev/null)
+            case "$saved_side" in
+                external-right) apply_external_side "external-left" ;;
+                *) apply_external_side "external-right" ;;
+            esac
+            ;;
+    esac
+}
+
+case "${1:-status}" in
+    status) do_status ;;
+    click) do_click ;;
+    external-left|left) apply_external_side "external-left" ;;
+    external-right|right) apply_external_side "external-right" ;;
+    toggle-side) do_toggle_side ;;
+    mirror-toggle) do_mirror_toggle ;;
+    *) do_status ;;
+esac

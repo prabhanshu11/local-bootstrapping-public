@@ -1,0 +1,7 @@
+[Unit]
+Description=Refresh datalake with new Claude sessions
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Programs/datalake
+ExecStart=%h/Programs/datalake/scripts/refresh-claude.sh

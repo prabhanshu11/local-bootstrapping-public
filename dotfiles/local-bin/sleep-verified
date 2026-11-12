@@ -1,0 +1,1002 @@
+#!/usr/bin/env python3
+"""
+sleep-verified — the ONE suspend entry point: suspend, prove it slept, and if it
+did not, unstick what blocked it, retry, and tell him.
+
+Why (2026-10-03, docs/issues/laptop-suspend-fails-freeze-2026-10-03.md): he
+suspended at 26 % at 01:39; the kernel could not freeze one process (seven
+threads stuck reading a FUSE directory), deep and s2idle both failed, and
+`systemctl suspend` said nothing — it returns before the sleep. The laptop
+sat awake behind the lock screen; battery-guard's two forced suspends failed
+the same way and it never retried; the laptop died at 0 % and the work was
+lost. His words that day: "the policies that you create which prevent the
+suspend need to be smart enough to respect my custom choices."
+
+What it does (every caller: him, the power button, battery-guard):
+  1. pre-flight (< 2 s): laptop-state-snapshot; list tasks waiting in FUSE
+     (wchan request_wait_answer) and FUSE connections with waiting > 0; log.
+  2. read /sys/power/suspend_stats, then `systemctl suspend`, then wait until
+     systemd-suspend.service has run (poll 1 s, cap 120 s, monotonic clock so
+     time asleep does not count).
+  3. verdict: SLEPT if suspend_stats/success went up or the boot clock moved
+     > 60 s past the monotonic clock (= time spent suspended); else FAILED:
+     the refusing tasks are parsed from `journalctl -k` ("task:NAME ... pid:
+     tgid:" lines after "Freezing ... failed") and resolved to comm/exe/cwd.
+  4. remedy ladder on FAILED, each a knob in ~/.config/battery-guard.conf:
+       UNSTICK_FUSE=1        abort his own hung FUSE connections
+                             (/sys/fs/fuse/connections/N/abort), retry once
+       KILL_BLOCKERS=lower   never|lower|always — SIGKILL the refusing pids,
+                             retry once ("lower" = only with --urgent, which
+                             battery-guard passes at its LOWER limit only)
+       LAST_RESORT=hibernate none|hibernate|poweroff, taken when the ladder
+                             still FAILED and either this is battery-guard's
+                             LOWER limit (--urgent: at once, whatever the %)
+                             or the battery is <= LAST_RESORT_PCT (8) on
+                             battery. hibernate refuses (log + card + one
+                             Telegram line, laptop stays on) while resume= is
+                             not on the kernel command line.
+       REMOUNT_AFTER_UNSTICK=1  after the verdict, remount what was aborted
+                             (gvfsd-fuse / document portal) so his apps work
+  5. always: ~/.local/state/sleep-verified/last.json + history.jsonl; on
+     FAILED a sticky critical notification, a beep, one Telegram line.
+
+A suspend he asked for is NEVER blocked or delayed: no policy here except
+verify -> unstick -> report. Exit 0 = slept (or hibernated), 1 = failed,
+2 = refused (only a guard request while another sleep-verified is running;
+never --reason user), 3 = post-mortem retry cancelled because he was back,
+4 = --last-resort not available (LAST_RESORT=none, or hibernate without resume=).
+
+Hibernate (2026-10-06, his words: "if a policy where there are two sleeps not
+possible we have can hibernate ... We need to assume that 4% is the new zero"):
+`systemctl hibernate`, then wait for systemd-hibernate.service (monotonic cap
+600 s). suspend_stats does not count hibernation, so the verdict is
+HIBERNATED when the unit ran (new InvocationID), its Result is "success" and
+the wall clock jumped >= 15 s past the monotonic clock (the machine was off);
+otherwise FAILED with the reason. --last-resort is battery-guard's direct call
+at <= LAST_RESORT_PCT (no suspend attempt first: no time left for one that may
+fail); --last-resort --check only answers 0 = possible / 4 = not.
+
+While it runs it holds $XDG_RUNTIME_DIR/sleep-verified.active (its pid), so
+sleep-watch — which sees EVERY sleep through logind's PrepareForSleep, also
+the ones nobody verified (Omarchy menu, hypridle, UPower) — leaves its sleeps
+to it and does not retry them a second time.
+
+--post-mortem is sleep-watch's call after a sleep that nobody verified FAILED
+(logind already ran it; nothing here suspends first): analyse the kernel log
+since --since, unstick FUSE (UNSTICK_FUSE), retry ONCE (not with --no-retry),
+alert if it still fails. It never kills and never takes the LAST_RESORT —
+those belong to battery-guard's limits. Before its retry (2026-10-06, his
+words: "give me some grace period if I am back at the keyboard or do something
+then the sleep should be interrupted") it shows a sticky card "Sleep failed at
+X % — retrying in RETRY_GRACE s" and runs input-activity-wait: any key, mouse
+or touch (after the first second) cancels the retry ("Retry cancelled: you're
+back", log, one Telegram line, exit 3). ACTIVITY_CANCELS=never skips the grace
+and retries at once (the 10-03 behaviour).
+
+Usage
+  sleep-verified [--reason TEXT] [--urgent] [--no-last-resort] [--dry-run] [--no-notify]
+  sleep-verified --last-resort [--check] [--reason TEXT] [--no-notify]
+  sleep-verified --post-mortem --reason TEXT --since EPOCH [--success-before N]
+                 [--slept S] [--no-retry] [--no-notify]
+  sleep-verified --parse-kernel FILE     # tests: blockers from kernel lines, JSON
+  sleep-verified --show-conf             # effective knobs, JSON
+"""
+
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+CONF = os.environ.get("SLEEP_VERIFIED_CONF") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), "battery-guard.conf")
+STATE = os.environ.get("SLEEP_VERIFIED_STATE_DIR") or os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "sleep-verified")
+SYS = os.environ.get("SLEEP_VERIFIED_SYS", "")          # tests: fake /sys root
+PROC = os.environ.get("SLEEP_VERIFIED_PROC", "/proc")
+BAT = SYS + "/sys/class/power_supply/BAT0"
+STATS = SYS + "/sys/power/suspend_stats"
+FUSECONN = SYS + "/sys/fs/fuse/connections"
+UNIT = "systemd-suspend.service"
+HUNIT = "systemd-hibernate.service"
+ACTIVITY_CMD = os.environ.get("SLEEP_VERIFIED_ACTIVITY_CMD") or os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "input-activity-wait")
+# tests only: a file holding seconds added to the wall clock (a stand-in for the
+# clock jump a real hibernation makes; nothing here can power the machine off).
+WALL_SKEW = os.environ.get("SLEEP_VERIFIED_WALL_SKEW_FILE")
+TELEGRAM = os.path.join(HOME, "Programs/phone-file-transfer/telegram-send.py")
+SNAPSHOT = os.path.join(HOME, ".local/bin/laptop-state-snapshot")
+MARKER = os.environ.get("SLEEP_VERIFIED_MARKER") or os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "sleep-verified.active")
+
+# Script defaults = dotfiles/battery-guard.conf.default (2026-10-06 values); his
+# ~/.config/battery-guard.conf overrides them.
+DEFAULTS = {
+    "UNSTICK_FUSE": "1",
+    "KILL_BLOCKERS": "lower",
+    "LAST_RESORT": "hibernate",
+    "LAST_RESORT_PCT": "8",
+    "REMOUNT_AFTER_UNSTICK": "1",
+    "RETRY_GRACE": "60",
+    "ACTIVITY_CANCELS": "watcher",
+}
+ALLOWED = {
+    "UNSTICK_FUSE": {"0", "1"},
+    "KILL_BLOCKERS": {"never", "lower", "always"},
+    "LAST_RESORT": {"none", "hibernate", "poweroff"},
+    "REMOUNT_AFTER_UNSTICK": {"0", "1"},
+    "ACTIVITY_CANCELS": {"watcher", "watcher+upper", "never"},
+}
+WAIT_CAP = 120          # s (monotonic) for systemd-suspend.service to run
+HIB_WAIT_CAP = 600      # s (monotonic) for systemd-hibernate.service (writing the image is slow)
+SLEPT_GAP = 60          # s of boottime-minus-monotonic = it was asleep
+HIB_GAP = 15            # s the wall clock must jump past the monotonic clock = it was off
+TG_DEDUPE = 900         # s: same failure -> one Telegram line per 15 min
+# The FUSE daemons' own idle readers sit in fuse_dev_do_read; only a client
+# waiting for an answer is stuck.
+FUSE_WAIT = re.compile(r"^(request_wait_answer|fuse_wait_on_page_writeback|fuse_\w*wait\w*)$")
+
+QUIET = not sys.stderr.isatty()
+
+
+def log(msg):
+    try:
+        subprocess.run(["logger", "-t", "sleep-verified", "--", msg], timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if not QUIET or os.environ.get("SLEEP_VERIFIED_ECHO"):
+        print(msg, file=sys.stderr)
+
+
+def rd(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def run(cmd, timeout=10):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, "", str(e)
+
+
+# ------------------------------------------------------------------ knobs
+def load_conf(path=CONF):
+    """KEY=VALUE lines of the guard's bash conf (comments, quotes allowed)."""
+    knobs, bad = dict(DEFAULTS), []
+    for line in (rd(path, "") or "").splitlines():
+        m = re.match(r"""^\s*(?:export\s+)?([A-Z_]+)=(["']?)([^"'#\s]*)\2\s*(?:#.*)?$""", line)
+        if not m or m.group(1) not in DEFAULTS:
+            continue
+        k, v = m.group(1), m.group(3)
+        if k in ALLOWED and v not in ALLOWED[k]:
+            bad.append(f"{k}={v}")
+            continue
+        if k == "LAST_RESORT_PCT" and not re.match(r"^\d+(\.\d)?$", v):
+            bad.append(f"{k}={v}")
+            continue
+        if k == "RETRY_GRACE" and not v.isdigit():
+            bad.append(f"{k}={v}")
+            continue
+        knobs[k] = v
+    knobs["_invalid"] = bad
+    return knobs
+
+
+# ------------------------------------------------------------------ facts
+def battery():
+    """(percent with one decimal or None, on_battery)."""
+    now, full = rd(BAT + "/energy_now"), rd(BAT + "/energy_full")
+    pct = None
+    if now and full and int(full) > 0:
+        pct = round(int(now) * 100 / int(full), 1)
+    elif rd(BAT + "/capacity"):
+        pct = float(rd(BAT + "/capacity"))
+    return pct, rd(BAT + "/status", "") == "Discharging"
+
+
+def suspend_stats():
+    s = {}
+    for k in ("success", "fail", "failed_freeze", "last_failed_step"):
+        v = rd(f"{STATS}/{k}", "")
+        s[k] = int(v) if v.isdigit() else v
+    return s
+
+
+def sleep_clock():
+    """Seconds the machine has spent suspended since boot (boottime - monotonic)."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC)
+
+
+def fuse_mounts():
+    """{conn_number: {mount, fstype, source}} from mountinfo (conn N = minor dev of the mount)."""
+    out = {}
+    for line in (rd(f"{PROC}/self/mountinfo", "") or "").splitlines():
+        left, _, right = line.partition(" - ")
+        f, r = left.split(), right.split()
+        if len(f) < 5 or not r or not r[0].startswith("fuse") or r[0] == "fusectl":
+            continue
+        major, _, minor = f[2].partition(":")
+        if major == "0":
+            out[minor] = {"mount": f[4].replace("\\040", " "), "fstype": r[0],
+                          "source": r[1] if len(r) > 1 else ""}
+    return out
+
+
+def fuse_connections():
+    mounts = fuse_mounts()
+    conns = []
+    try:
+        names = sorted(os.listdir(FUSECONN), key=lambda n: int(n) if n.isdigit() else 0)
+    except OSError:
+        names = []
+    for n in names:
+        w = rd(f"{FUSECONN}/{n}/waiting", "0")
+        m = mounts.get(n, {})
+        conns.append({"conn": n, "waiting": int(w) if w.isdigit() else 0,
+                      "mount": m.get("mount", "?"), "fstype": m.get("fstype", "?"),
+                      "abort_writable": os.access(f"{FUSECONN}/{n}/abort", os.W_OK)})
+    return conns
+
+
+def fuse_waiters():
+    """Tasks blocked waiting on a FUSE answer right now."""
+    found = []
+    try:
+        pids = [p for p in os.listdir(PROC) if p.isdigit()]
+    except OSError:
+        return found
+    for pid in pids:
+        try:
+            tids = os.listdir(f"{PROC}/{pid}/task")
+        except OSError:
+            continue
+        for tid in tids:
+            wchan = rd(f"{PROC}/{pid}/task/{tid}/wchan", "")
+            if not wchan or not FUSE_WAIT.match(wchan):
+                continue
+            stat = rd(f"{PROC}/{pid}/task/{tid}/stat", "")
+            state = stat.rsplit(")", 1)[1].split()[0] if ")" in stat else "?"
+            found.append({"pid": int(pid), "tid": int(tid), "wchan": wchan, "state": state,
+                          "thread": rd(f"{PROC}/{pid}/task/{tid}/comm", "?"),
+                          "comm": rd(f"{PROC}/{pid}/comm", "?")})
+    return found
+
+
+def resolve(pid):
+    def link(name):
+        try:
+            return os.readlink(f"{PROC}/{pid}/{name}")
+        except OSError:
+            return None
+    cmd = rd(f"{PROC}/{pid}/cmdline", "") or ""
+    st = rd(f"{PROC}/{pid}/stat", "") or ""
+    ppid = int(st.rsplit(")", 1)[1].split()[1]) if ")" in st else None
+    return {"comm": rd(f"{PROC}/{pid}/comm"), "exe": link("exe"), "cwd": link("cwd"),
+            "cmdline": cmd.replace("\0", " ").strip()[:200] or None, "ppid": ppid,
+            "parent_comm": rd(f"{PROC}/{ppid}/comm") if ppid else None,
+            "alive": os.path.exists(f"{PROC}/{pid}")}
+
+
+# ------------------------------------------------------------------ kernel log
+TASK_RE = re.compile(r"task:(?P<name>.+?)\s+state:(?P<state>\S+).*?\bpid:(?P<pid>\d+)"
+                     r"(?:\s+tgid:(?P<tgid>\d+))?(?:\s+ppid:(?P<ppid>\d+))?")
+FAIL_RE = re.compile(r"Freezing (user space processes|remaining freezable tasks) failed after "
+                     r"([\d.]+) seconds \((\d+) tasks refusing to freeze")
+
+
+def parse_kernel(text):
+    """Refusing tasks from kernel log text, grouped by process (tgid).
+
+    Returns {"freeze_failures": n, "entries": [...], "blockers": [{pid, tids,
+    threads, ppid, state, fuse_fn}]} — pid is the process (tgid) to act on.
+    """
+    entries, fails, procs = [], 0, {}
+    in_fail, cur = False, None
+    for line in text.splitlines():
+        if "PM: suspend entry" in line:
+            entries.append(line.split("PM: suspend entry", 1)[1].strip(" ()"))
+        m = FAIL_RE.search(line)
+        if m:
+            fails += 1
+            in_fail, cur = True, None
+            continue
+        if not in_fail:
+            continue
+        if "Restarting tasks" in line or "PM: suspend exit" in line or "OOM killer enabled" in line:
+            in_fail, cur = False, None
+            continue
+        t = TASK_RE.search(line)
+        if t:
+            tgid = int(t.group("tgid") or t.group("pid"))
+            p = procs.setdefault(tgid, {"pid": tgid, "tids": [], "threads": [], "state": t.group("state"),
+                                        "ppid": int(t.group("ppid")) if t.group("ppid") else None,
+                                        "fuse_fn": None})
+            tid, name = int(t.group("pid")), t.group("name").strip()
+            if tid not in p["tids"]:
+                p["tids"].append(tid)
+                p["threads"].append(name)
+            cur = p
+            continue
+        if cur and not cur["fuse_fn"]:
+            f = re.search(r"\b(fuse_\w+)\+0x", line)
+            if f and not f.group(1).startswith("fuse_simple"):
+                cur["fuse_fn"] = f.group(1)
+    return {"freeze_failures": fails, "entries": entries, "blockers": list(procs.values())}
+
+
+def kernel_since(epoch):
+    rc, out, _ = run(["journalctl", "-k", "--no-pager", "-o", "short-iso", "--since", f"@{int(epoch) - 1}"],
+                     timeout=15)
+    return out if rc == 0 else ""
+
+
+def wall():
+    skew = 0.0
+    if WALL_SKEW:
+        try:
+            skew = float(rd(WALL_SKEW, "0") or 0)
+        except ValueError:
+            pass
+    return time.time() + skew
+
+
+def resume_configured():
+    """Hibernate can only come back if the kernel knows where the image is."""
+    return "resume=" in (rd(SYS + "/proc/cmdline", "") or "")
+
+
+def hibernate_verdict(unit_ran, result, wall_jump):
+    """(verdict, why) for one `systemctl hibernate`.
+
+    suspend_stats does not count hibernation. HIBERNATED needs all three: the
+    unit ran (new InvocationID), it ended with Result=success, and the wall
+    clock jumped >= HIB_GAP s past the monotonic clock (= the machine was off)."""
+    if not unit_ran:
+        return "FAILED", f"{HUNIT} never ran"
+    if result != "success":
+        return "FAILED", f"{HUNIT} Result={result or '?'}"
+    if wall_jump < HIB_GAP:
+        return "FAILED", f"{HUNIT} returned success but the clock jumped only {wall_jump}s (never powered off)"
+    return "HIBERNATED", None
+
+
+def verdict_of(before, after, slept_s):
+    """SLEPT when the kernel counted a successful suspend or the clock says it slept."""
+    b, a = before.get("success"), after.get("success")
+    if isinstance(a, int) and isinstance(b, int) and a > b:
+        return "SLEPT"
+    return "SLEPT" if slept_s > SLEPT_GAP else "FAILED"
+
+
+# ------------------------------------------------------------------ one attempt
+def unit_show(unit=UNIT):
+    rc, out, _ = run(["systemctl", "show", "-p", "ActiveState,Result,InvocationID,ExecMainStatus", unit])
+    return dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+
+
+def attempt(n):
+    before, inv0 = suspend_stats(), unit_show().get("InvocationID", "")
+    gap0, t_wall, t0 = sleep_clock(), time.time(), time.monotonic()
+    log(f"attempt {n}: systemctl suspend (success={before.get('success')} fail={before.get('fail')})")
+    rc, _, err = run(["systemctl", "suspend"], timeout=30)
+    a = {"n": n, "started": int(t_wall), "systemctl_rc": rc}
+    if rc != 0:
+        a.update(verdict="FAILED", why=f"systemctl suspend refused: {err[:200]}")
+        log(f"attempt {n}: {a['why']}")
+        return a
+    seen = False
+    while time.monotonic() - t0 < WAIT_CAP:
+        time.sleep(1)
+        u = unit_show()
+        if u.get("ActiveState") in ("activating", "active", "deactivating", "reloading"):
+            seen = True
+            continue
+        if seen or (u.get("InvocationID") and u.get("InvocationID") != inv0):
+            break
+    u, after = unit_show(), suspend_stats()
+    slept = round(sleep_clock() - gap0, 1)
+    a.update(verdict=verdict_of(before, after, slept), slept_s=slept, unit_result=u.get("Result"),
+             unit_status=u.get("ExecMainStatus"), success=[before.get("success"), after.get("success")],
+             fail=[before.get("fail"), after.get("fail")], last_failed_step=after.get("last_failed_step"),
+             waited_s=round(time.monotonic() - t0, 1), unit_ran=seen or u.get("InvocationID") != inv0)
+    if a["verdict"] == "FAILED":
+        analyse_failure(a, t_wall)
+        if not a["unit_ran"]:
+            a["why"] = f"{UNIT} never ran within {WAIT_CAP}s (inhibitor or queued job?)"
+    log(f"attempt {n}: {a['verdict']} slept={slept}s result={a.get('unit_result')} "
+        f"success {a['success'][0]}->{a['success'][1]}" + describe(a))
+    return a
+
+
+def hibernate_attempt(n):
+    """One `systemctl hibernate`, verified by the unit's Result and the wall-clock jump."""
+    inv0 = unit_show(HUNIT).get("InvocationID", "")
+    t_wall, t0 = wall(), time.monotonic()
+    log(f"attempt {n}: systemctl hibernate")
+    rc, _, err = run(["systemctl", "hibernate"], timeout=30)
+    a = {"n": n, "op": "hibernate", "started": int(t_wall), "systemctl_rc": rc}
+    if rc != 0:
+        a.update(verdict="FAILED", why=f"systemctl hibernate refused: {err[:200]}")
+        log(f"attempt {n}: {a['why']}")
+        return a
+    seen = False
+    while time.monotonic() - t0 < HIB_WAIT_CAP:
+        time.sleep(1)
+        u = unit_show(HUNIT)
+        if u.get("ActiveState") in ("activating", "active", "deactivating", "reloading"):
+            seen = True
+            continue
+        if seen or (u.get("InvocationID") and u.get("InvocationID") != inv0):
+            break
+    u = unit_show(HUNIT)
+    jump = round((wall() - t_wall) - (time.monotonic() - t0), 1)
+    ran = bool(seen or (u.get("InvocationID") and u.get("InvocationID") != inv0))
+    verdict, why = hibernate_verdict(ran, u.get("Result"), jump)
+    a.update(verdict=verdict, wall_jump_s=jump, unit_result=u.get("Result"), unit_ran=ran,
+             unit_status=u.get("ExecMainStatus"), waited_s=round(time.monotonic() - t0, 1))
+    if why:
+        a["why"] = why
+        analyse_failure(a, t_wall)
+    log(f"attempt {n}: hibernate {verdict} wall_jump={jump}s result={u.get('Result')}"
+        + (f" ({why})" if why else "") + describe(a))
+    return a
+
+
+def analyse_failure(a, since):
+    """Who refused to freeze (kernel log since `since`) and which FUSE mounts hang."""
+    k = parse_kernel(kernel_since(since))
+    a["freeze_failures"], a["entries"] = k["freeze_failures"], k["entries"]
+    a["blockers"] = []
+    for b in k["blockers"]:
+        b.update(resolve(b["pid"]))
+        a["blockers"].append(b)
+    a["fuse"] = [c for c in fuse_connections() if c["waiting"] > 0]
+    return a
+
+
+def describe(a):
+    return ("".join(f"; blocker {b.get('comm') or b['threads'][0]} pid {b['pid']} ({','.join(b['threads'][:3])}"
+                    f"{' in ' + b['fuse_fn'] if b.get('fuse_fn') else ''})" for b in a.get("blockers", []))
+            + "".join(f"; fuse {c['mount']} waiting={c['waiting']}" for c in a.get("fuse", [])))
+
+
+# ------------------------------------------------------------------ marker
+def marker_set():
+    try:
+        os.makedirs(os.path.dirname(MARKER), exist_ok=True)
+        with open(MARKER + ".tmp", "w") as f:
+            f.write(f"{os.getpid()} {int(time.time())}\n")
+        os.replace(MARKER + ".tmp", MARKER)
+    except OSError as e:
+        log(f"marker: cannot write {MARKER}: {e}")
+
+
+def marker_clear():
+    try:
+        if (rd(MARKER, "") or "").split()[:1] == [str(os.getpid())]:
+            os.remove(MARKER)
+    except OSError:
+        pass
+
+
+def marker_active(path=None):
+    """pid of a live sleep-verified run holding the marker, else None (stale markers ignored)."""
+    f = (rd(path or MARKER, "") or "").split()
+    if not f or not f[0].isdigit():
+        return None
+    try:
+        os.kill(int(f[0]), 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        pass
+    return int(f[0])
+
+
+# ------------------------------------------------------------------ remedies
+def abort_fuse(conns, dry):
+    done = []
+    for c in conns:
+        if not c["abort_writable"]:
+            log(f"unstick: cannot abort fuse {c['conn']} {c['mount']} (not his connection)")
+            continue
+        if dry:
+            done.append(c)
+            continue
+        try:
+            with open(f"{FUSECONN}/{c['conn']}/abort", "w") as f:
+                f.write("1")
+            log(f"unstick: aborted fuse connection {c['conn']} {c['mount']} ({c['fstype']}, waiting={c['waiting']})")
+            done.append(c)
+        except OSError as e:
+            log(f"unstick: abort {c['conn']} failed: {e}")
+    return done
+
+
+REMOUNT_UNITS = {"fuse.gvfsd-fuse": "gvfs-daemon.service", "fuse.portal": "xdg-document-portal.service"}
+
+
+def remount(aborted):
+    for c in aborted:
+        unit = REMOUNT_UNITS.get(c["fstype"])
+        if not unit:
+            log(f"remount: {c['mount']} ({c['fstype']}) needs a hand remount (fusermount3 -uz then restart its app)")
+            continue
+        run(["fusermount3", "-uz", c["mount"]])
+        rc, _, err = run(["systemctl", "--user", "restart", unit], timeout=20)
+        log(f"remount: {c['mount']} via restart {unit}: {'ok' if rc == 0 else 'FAILED ' + err[:120]}")
+
+
+def kill_blockers(blockers):
+    me, killed = os.getpid(), []
+    mine = {me, os.getppid()}
+    for b in blockers:
+        pid = b["pid"]
+        if pid in mine or pid <= 1:
+            continue
+        # Only the same process the kernel named (pid reuse) and only his own.
+        try:
+            own = os.stat(f"{PROC}/{pid}").st_uid == os.getuid()
+        except OSError:
+            log(f"kill: pid {pid} is gone already")
+            continue
+        if not own or (b.get("comm") and rd(f"{PROC}/{pid}/comm") != b.get("comm")):
+            log(f"kill: skipped pid {pid} (not his, or no longer {b.get('comm')})")
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed.append(pid)
+            log(f"kill: SIGKILL {b.get('comm')} pid {pid} ({b.get('exe')})")
+        except OSError as e:
+            log(f"kill: {pid} failed: {e}")
+    return killed
+
+
+# ------------------------------------------------------------------ reporting
+def notify_failed(rec, knobs):
+    """Sticky critical card (replaces the previous one), a beep, one Telegram line."""
+    b = (rec.get("blockers") or [None])[0]
+    fuse = rec.get("fuse") or []
+    who = (f"{b.get('comm') or b['threads'][0]} pid {b['pid']} stuck"
+           + (" in FUSE" if b.get("fuse_fn") or fuse else "")
+           + (f" on {fuse[0]['mount']}" if fuse else "")) if b else (rec.get("why") or "no blocker named by the kernel")
+    pct = rec.get("battery_pct")
+    unstick = "applied" if any(r.startswith("unstick") for r in rec["remedy_applied"]) else \
+        ("on, nothing to abort" if knobs["UNSTICK_FUSE"] == "1" else "off")
+    lr = rec.get("last_resort") or {}
+    tail = ""
+    if lr.get("verdict") == "REFUSED" and lr.get("op") == "hibernate":
+        tail = "; hibernate not configured (no resume=), laptop will stay on"
+    elif lr.get("verdict") == "FAILED":
+        tail = f"; hibernate FAILED too ({lr.get('fail_why')})"
+    line = (f"Suspend FAILED ({rec['reason']}, {pct if pct is not None else '?'} %): {who}; unstick={unstick}, "
+            f"laptop still ON{tail}")
+    rec["message"] = line
+    idf = os.path.join(STATE, "notify-id")
+    cmd = ["notify-send", "-u", "critical", "-t", "0", "-p"]
+    # Default app name on purpose: mako's do-not-disturb mode hides every app
+    # except "notify-send" (omarchy core.ini), and this card must never hide.
+    old = rd(idf)
+    if old and old.isdigit():
+        cmd += ["-r", old]
+    cmd += ["Suspend FAILED — laptop is still ON",
+            f"{who}{tail}.\nAttempts: {len(rec['attempts'])}. Remedies: {', '.join(rec['remedy_applied']) or 'none'}.\n"
+            f"Save your work or plug in. Details: sleep-verified last.json"]
+    rc, out, _ = run(cmd, timeout=5)
+    if rc == 0 and out.strip().isdigit():
+        with open(idf, "w") as f:
+            f.write(out.strip())
+    subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-t", "0.6", "-f", "lavfi", "-i",
+                      "sine=frequency=880:duration=0.6"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # One Telegram line per distinct failure per 15 min (the guard retries every tick).
+    key = f"{rec['reason']}|{b['pid'] if b else rec.get('why')}"
+    last = {}
+    try:
+        last = json.load(open(os.path.join(STATE, "telegram-last.json")))
+    except (OSError, ValueError):
+        pass
+    if last.get("key") == key and time.time() - last.get("ts", 0) < TG_DEDUPE:
+        log("telegram: same failure sent < 15 min ago, skipped")
+        return
+    if os.access(TELEGRAM, os.X_OK):
+        rc, _, err = run(["timeout", "20", TELEGRAM, "-m", line], timeout=25)
+        log(f"telegram: {'sent' if rc == 0 else 'FAILED ' + err[:120]}")
+        json.dump({"key": key, "ts": time.time()}, open(os.path.join(STATE, "telegram-last.json"), "w"))
+    time.sleep(0.7)   # let the beep finish before a oneshot unit's cgroup is cleaned up
+
+
+def telegram(line, key=None):
+    """One Telegram line; with a key, at most one per TG_DEDUPE s for that key."""
+    os.makedirs(STATE, exist_ok=True)
+    kf = os.path.join(STATE, "telegram-keys.json")
+    seen = {}
+    if key:
+        try:
+            seen = json.load(open(kf))
+        except (OSError, ValueError):
+            seen = {}
+        if time.time() - seen.get(key, 0) < TG_DEDUPE:
+            log(f"telegram: '{key}' sent < 15 min ago, skipped")
+            return
+    if not os.access(TELEGRAM, os.X_OK):
+        log("telegram: sender missing, skipped")
+        return
+    rc, _, err = run(["timeout", "20", TELEGRAM, "-m", line], timeout=25)
+    log(f"telegram: {'sent' if rc == 0 else 'FAILED ' + err[:120]}")
+    if key:
+        seen[key] = time.time()
+        json.dump(seen, open(kf, "w"))
+
+
+def last_resort(rec, knobs, why, notify=True):
+    """LAST_RESORT (hibernate | poweroff). Returns HIBERNATED, FAILED, REFUSED or POWEROFF."""
+    op = knobs["LAST_RESORT"]
+    pct, _ = battery()
+    rec["last_resort"] = {"op": op, "why": why, "battery_pct": pct}
+    if op == "none":
+        rec["last_resort"]["verdict"] = "REFUSED"
+        return "REFUSED"
+    if op == "hibernate" and not resume_configured():
+        log(f"last resort: hibernate REFUSED ({why}) — no resume= on the kernel command line "
+            "(the image could not be restored); the laptop stays on")
+        rec["remedy_applied"].append("hibernate-refused:no-resume")
+        rec["last_resort"]["verdict"] = "REFUSED"
+        return "REFUSED"
+    log(f"last resort: {op} at {pct}% ({why}; LAST_RESORT_PCT={knobs['LAST_RESORT_PCT']})")
+    rec["remedy_applied"].append(f"last-resort:{op}")
+    if op == "poweroff":
+        rec["verdict"] = "FAILED"
+        rec["last_resort"]["verdict"] = "POWEROFF"
+        write_record(rec)
+        run(["systemctl", "poweroff"], timeout=30)
+        return "POWEROFF"
+    a = hibernate_attempt(len(rec["attempts"]) + 1)
+    rec["attempts"].append(a)
+    rec["last_resort"]["verdict"] = a["verdict"]
+    if a.get("why"):
+        rec["last_resort"]["fail_why"] = a["why"]
+    return a["verdict"]
+
+
+def write_record(rec):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = os.path.join(STATE, "last.json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(rec, f, indent=1)
+    os.replace(tmp, os.path.join(STATE, "last.json"))
+    with open(os.path.join(STATE, "history.jsonl"), "a") as f:
+        f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+
+# ------------------------------------------------------------------ main
+def main(argv):
+    global QUIET
+    args = {"reason": "user", "urgent": False, "dry": False, "notify": True, "post_mortem": False,
+            "since": None, "success_before": None, "slept": None, "retry": True,
+            "no_last_resort": False, "last_resort": False, "check": False}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--reason" and i + 1 < len(argv):
+            args["reason"] = argv[i + 1]
+            i += 1
+        elif a.startswith("--reason="):
+            args["reason"] = a.split("=", 1)[1]
+        elif a == "--urgent":
+            args["urgent"] = True
+        elif a == "--dry-run":
+            args["dry"] = True
+        elif a == "--no-notify":
+            args["notify"] = False
+        elif a == "--post-mortem":
+            args["post_mortem"] = True
+        elif a == "--no-retry":
+            args["retry"] = False
+        elif a == "--no-last-resort":
+            args["no_last_resort"] = True
+        elif a == "--last-resort":
+            args["last_resort"] = True
+        elif a == "--check":
+            args["check"] = True
+        elif a in ("--since", "--success-before", "--slept") and i + 1 < len(argv):
+            try:
+                args[a[2:].replace("-", "_")] = float(argv[i + 1])
+            except ValueError:
+                print(f"sleep-verified: {a} needs a number", file=sys.stderr)
+                return 2
+            i += 1
+        elif a == "--parse-kernel" and i + 1 < len(argv):
+            print(json.dumps(parse_kernel(open(argv[i + 1]).read()), indent=1))
+            return 0
+        elif a == "--show-conf":
+            print(json.dumps(load_conf(), indent=1))
+            return 0
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        else:
+            print(f"sleep-verified: unknown argument {a}", file=sys.stderr)
+            return 2
+        i += 1
+    if args["dry"]:
+        QUIET = False
+    reason, user_asked = args["reason"], args["reason"] in ("user", "power-button", "menu", "idle")
+    knobs = load_conf()
+    for b in knobs.pop("_invalid"):
+        log(f"conf: ignoring invalid {b} in {CONF}; using the default")
+
+    if args["last_resort"] and args["check"]:
+        ok = knobs["LAST_RESORT"] == "poweroff" or (knobs["LAST_RESORT"] == "hibernate" and resume_configured())
+        print(f"last resort {knobs['LAST_RESORT']}: "
+              + ("available" if ok else ("off (LAST_RESORT=none)" if knobs["LAST_RESORT"] == "none"
+                                         else "NOT available (no resume= on the kernel command line)")))
+        return 0 if ok else 4
+
+    os.makedirs(STATE, exist_ok=True)
+    lock = open(os.path.join(STATE, "lock"), "w")
+    if args["last_resort"]:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            log(f"last resort ({reason}): another sleep-verified is running; nothing done")
+            return 2
+        marker_set()
+        try:
+            return last_resort_flow(args, knobs)
+        finally:
+            marker_clear()
+    if args["post_mortem"]:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            log(f"post-mortem ({reason}): another sleep-verified is running; it owns this sleep, nothing done")
+            return 2
+        marker_set()
+        try:
+            return post_mortem(args, knobs)
+        finally:
+            marker_clear()
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        if not user_asked:
+            log(f"refused ({reason}): another sleep-verified is running")
+            return 2
+        log(f"another sleep-verified is running; {reason} goes ahead anyway (his request is never blocked)")
+
+    # (a) pre-flight, bounded: the snapshot gets 1.5 s, the scans are /proc reads.
+    t0 = time.monotonic()
+    pct, on_bat = battery()
+    if os.access(SNAPSHOT, os.X_OK) and not args["dry"]:
+        try:
+            subprocess.run([SNAPSHOT, "--quiet"], timeout=1.5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            log("pre-flight: snapshot timed out (1.5 s), going on")
+    waiters, conns = fuse_waiters(), fuse_connections()
+    stuck = [c for c in conns if c["waiting"] > 0]
+    log(f"pre-flight ({reason}{', urgent' if args['urgent'] else ''}, battery {pct}%"
+        f"{' on battery' if on_bat else ''}): {len(waiters)} task(s) waiting in FUSE, "
+        f"{len(stuck)} FUSE connection(s) with waiting>0, {time.monotonic() - t0:.2f}s")
+    for w in waiters[:10]:
+        log(f"pre-flight: {w['comm']} pid {w['pid']} thread {w['thread']} ({w['tid']}) "
+            f"state {w['state']} wchan {w['wchan']}")
+    for c in stuck:
+        log(f"pre-flight: fuse conn {c['conn']} {c['mount']} ({c['fstype']}) waiting={c['waiting']}")
+
+    if args["dry"]:
+        s = suspend_stats()
+        print(json.dumps({"suspend_stats": s, "knobs": knobs, "fuse_connections": conns,
+                          "fuse_waiters": waiters}, indent=1))
+        print(f"would suspend ({reason}): systemctl suspend, then verify via suspend_stats/success "
+              f"(now {s.get('success')}) and {UNIT}")
+        return 0
+
+    marker_set()
+    try:
+        return suspend_flow(args, knobs, pct, waiters, stuck)
+    finally:
+        marker_clear()
+
+
+def suspend_flow(args, knobs, pct, waiters, stuck):
+    reason = args["reason"]
+    rec = {"ts": int(time.time()), "reason": reason, "urgent": args["urgent"], "battery_pct": pct,
+           "preflight": {"fuse_waiters": waiters, "fuse_stuck": stuck}, "attempts": [],
+           "remedy_applied": [], "blockers": [], "fuse": []}
+    a = attempt(1)
+    rec["attempts"].append(a)
+    aborted = []
+
+    def absorb(a):
+        if a.get("blockers"):
+            rec["blockers"] = a["blockers"]
+        if a.get("fuse"):
+            rec["fuse"] = a["fuse"]
+        if a.get("why"):
+            rec["why"] = a["why"]
+
+    absorb(a)
+    if a["verdict"] == "FAILED" and knobs["UNSTICK_FUSE"] == "1":
+        hung = [c for c in fuse_connections() if c["waiting"] > 0]
+        aborted = abort_fuse(hung, False)
+        if aborted:
+            rec["remedy_applied"].append("unstick:" + ",".join(c["mount"] for c in aborted))
+            time.sleep(1)
+            a = attempt(len(rec["attempts"]) + 1)
+            rec["attempts"].append(a)
+            absorb(a)
+    kill = knobs["KILL_BLOCKERS"] == "always" or (knobs["KILL_BLOCKERS"] == "lower" and args["urgent"])
+    if a["verdict"] == "FAILED" and kill and a.get("blockers"):
+        killed = kill_blockers(a["blockers"])
+        if killed:
+            rec["remedy_applied"].append("kill:" + ",".join(map(str, killed)))
+            time.sleep(2)
+            a = attempt(len(rec["attempts"]) + 1)
+            rec["attempts"].append(a)
+            absorb(a)
+    rec["verdict"] = a["verdict"]
+    # The last resort (2026-10-06): at battery-guard's LOWER limit (--urgent) at once
+    # once the ladder is exhausted, otherwise only at <= LAST_RESORT_PCT on battery.
+    if a["verdict"] == "FAILED" and knobs["LAST_RESORT"] != "none" and not args["no_last_resort"]:
+        pct, on_bat = battery()
+        low = on_bat and pct is not None and pct <= float(knobs["LAST_RESORT_PCT"])
+        if args["urgent"] or low:
+            why = ("lower limit, suspend ladder exhausted" if args["urgent"]
+                   else f"{pct}% <= LAST_RESORT_PCT {knobs['LAST_RESORT_PCT']}")
+            if last_resort(rec, knobs, why) == "HIBERNATED":
+                rec["verdict"] = "HIBERNATED"
+    if aborted and knobs["REMOUNT_AFTER_UNSTICK"] == "1":
+        remount(aborted)
+        rec["remedy_applied"].append("remounted")
+    rec["done"] = int(time.time())
+    if rec["verdict"] == "FAILED" and args["notify"]:
+        notify_failed(rec, knobs)
+    elif rec["verdict"] == "HIBERNATED" and args["notify"]:
+        run(["notify-send", "-u", "normal", "-t", "0", "Suspend failed — hibernated instead",
+             f"The {reason} suspend failed after: {', '.join(rec['remedy_applied'])}. "
+             "See sleep-verified last.json."], timeout=5)
+    elif rec["verdict"] == "SLEPT" and rec["remedy_applied"] and args["notify"]:
+        run(["notify-send", "-u", "normal", "-t", "0", "Suspend needed a fix",
+             f"It slept after: {', '.join(rec['remedy_applied'])}. See sleep-verified last.json."], timeout=5)
+    write_record(rec)
+    log(f"verdict {rec['verdict']} ({reason}) after {len(rec['attempts'])} attempt(s); "
+        f"remedies: {', '.join(rec['remedy_applied']) or 'none'}")
+    return 0 if rec["verdict"] in ("SLEPT", "HIBERNATED") else 1
+
+
+def last_resort_flow(args, knobs):
+    """battery-guard at <= LAST_RESORT_PCT: the last resort directly, no suspend attempt first."""
+    reason = args["reason"] if args["reason"] != "user" else "last-resort"
+    pct, _ = battery()
+    rec = {"ts": int(time.time()), "reason": reason, "urgent": True, "battery_pct": pct, "source": "last-resort",
+           "attempts": [], "remedy_applied": [], "blockers": [], "fuse": []}
+    v = last_resort(rec, knobs, f"direct at {pct}% (<= LAST_RESORT_PCT {knobs['LAST_RESORT_PCT']})")
+    if v == "POWEROFF":
+        return 0
+    rec["verdict"] = {"HIBERNATED": "HIBERNATED", "REFUSED": "REFUSED"}.get(v, "FAILED")
+    rec["done"] = int(time.time())
+    if v == "REFUSED" and args["notify"]:
+        telegram(f"Battery {pct} %: hibernate not configured (no resume=), laptop will stay on "
+                 "unless the lower-limit suspend works", key="hibernate-refused")
+    if v == "FAILED":
+        a = rec["attempts"][-1] if rec["attempts"] else {}
+        rec["blockers"], rec["fuse"] = a.get("blockers", []), a.get("fuse", [])
+        rec["why"] = a.get("why")
+        if args["notify"]:
+            telegram(f"Hibernate FAILED at {pct} % ({a.get('why')}); battery-guard tries a suspend next",
+                     key="hibernate-failed")
+    write_record(rec)
+    log(f"last resort verdict {rec['verdict']} ({reason})")
+    return {"HIBERNATED": 0, "REFUSED": 4}.get(v, 1)
+
+
+def post_mortem(args, knobs):
+    """A sleep nobody verified FAILED (sleep-watch saw it): analyse, unstick, retry once, alert.
+
+    Never kills and never takes the LAST_RESORT: those are battery-guard's, at his limits.
+    """
+    reason = args["reason"]
+    since = args["since"] or time.time() - 180
+    pct, _ = battery()
+    now = suspend_stats()
+    a0 = {"n": 0, "observed": True, "started": int(since), "verdict": "FAILED",
+          "success": [int(args["success_before"]) if args["success_before"] is not None else None,
+                      now.get("success")],
+          "fail": [None, now.get("fail")], "last_failed_step": now.get("last_failed_step"),
+          "slept_s": args["slept"]}
+    analyse_failure(a0, since)
+    log(f"post-mortem ({reason}): the sleep FAILED (nobody verified it), success "
+        f"{a0['success'][0]}->{a0['success'][1]}" + describe(a0))
+    rec = {"ts": int(time.time()), "reason": reason, "urgent": False, "battery_pct": pct,
+           "source": "sleep-watch", "attempts": [a0], "remedy_applied": [],
+           "blockers": a0["blockers"], "fuse": a0["fuse"]}
+    a, aborted = a0, []
+    if knobs["UNSTICK_FUSE"] == "1":
+        aborted = abort_fuse([c for c in fuse_connections() if c["waiting"] > 0], False)
+        if aborted:
+            rec["remedy_applied"].append("unstick:" + ",".join(c["mount"] for c in aborted))
+            time.sleep(1)
+    cancelled = False
+    if args["retry"] and knobs["ACTIVITY_CANCELS"] != "never" and int(knobs["RETRY_GRACE"]) > 0:
+        cancelled = activity_grace(rec, knobs, reason, args["notify"])
+    if cancelled:
+        rec["cancelled"] = "activity"
+        rec["remedy_applied"].append("retry-cancelled:activity")
+    elif args["retry"]:
+        rec["remedy_applied"].append("retry")
+        a = attempt(1)
+        rec["attempts"].append(a)
+        if a.get("blockers"):
+            rec["blockers"] = a["blockers"]
+        if a.get("fuse"):
+            rec["fuse"] = a["fuse"]
+        if a.get("why"):
+            rec["why"] = a["why"]
+    else:
+        log(f"post-mortem ({reason}): no retry (sleep-watch already retried within its 10-minute cap)")
+    rec["verdict"] = a["verdict"]
+    if aborted and knobs["REMOUNT_AFTER_UNSTICK"] == "1":
+        remount(aborted)
+        rec["remedy_applied"].append("remounted")
+    rec["done"] = int(time.time())
+    if cancelled:
+        pass              # he is back: the "you're back" card replaced the countdown, no alarm
+    elif rec["verdict"] == "FAILED" and args["notify"]:
+        notify_failed(rec, knobs)
+    elif rec["verdict"] == "SLEPT" and args["notify"]:
+        run(["notify-send", "-u", "normal", "-t", "0", "Suspend needed a retry",
+             f"The {reason} suspend failed at first; it slept after: {', '.join(rec['remedy_applied'])}. "
+             "See sleep-verified last.json."], timeout=5)
+    write_record(rec)
+    log(f"post-mortem verdict {rec['verdict']} ({reason}); remedies: {', '.join(rec['remedy_applied']) or 'none'}")
+    if cancelled:
+        return 3
+    return 0 if rec["verdict"] == "SLEPT" else 1
+
+
+def activity_grace(rec, knobs, reason, notify=True):
+    """Sticky countdown card, then input-activity-wait. True = he is back (cancel the retry)."""
+    g = int(knobs["RETRY_GRACE"])
+    pct, _ = battery()
+    p = f"{pct:.0f}" if pct is not None else "?"
+    idf = os.path.join(STATE, "notify-id")
+    card = None
+    if notify:
+        cmd = ["notify-send", "-u", "critical", "-t", "0", "-p"]
+        old = rd(idf)
+        if old and old.isdigit():
+            cmd += ["-r", old]
+        rc, out, _ = run(cmd + [f"Sleep failed at {p} % — retrying in {g} s",
+                                "Press a key, move the mouse or touch the screen to cancel."], timeout=5)
+        if rc == 0 and out.strip().isdigit():
+            card = out.strip()
+            with open(idf, "w") as f:
+                f.write(card)
+    log(f"post-mortem ({reason}): retry in {g}s unless he is back (input-activity-wait)")
+    rc, out, err = run([ACTIVITY_CMD, "--seconds", str(g), "--settle", "1"], timeout=g + 15)
+    rec["activity_grace"] = {"seconds": g, "exit": rc, "seen": out[:200] if rc == 0 else None}
+    if rc == 0:
+        log(f"post-mortem ({reason}): retry cancelled — activity during the grace ({out[:160]})")
+        if notify:
+            cmd = ["notify-send", "-u", "normal", "-t", "20000"] + (["-r", card] if card else [])
+            run(cmd + ["Retry cancelled: you're back", f"Laptop is awake at {p} %."], timeout=5)
+            telegram(f"Sleep failed ({reason}) at {p} %; retry cancelled: you're back, laptop awake")
+        return True
+    if rc == 1:
+        log(f"post-mortem ({reason}): no activity in {g}s; retrying")
+    else:
+        log(f"post-mortem ({reason}): activity check unavailable (exit {rc}: {err[:120]}); retrying anyway")
+    return False
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

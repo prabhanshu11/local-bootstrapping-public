@@ -1,0 +1,172 @@
+#!/bin/bash
+# battery-guard-test-stage <E|A|B|C|D|F|G> — run one stage of
+# docs/issues/laptop-low-battery-suspend-TESTPLAN.md and print the evidence.
+# It does not judge PASS/FAIL; the caller (battery-guard-test-runner → claude) does.
+#
+# Exit: 0 stage ran (evidence printed) · 3 preconditions not met, nothing done.
+set -u
+
+STAGE="${1:-}"
+G="$HOME/.local/bin/battery-guard"
+TS="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/battery-guard.TEST.state"
+AC=/sys/class/power_supply/AC/online
+CAP=/sys/class/power_supply/BAT0/capacity
+INSTALLED="2026-09-17 23:30"   # after the last untagged manual fake run
+
+on_battery_ok() { [[ "$(cat $AC)" == "0" ]] && (( $(cat $CAP) >= 35 )); }
+
+need_ac() {
+    if [[ "$(cat $AC)" != "1" ]]; then
+        echo "PRECONDITION-FAIL: AC=$(cat $AC) (need AC=1)"
+        exit 3
+    fi
+}
+
+need_battery() {
+    if ! on_battery_ok; then
+        echo "PRECONDITION-FAIL: AC=$(cat $AC) capacity=$(cat $CAP) (need AC=0 and capacity>=35)"
+        exit 3
+    fi
+}
+
+# 5-minute warning, 1-minute reminder. Blocks ~4 min.
+test_notice() {
+    /usr/bin/notify-send -u critical -a battery-guard "battery-guard TEST in 5 min: $1" \
+        "Laptop will suspend in about 5 minutes. Save what you need. Wake it with the lid or a key."
+    sleep 240
+    /usr/bin/notify-send -u critical -a battery-guard "battery-guard TEST in 1 min: $1" \
+        "Suspending in about a minute."
+}
+
+# Run the guard the way its timer does: inside the user manager, not this shell.
+run_guard() {
+    local t=$SECONDS
+    /usr/bin/systemd-run --user --wait --collect -q \
+        -E BATTERY_GUARD_STATE="$TS" -E BATTERY_GUARD_FAKE_CAPACITY="$1" \
+        -E BATTERY_GUARD_FAKE_STATUS=Discharging "$G"
+    echo "run_guard $1: exit=$? took=$((SECONDS - t))s"
+    notifications_now
+}
+
+# mako: a notification is in `list` while shown and only enters `history` once it
+# expires or is dismissed; critical ones never expire. Read both, every time.
+notifications_now() {
+    echo "--- notifications now (makoctl list + history, battery-guard) $(date -Is)"
+    { makoctl list; makoctl history; } 2>/dev/null | grep -A3 -iE "battery-guard|Battery [0-9]+%|Charger cannot" | head -40
+}
+
+# One AC-drain tick of the guard the way its timer runs it. Args: index, capacity (optional).
+# Energy falls 100 mWh per simulated minute from 40 000 mWh; AC is faked so the
+# stage is independent of the real charger, but the grace-period recheck still reads it.
+G_BASE=3000000
+run_guard_ac() {
+    local i=$1 cap="${2:-}" t=$SECONDS
+    /usr/bin/systemd-run --user --wait --collect -q \
+        -E BATTERY_GUARD_STATE="$TS" -E BATTERY_GUARD_FAKE_AC=1 \
+        -E BATTERY_GUARD_FAKE_NOW=$((G_BASE + i * 60)) -E BATTERY_GUARD_FAKE_ENERGY=$((40000000 - i * 100000)) \
+        ${cap:+-E BATTERY_GUARD_FAKE_CAPACITY=$cap} "$G" ${3:-}
+    echo "run_guard_ac $i${cap:+ cap=$cap}: exit=$? took=$((SECONDS - t))s"
+}
+
+# systemctl suspend is asynchronous: wait (awake time only) until N resumes are logged.
+wait_resumes() {
+    local want=$1 i
+    for i in $(seq 1 60); do
+        (( $(journalctl -k --since "$T0" --no-pager | grep -c "PM: suspend exit") >= want )) && { sleep 5; return 0; }
+        sleep 5
+    done
+    echo "wait_resumes: only $(journalctl -k --since "$T0" --no-pager | grep -c "PM: suspend exit")/$want resumes seen after 5 min awake"
+}
+
+evidence() {
+    echo "--- guard log since T0"
+    journalctl -t battery-guard --since "$T0" --no-pager -o short-iso
+    echo "--- kernel PM since T0"
+    journalctl -k --since "$T0" --no-pager -o short-iso | grep -E "PM: suspend (entry|exit)|failed to suspend|EMERGENCY"
+    echo "--- sleep units since T0"
+    journalctl --since "$T0" --no-pager -o short-iso -u systemd-suspend.service \
+        -u systemd-suspend-then-hibernate.service -u nvidia-suspend.service | grep -E "Starting|Finished|Failed"
+    notifications_now
+    echo "--- test state file"
+    cat "$TS" 2>/dev/null || echo "(none)"
+    echo "--- now: AC=$(cat $AC) capacity=$(cat $CAP) $(date -Is)"
+}
+
+[[ -r $CAP ]] || { echo "PRECONDITION-FAIL: no battery (not the laptop)"; exit 3; }
+T0=$(date -Is)
+echo "STAGE=$STAGE T0=$T0 AC=$(cat $AC) capacity=$(cat $CAP)"
+
+case "$STAGE" in
+E)
+    echo "SleepOperation: $(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager SleepOperation)"
+    test_notice "logind sleep path"
+    sleep 60
+    echo "systemctl sleep at $(date -Is)"
+    /usr/bin/systemctl sleep
+    wait_resumes 1
+    ;;
+A)
+    need_battery; rm -f "$TS"
+    test_notice "upper limit 20%"
+    need_battery
+    run_guard 19
+    wait_resumes 1
+    ;;
+B)
+    need_battery
+    [[ -r "$TS" ]] || printf 'warned=1\nupper_done=1\n' >"$TS"
+    echo "state before: $(tr '\n' ' ' <"$TS")"
+    run_guard 12
+    sleep 10
+    ;;
+C)
+    need_battery; printf 'warned=1\nupper_done=1\n' >"$TS"
+    test_notice "lower limit 7% — it will suspend TWICE, wake it both times"
+    need_battery
+    run_guard 6
+    wait_resumes 1
+    run_guard 6
+    wait_resumes 2
+    ;;
+D)
+    need_battery; rm -f "$TS"
+    /usr/bin/notify-send -u critical -a battery-guard "battery-guard TEST in 5 min: plug-in cancel" \
+        "In 5 minutes you will be asked to PLUG IN THE CHARGER within 60 s. If you are away the laptop suspends instead."
+    sleep 300
+    need_battery
+    /usr/bin/notify-send -u critical -a battery-guard "battery-guard TEST: PLUG IN THE CHARGER NOW" \
+        "You have 60 s. This checks that plugging in cancels the suspend."
+    run_guard 19
+    sleep 15
+    ;;
+G)
+    # AC drain (2026-09-18 failure class): 10 dry ticks build the energy history without
+    # tripping the detector, the 11th tick (real, not dry) trips it at capacity 19 and
+    # must notify, drop the power profile to balanced, and suspend once on AC.
+    need_ac; rm -f "$TS"
+    prev_profile="$(powerprofilesctl get 2>/dev/null || echo unknown)"
+    echo "power profile before: $prev_profile; override file: $([[ -e /tmp/power-profile-override ]] && echo present || echo absent)"
+    echo "--- dry ticks 0-9 (expect only capacity lines, no 'draining')"
+    for i in $(seq 0 9); do run_guard_ac "$i" "" --dry-run; done
+    echo "state after dry ticks: $(tr '\n' ' ' <"$TS")"
+    test_notice "AC drain — the laptop suspends once while PLUGGED IN"
+    need_ac
+    echo "--- real tick 10 at capacity 19 (expect: draining on AC, profile -> balanced, suspend)"
+    run_guard_ac 10 19
+    wait_resumes 1
+    echo "power profile after: $(powerprofilesctl get 2>/dev/null || echo unknown); override file: $([[ -e /tmp/power-profile-override ]] && echo present || echo absent)"
+    rm -f /tmp/power-profile-override
+    [[ "$prev_profile" != unknown ]] && powerprofilesctl set "$prev_profile" 2>/dev/null && echo "power profile restored to $prev_profile"
+    ;;
+F)
+    echo "--- real (untagged) guard events since install"
+    journalctl -t battery-guard --since "$INSTALLED" --no-pager -o short-iso \
+        | grep -E "warning at|suspending|cancelled" | grep -v "\[TEST\]"
+    echo "--- kernel PM since install"
+    journalctl -k --since "$INSTALLED" --no-pager -o short-iso | grep -E "PM: suspend (entry|exit)|failed to suspend" | tail -40
+    exit 0
+    ;;
+*)
+    echo "usage: battery-guard-test-stage <E|A|B|C|D|F|G>"; exit 2 ;;
+esac
+evidence

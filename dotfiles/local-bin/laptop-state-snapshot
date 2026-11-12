@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""
+laptop-state-snapshot — write down what is open, so a failed suspend or a dead
+battery never loses the map of his work.
+
+2026-10-03: a suspend failed silently, the laptop died at 0 %, and every
+window and Claude Code session was gone with no list of what had been open.
+His words: "let's develop the project in such a way that this kind of work
+loss doesn't happen."
+
+Writes ~/.local/state/laptop-state/latest.json and history/<ts>.json (keeps
+the newest 48 = 4 h at the 5-minute timer). Captures:
+  hyprctl clients / workspaces / monitors (-j)
+  Claude Code: running `claude` processes (pid, cwd, start, session id from
+  ~/.claude/sessions/<pid>.json) and the 15 most recently modified
+  ~/.claude/projects/*/*.jsonl (cwd, mtime, last user message <= 120 chars)
+  tmux sessions, battery %
+Run by laptop-state-snapshot.timer, sleep-verified's pre-flight and
+battery-guard's warning. Read it back with `laptop-state-restore --print`.
+
+Usage: laptop-state-snapshot [--quiet]
+"""
+
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+OUT = os.environ.get("LAPTOP_STATE_DIR") or os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "laptop-state")
+KEEP = 48
+RECENT = 15
+TAIL_BYTES = 768 * 1024   # last user message: read only the end of big transcripts
+
+
+def run(cmd, timeout=3, env=None):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        return p.returncode, p.stdout
+    except (OSError, subprocess.SubprocessError):
+        return 127, ""
+
+
+def hypr_env():
+    """hyprctl needs HYPRLAND_INSTANCE_SIGNATURE; a systemd unit may lack it."""
+    env = dict(os.environ)
+    if env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return env
+    rt = env.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    socks = sorted(glob.glob(f"{rt}/hypr/*/.socket.sock"), key=os.path.getmtime, reverse=True)
+    if socks:
+        env["HYPRLAND_INSTANCE_SIGNATURE"] = os.path.basename(os.path.dirname(socks[0]))
+        env.setdefault("XDG_RUNTIME_DIR", rt)
+    return env
+
+
+def hypr(what, env):
+    rc, out = run(["hyprctl", what, "-j"], env=env)
+    try:
+        return json.loads(out) if rc == 0 else None
+    except ValueError:
+        return None
+
+
+def rd(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def boot_time():
+    for line in (rd("/proc/stat") or "").splitlines():
+        if line.startswith("btime "):
+            return int(line.split()[1])
+    return 0
+
+
+def claude_processes():
+    hz, bt, out = os.sysconf("SC_CLK_TCK"), boot_time(), []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        if rd(f"/proc/{pid}/comm") != "claude":
+            continue
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            cwd = None
+        st = rd(f"/proc/{pid}/stat") or ""
+        start = bt + int(st.rsplit(")", 1)[1].split()[19]) // hz if ")" in st else None
+        args = (rd(f"/proc/{pid}/cmdline") or "").split("\0")
+        p = {"pid": int(pid), "cwd": cwd, "started": start, "args": " ".join(a for a in args[1:] if a)[:160]}
+        try:   # only the identifying fields; the file also holds keys/sockets
+            s = json.load(open(os.path.join(HOME, ".claude/sessions", f"{pid}.json")))
+            p.update({k: s.get(k) for k in ("sessionId", "kind", "name", "entrypoint") if s.get(k)})
+            p["cwd"] = s.get("cwd") or p["cwd"]
+        except (OSError, ValueError):
+            pass
+        out.append(p)
+    out.sort(key=lambda p: p["started"] or 0)
+    match_transcripts(out)
+    return out
+
+
+def project_dir(cwd):
+    """~/.claude/projects/<cwd with every non-alphanumeric char as '-'> (Claude Code's own naming)."""
+    return os.path.join(HOME, ".claude/projects", re.sub(r"[^A-Za-z0-9]", "-", cwd or ""))
+
+
+def match_transcripts(procs):
+    """For a process with no ~/.claude/sessions/<pid>.json (remote-control, older CLIs): the newest
+    transcript in its project dir written since the process started and not claimed by another
+    running session -> `transcript_guess`. Newest-started processes pick first."""
+    claimed = {p["sessionId"] for p in procs if p.get("sessionId")}
+    for p in sorted(procs, key=lambda p: p.get("started") or 0, reverse=True):
+        if p.get("sessionId") or not p.get("cwd"):
+            continue
+        files = []
+        for f in glob.glob(os.path.join(project_dir(p["cwd"]), "*.jsonl")):
+            try:
+                files.append((os.path.getmtime(f), f))
+            except OSError:
+                pass
+        for mtime, f in sorted(files, reverse=True):
+            sid = os.path.basename(f)[:-6]
+            if mtime < (p.get("started") or 0):
+                break
+            if sid in claimed:
+                continue
+            p["transcript_guess"] = {"sessionId": sid, "mtime": int(mtime)}
+            claimed.add(sid)
+            break
+
+
+def text_of(msg):
+    c = (msg or {}).get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts = [b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"]
+        return " ".join(parts)
+    return ""
+
+
+def last_user(path):
+    """(cwd, last real user message) from the end of a transcript."""
+    cwd, msg = None, None
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - TAIL_BYTES))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None, None
+    for line in reversed(lines):
+        try:
+            j = json.loads(line)
+        except ValueError:
+            continue
+        cwd = cwd or j.get("cwd")
+        if msg is None and j.get("type") == "user" and not j.get("isMeta"):
+            t = " ".join(text_of(j.get("message")).split())
+            if t and not t.startswith("<"):
+                msg = t[:120]
+        if cwd and msg:
+            break
+    return cwd, msg
+
+
+def recent_sessions():
+    files = glob.glob(os.path.join(HOME, ".claude/projects/*/*.jsonl"))
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    out = []
+    for p in files[:RECENT]:
+        cwd, msg = last_user(p)
+        out.append({"sessionId": os.path.basename(p)[:-6], "cwd": cwd, "mtime": int(os.path.getmtime(p)),
+                    "project": os.path.basename(os.path.dirname(p)), "last_user": msg})
+    return out
+
+
+def tmux():
+    rc, out = run(["tmux", "list-sessions", "-F",
+                   "#{session_name}\t#{session_windows}\t#{session_attached}\t#{pane_current_path}"])
+    if rc != 0:
+        return []
+    res = []
+    for line in out.splitlines():
+        f = line.split("\t")
+        if len(f) == 4:
+            res.append({"name": f[0], "windows": int(f[1]), "attached": f[2] != "0", "path": f[3]})
+    return res
+
+
+def battery():
+    b = "/sys/class/power_supply/BAT0"
+    now, full = rd(f"{b}/energy_now"), rd(f"{b}/energy_full")
+    if now and full and int(full):
+        return {"percent": round(int(now) * 100 / int(full), 1), "status": rd(f"{b}/status")}
+    return None
+
+
+def main():
+    quiet = "--quiet" in sys.argv
+    t0 = time.time()
+    env = hypr_env()
+    snap = {"ts": int(t0), "host": os.uname().nodename,
+            "clients": hypr("clients", env), "workspaces": hypr("workspaces", env),
+            "monitors": hypr("monitors", env), "claude_running": claude_processes(),
+            "claude_recent": recent_sessions(), "tmux": tmux(), "battery": battery()}
+    # Keep only what a restore needs from each window (the full dump is large).
+    if isinstance(snap["clients"], list):
+        snap["clients"] = [{k: c.get(k) for k in ("address", "class", "title", "initialClass", "pid",
+                                                   "workspace", "monitor", "floating", "fullscreen",
+                                                   "at", "size", "focusHistoryID")}
+                           for c in snap["clients"]]
+    snap["took_s"] = round(time.time() - t0, 2)
+    os.makedirs(os.path.join(OUT, "history"), exist_ok=True)
+    name = time.strftime("%Y%m%d-%H%M%S", time.localtime(t0))
+    data = json.dumps(snap, indent=1)
+    with open(os.path.join(OUT, "history", f"{name}.json"), "w") as f:
+        f.write(data)
+    tmp = os.path.join(OUT, "latest.json.tmp")
+    with open(tmp, "w") as f:
+        f.write(data)
+    os.replace(tmp, os.path.join(OUT, "latest.json"))
+    hist = sorted(glob.glob(os.path.join(OUT, "history", "*.json")))
+    for old in hist[:-KEEP]:
+        os.remove(old)
+    if not quiet:
+        n = len(snap["clients"] or [])
+        print(f"laptop-state-snapshot: {n} windows, {len(snap['claude_running'])} claude running, "
+              f"{len(snap['tmux'])} tmux, {snap['took_s']}s -> {os.path.join(OUT, 'latest.json')}")
+
+
+if __name__ == "__main__":
+    main()

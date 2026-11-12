@@ -1,0 +1,6 @@
+[Unit]
+Description=Power profile auto-switcher
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/power-profile-monitor switch

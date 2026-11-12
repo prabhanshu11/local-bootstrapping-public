@@ -1,0 +1,534 @@
+#!/bin/bash
+# system-health - Unified system health monitor for Omarchy
+#
+# Monitors and manages:
+# - Clipboard (elephant/wl-paste health)
+# - Bluetooth (power, discoverable, auto-connect)
+# - WiFi (connected, auto-connect)
+#
+# Usage:
+#   system-health status           # JSON status for waybar
+#   system-health clipboard        # Clipboard health JSON
+#   system-health bluetooth        # Bluetooth status JSON
+#   system-health wifi             # WiFi status JSON
+#   system-health toggle <component> <setting>
+#
+# Waybar integration:
+#   Each component returns JSON with: text, class, tooltip
+#
+# Click actions in waybar widgets handle all toggles
+
+set -euo pipefail
+
+# ============================================================================
+# Common utilities
+# ============================================================================
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+emit_json() {
+    local text="$1" class="$2" tooltip="$3"
+    tooltip=$(json_escape "$tooltip")
+    printf '{"text":"%s","class":"%s","tooltip":"%s"}\n' "$text" "$class" "$tooltip"
+}
+
+notify() {
+    local title="$1" msg="$2" urgency="${3:-normal}"
+    notify-send -u "$urgency" "$title" "$msg" 2>/dev/null || true
+}
+
+# ============================================================================
+# Clipboard Health
+# ============================================================================
+
+clipboard_check() {
+    local elephant_pid wl_paste_ok zombie_found
+
+    # Check elephant service
+    if ! systemctl --user is-active --quiet elephant.service 2>/dev/null; then
+        echo "error:service_down"
+        return
+    fi
+
+    elephant_pid=$(pgrep -x elephant 2>/dev/null || true)
+    if [[ -z "$elephant_pid" ]]; then
+        echo "error:no_process"
+        return
+    fi
+
+    # Check for zombie wl-paste
+    if ps --ppid "$elephant_pid" -o stat,comm 2>/dev/null | grep -q "^Z.*wl-paste"; then
+        echo "error:zombie"
+        return
+    fi
+
+    # Check if wl-paste --watch is running
+    if ! pgrep -P "$elephant_pid" -a 2>/dev/null | grep -q "wl-paste.*--watch"; then
+        echo "error:no_watcher"
+        return
+    fi
+
+    echo "ok"
+}
+
+clipboard_fix() {
+    notify "Clipboard" "Restarting elephant service..."
+    systemctl --user restart elephant.service
+    sleep 1
+    local status
+    status=$(clipboard_check)
+    if [[ "$status" == "ok" ]]; then
+        notify "Clipboard" "Fixed - clipboard capture restored" "low"
+    else
+        notify "Clipboard" "Still broken: $status" "critical"
+    fi
+}
+
+clipboard_json() {
+    local status text class tooltip
+    status=$(clipboard_check)
+
+    case "$status" in
+        ok)
+            text="󰅍"
+            class="ok"
+            tooltip="Clipboard: OK
+wl-paste watcher running
+
+Super+Ctrl+V: Open history
+Left-click: Fix if broken"
+            ;;
+        error:zombie)
+            text="󰅍!"
+            class="error"
+            tooltip="Clipboard: BROKEN (zombie wl-paste)
+New copies not being captured
+
+Left-click: Fix"
+            ;;
+        error:no_watcher)
+            text="󰅍!"
+            class="error"
+            tooltip="Clipboard: BROKEN (watcher dead)
+New copies not being captured
+
+Left-click: Fix"
+            ;;
+        error:*)
+            text="󰅍?"
+            class="warning"
+            tooltip="Clipboard: Issue (${status#error:})
+
+Left-click: Fix"
+            ;;
+    esac
+
+    emit_json "$text" "$class" "$tooltip"
+}
+
+# ============================================================================
+# Bluetooth
+# ============================================================================
+
+bt_get_controller() {
+    # Get default controller info via D-Bus
+    local powered discoverable pairable
+
+    # Check if bluetooth service is running
+    if ! systemctl is-active --quiet bluetooth.service 2>/dev/null; then
+        echo "service_down"
+        return
+    fi
+
+    # Check if controller exists
+    if ! rfkill list bluetooth 2>/dev/null | grep -q "hci"; then
+        echo "no_controller"
+        return
+    fi
+
+    # Check rfkill
+    if rfkill list bluetooth 2>/dev/null | grep -q "Soft blocked: yes"; then
+        echo "rfkill_blocked"
+        return
+    fi
+
+    # Get power status via D-Bus
+    powered=$(dbus-send --system --print-reply --dest=org.bluez /org/bluez/hci0 \
+        org.freedesktop.DBus.Properties.Get string:org.bluez.Adapter1 string:Powered 2>/dev/null \
+        | grep boolean | awk '{print $NF}')
+
+    discoverable=$(dbus-send --system --print-reply --dest=org.bluez /org/bluez/hci0 \
+        org.freedesktop.DBus.Properties.Get string:org.bluez.Adapter1 string:Discoverable 2>/dev/null \
+        | grep boolean | awk '{print $NF}')
+
+    echo "powered:${powered:-false}:discoverable:${discoverable:-false}"
+}
+
+bt_get_connected_count() {
+    dbus-send --system --print-reply --dest=org.bluez / \
+        org.freedesktop.DBus.ObjectManager.GetManagedObjects 2>/dev/null \
+        | grep -c "org.bluez.Device1" | tr -d ' ' || echo "0"
+}
+
+bt_toggle_power() {
+    local current
+    current=$(bt_get_controller)
+
+    if [[ "$current" == "rfkill_blocked" ]]; then
+        rfkill unblock bluetooth
+        notify "Bluetooth" "Unblocked" "low"
+        sleep 0.5
+    fi
+
+    local powered
+    powered=$(echo "$current" | grep -oP 'powered:\K(true|false)')
+
+    if [[ "$powered" == "true" ]]; then
+        # Turn off
+        rfkill block bluetooth
+        notify "Bluetooth" "Disabled" "low"
+    else
+        # Turn on
+        rfkill unblock bluetooth
+        notify "Bluetooth" "Enabled" "low"
+    fi
+}
+
+bt_toggle_discoverable() {
+    local current powered
+    current=$(bt_get_controller)
+    powered=$(echo "$current" | grep -oP 'powered:\K(true|false)')
+
+    if [[ "$powered" != "true" ]]; then
+        notify "Bluetooth" "Enable Bluetooth first" "normal"
+        return 1
+    fi
+
+    local discoverable
+    discoverable=$(echo "$current" | grep -oP 'discoverable:\K(true|false)')
+
+    if [[ "$discoverable" == "true" ]]; then
+        dbus-send --system --print-reply --dest=org.bluez /org/bluez/hci0 \
+            org.freedesktop.DBus.Properties.Set string:org.bluez.Adapter1 \
+            string:Discoverable variant:boolean:false >/dev/null 2>&1
+        notify "Bluetooth" "Discoverable OFF" "low"
+    else
+        dbus-send --system --print-reply --dest=org.bluez /org/bluez/hci0 \
+            org.freedesktop.DBus.Properties.Set string:org.bluez.Adapter1 \
+            string:Discoverable variant:boolean:true >/dev/null 2>&1
+        notify "Bluetooth" "Discoverable ON (2 min)" "normal"
+    fi
+}
+
+bluetooth_json() {
+    local status text class tooltip connected
+    status=$(bt_get_controller)
+    connected=$(bt_get_connected_count)
+
+    case "$status" in
+        service_down)
+            text="󰂲"
+            class="disabled"
+            tooltip="Bluetooth: Service not running
+
+Click: Start service"
+            ;;
+        no_controller)
+            text=""
+            class="disabled"
+            tooltip="Bluetooth: No controller found"
+            ;;
+        rfkill_blocked)
+            text="󰂲"
+            class="disabled"
+            tooltip="Bluetooth: Blocked (rfkill)
+
+Click: Unblock"
+            ;;
+        powered:false:*)
+            text="󰂲"
+            class="disabled"
+            tooltip="Bluetooth: OFF
+
+Click: Enable"
+            ;;
+        powered:true:discoverable:true)
+            text="󰂱"
+            class="discoverable"
+            tooltip="Bluetooth: ON (Discoverable)
+Connected devices: $connected
+
+Click: Open Bluetooth settings"
+            ;;
+        powered:true:discoverable:false)
+            if [[ "$connected" -gt 0 ]]; then
+                text="󰂱"
+                class="connected"
+            else
+                text=""
+                class="ok"
+            fi
+            tooltip="Bluetooth: ON
+Connected devices: $connected
+
+Click: Open Bluetooth settings"
+            ;;
+        *)
+            text="󰂿"
+            class="warning"
+            tooltip="Bluetooth: Unknown state ($status)"
+            ;;
+    esac
+
+    emit_json "$text" "$class" "$tooltip"
+}
+
+# ============================================================================
+# WiFi
+# ============================================================================
+
+wifi_get_status() {
+    # Check if wlan interface exists
+    if ! ip link show wlan0 &>/dev/null; then
+        echo "no_interface"
+        return
+    fi
+
+    # Check rfkill
+    if rfkill list wifi 2>/dev/null | grep -q "Soft blocked: yes"; then
+        echo "rfkill_blocked"
+        return
+    fi
+
+    # Check iwd service
+    if ! systemctl is-active --quiet iwd.service 2>/dev/null; then
+        echo "service_down"
+        return
+    fi
+
+    # Get connection status
+    local state essid signal
+    state=$(iwctl station wlan0 show 2>/dev/null | grep "State" | awk '{print $NF}')
+
+    if [[ "$state" == "connected" ]]; then
+        essid=$(iwctl station wlan0 show 2>/dev/null | grep "Connected network" | awk '{print $NF}')
+        # Get signal strength (approximate from link quality)
+        signal=$(iw dev wlan0 link 2>/dev/null | grep "signal" | awk '{print $2}')
+        echo "connected:$essid:$signal"
+    elif [[ "$state" == "disconnected" ]]; then
+        echo "disconnected"
+    else
+        echo "state:$state"
+    fi
+}
+
+wifi_toggle_power() {
+    local status
+    status=$(wifi_get_status)
+
+    if [[ "$status" == "rfkill_blocked" ]]; then
+        rfkill unblock wifi
+        notify "WiFi" "Enabled" "low"
+    elif [[ "$status" == "no_interface" ]]; then
+        notify "WiFi" "No wireless interface found" "critical"
+    else
+        rfkill block wifi
+        notify "WiFi" "Disabled" "low"
+    fi
+}
+
+wifi_json() {
+    local status text class tooltip
+
+    status=$(wifi_get_status)
+
+    case "$status" in
+        no_interface)
+            text="󰤭"
+            class="disabled"
+            tooltip="WiFi: No interface"
+            ;;
+        rfkill_blocked)
+            text="󰤮"
+            class="disabled"
+            tooltip="WiFi: Disabled (rfkill)
+
+Click: Enable"
+            ;;
+        service_down)
+            text="󰤮"
+            class="error"
+            tooltip="WiFi: iwd service not running
+
+Click: Start service"
+            ;;
+        disconnected)
+            text="󰤯"
+            class="disconnected"
+            tooltip="WiFi: Not connected
+
+Click: Open WiFi settings"
+            ;;
+        connected:*)
+            local essid signal signal_icon
+            essid=$(echo "$status" | cut -d: -f2)
+            signal=$(echo "$status" | cut -d: -f3)
+
+            # Map signal to icon (signal is negative dBm)
+            if [[ -n "$signal" && "$signal" -gt -50 ]]; then
+                signal_icon="󰤨"  # Excellent
+            elif [[ -n "$signal" && "$signal" -gt -60 ]]; then
+                signal_icon="󰤥"  # Good
+            elif [[ -n "$signal" && "$signal" -gt -70 ]]; then
+                signal_icon="󰤢"  # Fair
+            else
+                signal_icon="󰤟"  # Weak
+            fi
+
+            text="$signal_icon"
+            class="connected"
+            tooltip="WiFi: Connected to $essid
+Signal: ${signal:-?} dBm
+
+Click: Open WiFi settings"
+            ;;
+        state:*)
+            text="󰤠"
+            class="warning"
+            tooltip="WiFi: ${status#state:}"
+            ;;
+        *)
+            text="󰤫"
+            class="warning"
+            tooltip="WiFi: Unknown ($status)"
+            ;;
+    esac
+
+    emit_json "$text" "$class" "$tooltip"
+}
+
+# ============================================================================
+# Combined status
+# ============================================================================
+
+combined_json() {
+    local clip_status bt_status wifi_status
+    local text class tooltip_parts
+
+    clip_status=$(clipboard_check)
+    bt_status=$(bt_get_controller)
+    wifi_status=$(wifi_get_status)
+
+    local issues=0 text_parts=()
+    tooltip_parts=()
+
+    # Clipboard
+    if [[ "$clip_status" != "ok" ]]; then
+        ((issues++))
+        text_parts+=("󰅍!")
+        tooltip_parts+=("Clipboard: ${clip_status#error:}")
+    fi
+
+    # Bluetooth (only show issues, not normal state)
+    case "$bt_status" in
+        service_down|no_controller)
+            ((issues++))
+            text_parts+=("󰂲")
+            tooltip_parts+=("Bluetooth: ${bt_status}")
+            ;;
+    esac
+
+    # WiFi (only show issues)
+    case "$wifi_status" in
+        no_interface|rfkill_blocked|service_down|disconnected)
+            ((issues++))
+            text_parts+=("󰤮")
+            tooltip_parts+=("WiFi: ${wifi_status}")
+            ;;
+    esac
+
+    if [[ $issues -eq 0 ]]; then
+        text="󰒓"
+        class="ok"
+        tooltip="System Health: All OK
+
+Clipboard, Bluetooth, WiFi operational"
+    else
+        text="${text_parts[*]}"
+        class="warning"
+        tooltip="System Health: $issues issue(s)
+
+$(printf '%s\n' "${tooltip_parts[@]}")
+
+Click: Show details"
+    fi
+
+    emit_json "$text" "$class" "$tooltip"
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+case "${1:-status}" in
+    status|combined)
+        combined_json
+        ;;
+    clipboard)
+        case "${2:-status}" in
+            status) clipboard_json ;;
+            fix) clipboard_fix ;;
+            check) clipboard_check ;;
+            *) clipboard_json ;;
+        esac
+        ;;
+    bluetooth|bt)
+        case "${2:-status}" in
+            status) bluetooth_json ;;
+            toggle-power|power) bt_toggle_power ;;
+            toggle-discoverable|discoverable) bt_toggle_discoverable ;;
+            *) bluetooth_json ;;
+        esac
+        ;;
+    wifi)
+        case "${2:-status}" in
+            status) wifi_json ;;
+            toggle-power|power) wifi_toggle_power ;;
+            *) wifi_json ;;
+        esac
+        ;;
+    toggle)
+        case "$2" in
+            clipboard) clipboard_fix ;;
+            bluetooth) bt_toggle_power ;;
+            wifi) wifi_toggle_power ;;
+            *) echo "Unknown component: $2" >&2; exit 1 ;;
+        esac
+        ;;
+    help|--help|-h)
+        cat <<'EOF'
+system-health - Unified system health monitor
+
+Commands:
+  status                    Combined health status (JSON)
+  clipboard [status|fix]    Clipboard health
+  bluetooth [status|power|discoverable]
+  wifi [status|power]
+  toggle <component>        Quick toggle (clipboard/bluetooth/wifi)
+
+Waybar widgets provide click actions for all toggles.
+EOF
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        echo "Run 'system-health help' for usage" >&2
+        exit 1
+        ;;
+esac

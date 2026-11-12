@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# Local wrapper for running sudo on a remote machine via SSH.
+# Handles hardware auth (YubiKey/fingerprint) transparently, and falls back
+# to opening a local terminal window with a password prompt when hardware is unavailable.
+#
+# Usage: sudo-with-notify-remote <ssh-host> "description" [delay] -- sudo command args...
+# Examples:
+#   sudo-with-notify-remote desktop "Installing package" -- sudo pacman -S --noconfirm pkg
+#   sudo-with-notify-remote desktop "Quick check" 1 -- sudo -v
+
+set -uo pipefail
+
+if [ $# -lt 4 ]; then
+    echo "Usage: sudo-with-notify-remote <ssh-host> \"description\" [delay] -- sudo command args..."
+    exit 1
+fi
+
+ssh_host="$1"
+shift
+
+# Remaining args are passed verbatim to sudo-with-notify on the remote
+# Format: "description" [delay] -- sudo command args...
+
+# Build the remote command with proper quoting
+remote_args=()
+for arg in "$@"; do
+    # Shell-escape each argument
+    remote_args+=("$(printf '%q' "$arg")")
+done
+
+# Construct the full remote command
+# Prepend ~/.local/bin to PATH (not in PATH for non-interactive SSH)
+remote_cmd="
+export PATH=\"\$HOME/.local/bin:\$HOME/Programs/local-bootstrapping/dotfiles/local-bin:\$PATH\"
+sudo-with-notify ${remote_args[*]}
+"
+
+echo "[sudo-with-notify-remote] Attempting sudo on $ssh_host..."
+
+# Announce the upcoming touch on THIS machine too (2026-09-14): the remote
+# sudo-with-notify only notifies on the remote's screen, so when the user sits at
+# the laptop with the desktop's key on the desk, a silent prompt stalls until
+# they happen to look. Beep + desktop notification here, best-effort.
+description="$1"
+if command -v notify-send >/dev/null 2>&1; then
+    notify-send -u critical -t 15000 "sudo on $ssh_host — touch the key" "$description" 2>/dev/null || true
+fi
+# Sound: the 1 kHz WAV from scripts/desktop-unattended-boot (dsudo, 2026-09-11) at
+# --volume=18500; the measured lesson that night was that the default/quiet
+# volume was inaudible. Falls back to the freedesktop chime, then the bell.
+_here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+_wav="$_here/sudo-beep1k.wav"
+_snd=/usr/share/sounds/freedesktop/stereo/complete.oga
+if [ -r "$_wav" ]; then
+    (paplay --volume=18500 "$_wav" 2>/dev/null || pw-play "$_wav" 2>/dev/null) &
+elif [ -r "$_snd" ]; then
+    (paplay "$_snd" 2>/dev/null || pw-play "$_snd" 2>/dev/null) &
+fi
+printf '\a'
+
+# Run sudo-with-notify on the remote
+ssh "$ssh_host" "$remote_cmd"
+remote_exit=$?
+
+if [ $remote_exit -eq 0 ]; then
+    # Hardware auth worked, command completed successfully
+    exit 0
+elif [ $remote_exit -eq 2 ]; then
+    # Exit code 2 = tmux fallback needed — hardware auth failed on remote
+    echo "[sudo-with-notify-remote] Hardware auth on $ssh_host failed (device unreachable or you're not physically there)."
+    echo "[sudo-with-notify-remote] Falling back to password prompt — opening terminal window..."
+
+    # Read the signal file from remote to get tmux session details
+    tmux_signal=$(ssh "$ssh_host" "cat /tmp/sudo-with-notify-needs-tmux 2>/dev/null")
+    if [ -z "$tmux_signal" ]; then
+        echo "[sudo-with-notify-remote] ERROR: tmux signal file not found on remote." >&2
+        exit 1
+    fi
+
+    tmux_session=$(echo "$tmux_signal" | jq -r '.session')
+    result_file=$(echo "$tmux_signal" | jq -r '.result_file')
+
+    # Open a terminal window on THIS machine (where the user is) attached to the remote tmux session
+    # This makes the password prompt appear on the user's screen
+    # Detect available terminal emulator
+    if command -v ghostty &>/dev/null; then
+        ghostty -e ssh -t "$ssh_host" "tmux attach -t $tmux_session" &
+    elif command -v foot &>/dev/null; then
+        foot --title "sudo auth — $ssh_host" -- ssh -t "$ssh_host" "tmux attach -t $tmux_session" &
+    elif command -v kitty &>/dev/null; then
+        kitty --title "sudo auth — $ssh_host" ssh -t "$ssh_host" "tmux attach -t $tmux_session" &
+    elif command -v alacritty &>/dev/null; then
+        alacritty --title "sudo auth — $ssh_host" -e ssh -t "$ssh_host" "tmux attach -t $tmux_session" &
+    else
+        echo "[sudo-with-notify-remote] ERROR: No terminal emulator found (ghostty/foot/kitty/alacritty)" >&2
+        echo "[sudo-with-notify-remote] Manually run: ssh -t $ssh_host \"tmux attach -t $tmux_session\"" >&2
+        exit 1
+    fi
+    foot_pid=$!
+
+    echo "[sudo-with-notify-remote] Password prompt opened. Waiting for authentication..."
+
+    # Poll the result file on the remote.
+    # Protocol (written by sudo-with-notify inside the tmux pane): AUTH_OK -> DONE <rc>, or FAIL.
+    # The command itself runs inside that pane (sudo timestamps are per-tty), so we wait for DONE.
+    out_file="/tmp/sudo-auth-output"
+    max_wait=1800
+    elapsed=0
+    authenticated=false
+    rc=""
+    unreachable=0
+    while [ $elapsed -lt $max_wait ]; do
+        if result=$(ssh -o ConnectTimeout=5 -o BatchMode=yes "$ssh_host" "cat $result_file 2>/dev/null; true" 2>/dev/null); then
+            unreachable=0
+            case "$result" in
+                AUTH_OK)
+                    if [ "$authenticated" = false ]; then
+                        echo "[sudo-with-notify-remote] Authenticated via password on $ssh_host — command running in the auth window..."
+                        authenticated=true
+                    fi ;;
+                DONE*)
+                    authenticated=true
+                    rc="${result#DONE }"
+                    break ;;
+                FAIL)
+                    echo "[sudo-with-notify-remote] Authentication failed on $ssh_host."
+                    break ;;
+            esac
+        else
+            unreachable=$((unreachable + 1))
+            if [ "$authenticated" = true ] && [ $unreachable -ge 3 ]; then
+                echo "[sudo-with-notify-remote] $ssh_host stopped answering after authentication — assuming the command took it down (reboot/shutdown)."
+                rc=0
+                break
+            fi
+        fi
+
+        # Window closed before we saw AUTH_OK: either the user gave up, or the command was so
+        # fast that the host went down first (e.g. `sudo systemctl reboot` — seen 2026-09-11).
+        # After auth the command keeps running in tmux, so a closed window is fine then.
+        if [ "$authenticated" = false ] && ! kill -0 "$foot_pid" 2>/dev/null; then
+            if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$ssh_host" true 2>/dev/null; then
+                echo "[sudo-with-notify-remote] Auth window closed and $ssh_host is unreachable — assuming the command took it down (reboot/shutdown)."
+                authenticated=true; unreachable=3; rc=0
+                break
+            fi
+            echo "[sudo-with-notify-remote] Terminal window closed."
+            break
+        fi
+
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+
+    # Clean up
+    kill "$foot_pid" 2>/dev/null
+    wait "$foot_pid" 2>/dev/null
+
+    if [ -z "$rc" ]; then
+        echo "[sudo-with-notify-remote] Authentication timed out or failed." >&2
+        ssh -o ConnectTimeout=5 -o BatchMode=yes "$ssh_host" "tmux kill-session -t $tmux_session 2>/dev/null; rm -f $result_file /tmp/sudo-with-notify-needs-tmux /tmp/sudo-auth-cmd.sh" 2>/dev/null
+        exit 1
+    fi
+
+    if [ $unreachable -eq 0 ]; then
+        ssh -o ConnectTimeout=5 -o BatchMode=yes "$ssh_host" "cat $out_file 2>/dev/null; tmux kill-session -t $tmux_session 2>/dev/null; rm -f $result_file $out_file /tmp/sudo-with-notify-needs-tmux /tmp/sudo-auth-cmd.sh" 2>/dev/null
+    fi
+    echo "[sudo-with-notify-remote] Command finished on $ssh_host with exit $rc."
+    exit "$rc"
+else
+    # Some other error from the remote
+    echo "[sudo-with-notify-remote] Remote sudo-with-notify failed with exit code $remote_exit" >&2
+    exit $remote_exit
+fi

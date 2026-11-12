@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""bar-touch-click <module>: the fast twin of `bar-touch click <module>` (2026-11-01).
+
+waybar runs a module's on-click in a fresh process on every tap. `bar-touch` is
+~3500 lines and Python recompiles a script on every start (~58 ms of its ~90 ms),
+so the power-profile button measured ~110 ms from click to the daemon. This sends
+the identical request to the bar-touch daemon in ~15 ms. The daemon still decides
+tap vs long press. If it cannot be reached, the full `bar-touch click` runs (it
+has the plain-bar fallback). A slow reply is never a second action.
+"""
+import json
+import os
+import socket
+import sys
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+SOCK = os.environ.get("BAR_TOUCH_SOCK") or os.path.join(RUNTIME, "bar-touch.sock")
+FULL = os.path.join(os.path.dirname(os.path.realpath(__file__)), "bar-touch")
+
+module = sys.argv[1] if len(sys.argv) > 1 else ""
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(0.4)
+try:
+    s.connect(SOCK)
+except OSError:
+    s.close()
+    os.execv(FULL, [FULL, "click", module])
+try:
+    s.settimeout(3)
+    s.sendall((json.dumps({"cmd": "click", "module": module, "env": dict(os.environ)}) + "\n").encode())
+    s.shutdown(socket.SHUT_WR)
+    while s.recv(65536):
+        pass
+except OSError:
+    pass

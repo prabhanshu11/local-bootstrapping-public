@@ -1,0 +1,38 @@
+#!/bin/bash
+# disk-health-review: one-off (2026-11-08) reminder + review of the 2026-11-01 work:
+#   btrfs quotas off + snap-pac (docs/issues/btrfs-commit-stall/) and the RAM-resident power button.
+# Sends a Telegram + desktop reminder, runs ONE Opus `claude -p` review over the week's logs with a
+# USD budget cap, writes REVIEW-<date>.md, then sends a Telegram line with its path. Runs once (marker).
+# Usage: disk-health-review [--dry-run]   (dry run: messages printed, no claude call, no marker)
+set -u
+REPO="$HOME/Programs/local-bootstrapping"
+DOCS="$REPO/docs/issues/btrfs-commit-stall"
+STATE="$HOME/.local/state/disk-health-review"; mkdir -p "$STATE"
+DAY=$(date +%F); MARK="$STATE/done"; LOG="$STATE/run-$DAY.log"
+REPORT="$DOCS/REVIEW-$DAY.md"
+BUDGET_USD=15   # one run; well under the USD 200/week agent-loop cap
+DRY=0; [ "${1:-}" = --dry-run ] && DRY=1
+tg() { if [ $DRY = 1 ]; then echo "[tg] $1"; else (cd "$HOME/Programs/phone-file-transfer" && timeout 60 ./telegram-send.py -m "$1") >>"$LOG" 2>&1; fi; }
+note() { [ $DRY = 1 ] && echo "[notify] $1" || notify-send -a disk-health-review -u normal "Laptop health review" "$1" 2>/dev/null; }
+
+[ -e "$MARK" ] && [ $DRY = 0 ] && { echo "already ran: $(cat "$MARK")"; exit 0; }
+MSG="Reminder (set 11-01): a week ago we turned btrfs quotas off (25-35 s freezes -> 38 ms commits), added snap-pac snapshots and moved the power button into RAM. An Opus review of the week's logs is running now; report follows."
+tg "$MSG"; note "$MSG"
+[ $DRY = 1 ] && { echo "[dry-run] would run: claude -p --model opus --max-budget-usd $BUDGET_USD < $DOCS/REVIEW-BRIEF.md -> $REPORT"; exit 0; }
+date -Is > "$MARK"   # before the run: a crash must not re-fire it at every boot
+cd "$REPO" || exit 1
+PROMPT="$(cat "$DOCS/REVIEW-BRIEF.md")
+
+Today is $DAY. Write the report to: $REPORT"
+timeout 45m "$HOME/.local/bin/claude" -p --model opus --max-budget-usd "$BUDGET_USD" \
+    --permission-mode bypassPermissions --output-format json "$PROMPT" > "$STATE/claude-$DAY.json" 2>>"$LOG"
+rc=$?
+cost=$(jq -r '.total_cost_usd // "?"' "$STATE/claude-$DAY.json" 2>/dev/null)
+echo "$(date -Is) rc=$rc cost_usd=$cost" >> "$LOG"
+if [ -s "$REPORT" ]; then
+    head=$(grep -m1 -iE '^(verdict|\*\*verdict)' "$REPORT" | cut -c1-300)
+    tg "Laptop health review ready (rc=$rc, USD $cost): file://$REPORT ${head}"
+    note "Review ready: $REPORT"
+else
+    tg "Laptop health review FAILED (rc=$rc, USD $cost): no report. Log: $LOG"
+fi

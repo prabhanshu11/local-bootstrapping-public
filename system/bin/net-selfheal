@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# net-selfheal — keep the desktop's WIRED path to the home LAN alive with nobody home.
+#
+# WHY (DESKTOP-AWAY-1101, 2026-11-01): his words "can you make sure, on its own, desktop never goes
+# enp4s0 (r8169) -> Archer C50 wireless bridge -> Archer C6 192.168.0.1 -> Tata. wifi-wedge-watchdog
+# only knows wireless interfaces, so nothing watched this path. The 09-17 lesson: probe
+# reachability, not "do I hold a lease".
+#
+# Runs as root from net-selfheal.timer every 60 s (first run 120 s after boot).
+#
+#   probe A = ping the C6 (192.168.0.1) through the bridge      -> the LAN path
+#   probe B = ping 1.1.1.1 (only when A is ok)                  -> the Tata uplink
+#
+#   A failing (minutes since the first failed probe in THIS boot):
+#     2  networkctl reconfigure enp4s0
+#     5  ip link down; sleep 3; up + restart systemd-networkd
+#    10  restart tailscaled (never touches its login state)
+#    30  systemctl reboot  — last resort; boot is unattended and proven (TPM2 unlock, ~65 s to ssh).
+#        Guards: never within 10 min of boot; at most one per 2 h, and the gap doubles for every
+#        reboot that did NOT bring the LAN back (2 h, 4 h, 8 h, cap 24 h), so a dead C50/C6 cannot
+#        reboot-loop a training run. GPU busy (>= 50 % util) defers the reboot, at most 6 h.
+#    after 30, while a reboot is not allowed: repeat the 5-min link bounce every 15 min.
+#   A ok, B failing (Tata down, the 09-24 case): do NOTHING to the network, log it, restart
+#     tailscaled at 15 min and then once an hour so it re-registers the moment the uplink returns.
+#
+# Every action = one line in ~prabhanshu/logs/net-selfheal.log and the journal. After an outage
+# of >= 5 min, one Telegram line once both probes pass again (queued until the internet is back).
+# State (survives reboot, so the report counts the whole outage): /var/lib/net-selfheal.
+#
+# TEST (no root, nothing executed): NET_SELFHEAL_TEST=1 [NET_SELFHEAL_FORCE=A|B|none]
+#   [NET_SELFHEAL_NOW=<epoch>] [NET_SELFHEAL_UPTIME=<s>] [NET_SELFHEAL_STATE=<dir>] net-selfheal
+#   Actions and the Telegram line are printed as "DRY:" instead of run; see tests/unit/test-net-selfheal.sh.
+# Repo copy: local-bootstrapping/system/bin/ (installed by scripts/desktop-away-1101/phase1.sh).
+
+set -uo pipefail
+
+TEST="${NET_SELFHEAL_TEST:-0}"
+IFACE="${NET_SELFHEAL_IFACE:-enp4s0}"
+GW="${NET_SELFHEAL_GW:-192.168.0.1}"
+NET_HOST="${NET_SELFHEAL_INTERNET:-1.1.1.1}"
+OWNER="${NET_SELFHEAL_OWNER:-prabhanshu}"
+OWNER_HOME="/home/$OWNER"
+TG="$OWNER_HOME/Programs/star-trek-camera/scripts/ops/tg_plain.py"
+
+if [[ "$TEST" == 1 ]]; then
+    STATE_DIR="${NET_SELFHEAL_STATE:-${TMPDIR:-/tmp}/net-selfheal-test}"
+    LOG_FILE="${NET_SELFHEAL_LOG:-$STATE_DIR/net-selfheal.log}"
+else
+    STATE_DIR="/var/lib/net-selfheal"
+    LOG_FILE="$OWNER_HOME/logs/net-selfheal.log"
+fi
+mkdir -p "$STATE_DIR"
+
+NOW="${NET_SELFHEAL_NOW:-$(date +%s)}"
+if [[ -n "${NET_SELFHEAL_UPTIME:-}" ]]; then UPTIME="$NET_SELFHEAL_UPTIME"
+else UPTIME=$(cut -d. -f1 /proc/uptime); fi
+BOOT_ID="${NET_SELFHEAL_BOOT_ID:-$(cat /proc/sys/kernel/random/boot_id)}"
+
+# thresholds (seconds)
+T_RECONF=120; T_BOUNCE=300; T_TS=600; T_REBOOT=1800; T_REPEAT=900
+MIN_UPTIME_REBOOT=600; REBOOT_GAP=7200; REBOOT_GAP_CAP=86400; GPU_DEFER_MAX=21600
+B_TS_FIRST=900; B_TS_EVERY=3600; NOTIFY_MIN=300
+
+log() {
+    local line
+    line="$(date -d "@$NOW" '+%F %T') net-selfheal: $*"
+    echo "net-selfheal: $*"                       # journal (stdout of the service)
+    if [[ "$TEST" == 1 ]]; then
+        echo "$line" >> "$LOG_FILE" 2>/dev/null
+    else
+        # The file is in the user's home: append AS the user, never as root (root following a
+        # symlink planted there could write or chown any file).
+        runuser -u "$OWNER" -- sh -c 'cat >> "$1"' _ "$LOG_FILE" <<< "$line" 2>/dev/null
+    fi
+    return 0
+}
+
+get() { local v; v=$(cat "$STATE_DIR/$1" 2>/dev/null); echo "${v:-${2:-}}"; }
+num() { local v; v=$(get "$1"); [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo "${2:-0}"; }
+put() { echo "$2" > "$STATE_DIR/$1"; }
+del() { rm -f "$STATE_DIR/$1"; }
+
+run() {  # run an action (or print it in test mode); never abort the script
+    if [[ "$TEST" == 1 ]]; then echo "DRY: $*"; return 0; fi
+    "$@" 2>&1 | sed 's/^/  /'
+    return "${PIPESTATUS[0]}"
+}
+
+human() { local s=$1; if (( s >= 3600 )); then printf '%dh%02dm' $((s/3600)) $((s%3600/60)); else printf '%dm' $((s/60)); fi; }
+
+probe() {  # probe <host>: up to 3 single pings, any reply = ok
+    local force="${NET_SELFHEAL_FORCE:-}" which="$2"
+    if [[ "$TEST" == 1 && -n "$force" ]]; then
+        [[ "$force" == *"$which"* ]] && return 1 || return 0
+    fi
+    local i
+    for i in 1 2 3; do ping -n -q -c1 -W1 "$1" >/dev/null 2>&1 && return 0; done
+    return 1
+}
+
+gpu_busy() {
+    [[ "$TEST" == 1 ]] && { [[ "${NET_SELFHEAL_GPU_BUSY:-0}" == 1 ]]; return; }
+    local u
+    u=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc 0-9)
+    [[ -n "$u" ]] && (( u >= 50 ))
+}
+
+queue_notify() { echo "$1" >> "$STATE_DIR/notify-queue"; }
+
+flush_notify() {  # only called when both probes pass
+    local q="$STATE_DIR/notify-queue" msg
+    [[ -s "$q" ]] || return 0
+    msg="desktop net-selfheal: $(paste -sd' ' "$q")"
+    if [[ "$TEST" == 1 ]]; then echo "DRY: telegram: $msg"; del notify-queue; return 0; fi
+    if [[ -f "$TG" ]] && runuser -u "$OWNER" -- python3 "$TG" -m "$msg" >/dev/null 2>&1; then
+        log "telegram sent: $msg"; del notify-queue
+    else
+        log "telegram send failed (kept queued): $msg"
+    fi
+}
+
+step_done() { [[ ",$(get a_steps)," == *",$1,"* ]]; }
+mark_step() { put a_steps "$(get a_steps),$1"; }
+
+bounce() {
+    run ip link set "$IFACE" down
+    [[ "$TEST" == 1 ]] || sleep 3
+    run ip link set "$IFACE" up
+    run systemctl restart systemd-networkd
+}
+
+lan_down() {
+    local since ladder el gap rc
+    since=$(num a_since)
+    if (( since == 0 )); then
+        put a_since "$NOW"; since=$NOW
+        log "LAN probe failed: $GW unreachable on $IFACE (carrier=$(cat /sys/class/net/$IFACE/carrier 2>/dev/null || echo ?), ipv4=$(ip -4 -o addr show dev "$IFACE" scope global 2>/dev/null | awk '{print $4}' | head -1))"
+    fi
+    # The ladder restarts on every boot: after a reboot it climbs again from 2 min.
+    if [[ "$(get a_boot)" != "$BOOT_ID" ]]; then
+        put a_boot "$BOOT_ID"; put a_ladder "$NOW"; del a_steps; del a_repeat
+    fi
+    ladder=$(num a_ladder "$NOW")
+    el=$(( NOW - ladder ))
+
+    if (( el >= T_RECONF )) && ! step_done reconf; then
+        mark_step reconf
+        log "LAN down $(human $el) — networkctl reconfigure $IFACE"
+        run networkctl reconfigure "$IFACE"
+    fi
+    if (( el >= T_BOUNCE )) && ! step_done bounce; then
+        mark_step bounce
+        log "LAN down $(human $el) — link bounce $IFACE + restart systemd-networkd"
+        bounce
+    fi
+    if (( el >= T_TS )) && ! step_done ts; then
+        mark_step ts
+        log "LAN down $(human $el) — restart tailscaled"
+        run systemctl restart tailscaled
+    fi
+    if (( el >= T_REBOOT )); then
+        local count last allowed=1 why=""
+        count=$(num reboot_count); last=$(num reboot_last)
+        gap=$(( REBOOT_GAP << (count < 4 ? count : 4) )); (( gap > REBOOT_GAP_CAP )) && gap=$REBOOT_GAP_CAP
+        if (( UPTIME < MIN_UPTIME_REBOOT )); then allowed=0; why="uptime $(human "$UPTIME") < 10m"
+        elif (( last > 0 && NOW - last < gap )); then allowed=0; why="last reboot $(human $((NOW-last))) ago < gap $(human $gap)"
+        elif gpu_busy; then
+            local d0; d0=$(num gpu_defer_since)
+            (( d0 == 0 )) && { put gpu_defer_since "$NOW"; d0=$NOW; }
+            if (( NOW - d0 < GPU_DEFER_MAX )); then allowed=0; why="GPU busy (training?), deferred $(human $((NOW-d0))) of max 6h"; fi
+        fi
+        if (( allowed )); then
+            put reboot_last "$NOW"; put reboot_count $((count + 1)); del gpu_defer_since
+            log "LAN down $(human $el) this boot ($(human $((NOW-since))) total) — REBOOT #$((count+1)) (next allowed gap $(human $(( gap*2 > REBOOT_GAP_CAP ? REBOOT_GAP_CAP : gap*2 ))))"
+            run systemctl reboot
+            return
+        fi
+        local rep; rep=$(num a_repeat "$ladder")
+        if [[ "$(get reboot_held_why)" != "${why%% *}" ]]; then
+            log "LAN down $(human $el) — reboot held: $why"; put reboot_held_why "${why%% *}"
+        fi
+        if (( NOW - rep >= T_REPEAT && el >= T_REBOOT )); then
+            put a_repeat "$NOW"
+            log "LAN down $(human $el) — repeat link bounce (reboot held: $why)"
+            bounce
+        fi
+    fi
+}
+
+lan_up() {
+    local since
+    since=$(num a_since)
+    if (( since > 0 )); then
+        local dur=$(( NOW - since )) n; n=$(num reboot_count)
+        log "LAN back after $(human $dur) (steps this boot: $(get a_steps none | sed 's/^,//'), reboots: $n)"
+        (( dur >= NOTIFY_MIN )) && queue_notify "LAN path was down $(human $dur) from $(date -d "@$since" '+%d %b %H:%M'), back $(date -d "@$NOW" '+%H:%M') (actions: $(get a_steps none | sed 's/^,//')$( (( n > 0 )) && echo ", $n reboot(s)"))."
+        del a_since; del a_ladder; del a_steps; del a_repeat; del a_boot; del reboot_count; del gpu_defer_since; del reboot_held_why
+    fi
+
+    if probe "$NET_HOST" B; then
+        local bs; bs=$(num b_since)
+        if (( bs > 0 )); then
+            local dur=$(( NOW - bs ))
+            log "internet back after $(human $dur)"
+            (( dur >= NOTIFY_MIN )) && queue_notify "Internet (Tata) was down $(human $dur) from $(date -d "@$bs" '+%d %b %H:%M'), LAN stayed up; nothing touched but tailscaled."
+            del b_since; del b_ts
+        fi
+        flush_notify
+    else
+        local bs; bs=$(num b_since)
+        if (( bs == 0 )); then
+            put b_since "$NOW"; bs=$NOW
+            log "internet probe failed ($NET_HOST), LAN ok — uplink down; changing nothing on this machine"
+        fi
+        local dur=$(( NOW - bs )) last; last=$(num b_ts)
+        if { (( last == 0 )) && (( dur >= B_TS_FIRST )); } || { (( last > 0 )) && (( NOW - last >= B_TS_EVERY )); }; then
+            put b_ts "$NOW"
+            log "internet down $(human $dur) — restart tailscaled (re-registers when the uplink returns)"
+            run systemctl restart tailscaled
+        fi
+    fi
+}
+
+main() {
+    if probe "$GW" A; then lan_up; else lan_down; fi
+}
+
+main "$@"

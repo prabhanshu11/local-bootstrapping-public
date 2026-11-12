@@ -1,0 +1,114 @@
+#!/bin/bash
+# voice-stt-provider — choose the speech-to-text source for voice typing.
+#
+#   voice-stt-provider                 show the current provider
+#   voice-stt-provider deepgram        Deepgram nova-2 streaming (online)
+#   voice-stt-provider offline         this machine's own Whisper only (local-whisper :8767,
+#                                      the laptop's MX330 GPU): no internet needed
+#   voice-stt-provider local           fine-tuned Whisper on the desktop GPU (2026-09-25 experiment)
+#   voice-stt-provider toggle-offline  online <-> local (the mic popup's "Source:" button; silent,
+#                                      the button itself shows the new source, highlighted when local)
+#   voice-stt-provider label [--plain] the button's text: JSON {"label","active","loading"} for
+#                                      bar-touch's "state-cmd" (loading = local models still loading,
+#                                      or Deepgram not reached yet), or one plain line for the tooltip
+#
+# The gateway re-reads ~/.config/voice-typing/stt-provider at the start of every
+# recording, so no restart is needed. voice-retranscribe (the popup's Retry button)
+# also follows it: offline -> local Whisper. Details: omarchy-voice-typing/docs/local-stt.md
+set -euo pipefail
+f="$HOME/.config/voice-typing/stt-provider"
+prev="$HOME/.config/voice-typing/stt-provider.before-offline"
+current() { if [[ -f "$f" ]]; then head -c 40 "$f" | awk '{print $1; exit}'; else echo deepgram; fi; }
+set_to() {
+  mkdir -p "$(dirname "$f")"
+  echo "$1" > "$f.tmp" && mv "$f.tmp" "$f"
+  rm -f /tmp/hyprwhspr-tray-cache   # the mic popup's state text updates at once (15 s cache)
+}
+
+# Device names for the label, without waking the GPU (nvidia-smi would): /proc only.
+cpu_name() {   # "i7-10510U" (Intel), "AMD Ryzen 7 5800U" (AMD)
+  awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo \
+    | sed -E 's/\((R|TM)\)//g; s/ CPU.*//; s/ with .*//; s/^Intel //; s/^Core //; s/  +/ /g'
+}
+gpu_name() {   # "MX330"
+  local g
+  g="$(awk -F':[ \t]*' '/^Model/{print $2; exit}' /proc/driver/nvidia/gpus/*/information 2>/dev/null \
+       | sed -E 's/^NVIDIA //; s/GeForce //')"
+  echo "${g:-GPU}"
+}
+dev_name() { if [[ "$1" == cpu ]]; then cpu_name; else gpu_name; fi; }
+
+# The local source's state from local-whisper's /health: prints "text<TAB>loading".
+# Hybrid (2026-11-03): base on the CPU for short recordings, distil on the GPU from 25 s,
+# distil loaded only while the source is Local (local-whisper/server.py).
+local_state() {
+  local h st warm dev ls after ldev lmodel
+  h="$(curl -s -m 1 localhost:8767/health 2>/dev/null)"
+  if [[ -z "$h" ]]; then printf 'Source: Local · starting local-whisper…\ttrue\n'; return; fi
+  IFS=$'\t' read -r st warm dev ls after ldev lmodel < <(jq -r '[.status, (.warm // true), (.device // "cuda"),
+      (.long.state // "none"), ((.long.after_s // 0) | floor), (.long.device // ""),
+      (.long.model // "")] | @tsv' <<<"$h")
+  local base_on="base on $(dev_name "$dev")"
+  if [[ "$st" != ready || "$warm" != true ]]; then
+    printf 'Source: Local · loading Whisper base on %s…\ttrue\n' "$(dev_name "$dev")"; return
+  fi
+  case "$ls" in
+    none)  printf 'Source: Local · Whisper %s\tfalse\n' "$base_on" ;;
+    ready) printf 'Source: Local · %s · %s from %s s on %s\tfalse\n' "$base_on" "${lmodel%%-*}" "$after" "$(dev_name "$ldev")" ;;
+    error) printf 'Source: Local · %s · %s failed to load, retrying\ttrue\n' "$base_on" "${lmodel%%-*}" ;;
+    *)     printf 'Source: Local · base ready · loading %s on %s…\ttrue\n' "${lmodel%%-*}" "$(dev_name "$ldev")" ;;
+  esac
+}
+
+# Is Deepgram reachable with the gateway's key? (GET /v1/auth/token: free, no audio.) A success
+# is cached 60 s; a failure is not, so the pulsing button re-checks until it connects.
+online_ok() {
+  local c=/tmp/voice-stt-online-ok k
+  if [[ -f "$c" ]] && (( $(date +%s) - $(stat -c %Y "$c") < 60 )); then return 0; fi
+  k="$(grep -m1 '^DEEPGRAM_API_KEY=' "$HOME/Programs/omarchy-voice-typing/.env" 2>/dev/null \
+       | cut -d= -f2- | tr -d "\"'")"
+  [[ -n "$k" ]] || return 1
+  # the key goes in on stdin (-H @-), never on the command line
+  if [[ "$(printf 'Authorization: Token %s\n' "$k" | curl -s -o /dev/null -w '%{http_code}' -m 2.5 \
+           -H @- https://api.deepgram.com/v1/auth/token)" == 200 ]]; then
+    touch "$c"; return 0
+  fi
+  return 1
+}
+
+case "${1:-}" in
+  "")
+    if [[ -f "$f" ]]; then echo "provider: $(current)"; else echo "provider: deepgram (default, no $f)"; fi ;;
+  local|deepgram|offline)
+    set_to "$1"
+    echo "provider: $1 (applies to the next recording)" ;;
+  toggle-offline)
+    cur="$(current)"
+    if [[ "$cur" == offline ]]; then
+      back="$(cat "$prev" 2>/dev/null || true)"
+      [[ "$back" == local || "$back" == deepgram ]] || back=deepgram
+      set_to "$back"
+    else
+      mkdir -p "$(dirname "$f")"
+      echo "$cur" > "$prev"
+      set_to offline
+    fi
+    echo "provider: $(current) (applies to the next recording)" ;;
+  label)
+    # --plain: one line for the mic tooltip (no network check: the tray runs it every 15 s).
+    # Otherwise JSON for the popup's Source button (bar-touch "state-cmd"): "loading": true
+    # makes the button pulse and re-read this until the source is ready.
+    plain=false; [[ "${2:-}" == --plain ]] && plain=true
+    loading=false
+    case "$(current)" in
+      offline) IFS=$'\t' read -r text loading < <(local_state); active=true ;;
+      local)   text="Source: Desktop NVIDIA GPU (fine-tuned Whisper)"; active=true ;;
+      *)       text="Source: Deepgram (online)"; active=false
+               if ! $plain && ! online_ok; then text="Source: Deepgram (online) · connecting…"; loading=true; fi ;;
+    esac
+    if $plain; then echo "$text"
+    else jq -cn --arg l "$text" --argjson a "$active" --argjson g "$loading" \
+           '{label: $l, active: $a, loading: $g}'; fi ;;
+  *)
+    echo "usage: voice-stt-provider [local|deepgram|offline|toggle-offline|label [--plain]]" >&2; exit 2 ;;
+esac

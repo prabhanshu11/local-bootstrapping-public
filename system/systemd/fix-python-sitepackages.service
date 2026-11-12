@@ -1,0 +1,14 @@
+[Unit]
+Description=Fix stale Python site-packages after major version upgrade
+Before=sddm.service display-manager.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/prabhanshu/Programs/local-bootstrapping/scripts/fix-python-sitepackages.sh --fix
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical.target

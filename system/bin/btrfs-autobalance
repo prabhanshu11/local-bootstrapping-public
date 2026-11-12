@@ -1,0 +1,103 @@
+#!/bin/bash
+# btrfs-autobalance: the desktop root's upkeep that ACTS (desktop-space-permanent-1101, 2026-11-01).
+# His words 2026-11-01 ~20:25 IST: "please fix my desktop space situation.. its always falling low, beacues of silly
+# reasons." One silly reason: data chunks stay allocated half-empty (10-26: 425 GB allocated / 361 GB used, unallocated
+# 1 MiB), so btrfs runs out of room for new chunks while df still shows free space. Until now a watch ALARMED and a
+# lane ran the balance by hand with a YubiKey touch. This runs it from btrfs-autobalance.timer (root, hourly).
+#
+# Acts only when needed:  unallocated < 8 GiB  AND  data slack (allocated - used) >= 12 GiB,
+#                         no balance already running/paused, no other copy of this script (flock).
+# Staircase -dusage=50 -> 60 -> 70 -> 80, stops once unallocated >= 20 GiB; hard deadline 120 min (relocated chunks kept).
+# Camera gate (relative, not a fixed rate: the tracker runs ~2.4 cycles/s in stream mode, so the 10-27 script's fixed
+# "< 5/s" paused at once on 11-01): baseline = cycles/s over 120 s before the balance. While running, two 60 s windows
+# below 60 % of baseline -> pause; while paused, two windows >= 80 % -> resume; paused 20 min -> cancel (not ours).
+# during the run, the gate switches on with the first full window as baseline; if the tracker is stopped during the run
+# (API silent and nothing listening on :8100), the gate switches off and a paused balance resumes.
+# Deletes nothing; touches only the chunk layout. Log: /var/log/btrfs-autobalance.log; result line (world-readable):
+# /var/lib/btrfs-autobalance/last.txt. Telegram: one line naming what was done (never a question), sent as the user.
+#   btrfs-autobalance [--force] [--dry-run]     (--force skips the "needed?" test, not the gate)
+set -u
+FS=/
+LOG=/var/log/btrfs-autobalance.log
+STATE=/var/lib/btrfs-autobalance; mkdir -p "$STATE"; chmod 755 "$STATE"
+USER_NAME=prabhanshu
+GIB=$((1024*1024*1024))
+NEED_UNALLOC=$((8*GIB)); NEED_SLACK=$((12*GIB)); TARGET=$((20*GIB))
+STEPS="50 60 70 80"; DEADLINE_MIN=120; PAUSE_MAX=1200
+API=http://localhost:8100/tracker/status
+FORCE=0; DRY=0
+for a in "$@"; do case "$a" in --force) FORCE=1;; --dry-run) DRY=1;; esac; done
+
+exec 9>"$STATE/lock"; flock -n 9 || { echo "another btrfs-autobalance runs"; exit 0; }
+log(){ echo "$(date -u +%FT%TZ) $*" | tee -a "$LOG"; }
+usage_b(){ btrfs filesystem usage -b "$FS" 2>/dev/null; }
+unalloc(){ usage_b | awk '/Device unallocated:/{print $3; exit}'; }
+data_slack(){ usage_b | awk '/^Data,/{for(i=1;i<=NF;i++){if($i~/^Size:/){split($i,a,":");s=a[2]} if($i~/^Used:/){split($i,b,":");u=b[2]}}} END{print s-u}' | tr -d ','; }
+gib(){ awk -v b="${1:-0}" 'BEGIN{printf "%.1f", b/1073741824}'; }
+active(){ btrfs balance status "$FS" 2>/dev/null | grep -q -E "is (running|paused)"; }
+cyc(){ curl -s -m4 "$API" | python3 -c 'import json,sys;print(json.load(sys.stdin)["track_rate"]["cycles"])' 2>/dev/null; }
+notify(){  # one Telegram line as the user (drops root); failure only logged
+  local tg=/home/$USER_NAME/Programs/star-trek-camera/scripts/ops/tg_plain.py
+  [ "$DRY" = 1 ] && { log "DRY notify: $1"; return; }
+  [ -f "$tg" ] && runuser -u "$USER_NAME" -- timeout 90 /usr/bin/python3 "$tg" -m "$1" >/dev/null 2>&1 \
+    || log "notify failed: $1"; }
+
+U0=$(unalloc); S0=$(data_slack)
+[ -z "$U0" ] && { log "cannot read btrfs usage of $FS"; exit 1; }
+if active; then log "skip: a balance is already running/paused ($(btrfs balance status $FS | head -1))"; exit 0; fi
+if [ "$FORCE" = 0 ] && { [ "$U0" -ge "$NEED_UNALLOC" ] || [ "$S0" -lt "$NEED_SLACK" ]; }; then
+  echo "not needed: unallocated $(gib "$U0") GiB (acts < 8), data slack $(gib "$S0") GiB (acts >= 12)"
+  exit 0
+fi
+log "needed: unallocated $(gib "$U0") GiB, data slack $(gib "$S0") GiB -> staircase $STEPS (target 20 GiB, ${DEADLINE_MIN} min)"
+[ "$DRY" = 1 ] && { log "dry-run: stop here"; exit 0; }
+
+# baseline over 120 s (two samples 120 s apart; the rate swings 2.4-6.3 per 60 s); empty -> tracker off -> ungated
+c1=$(cyc); sleep 120; c2=$(cyc); BASE=""
+if [ -n "$c1" ] && [ -n "$c2" ]; then BASE=$(awk -v a="$c1" -v b="$c2" 'BEGIN{printf "%.3f", (b-a)/120}'); fi
+if [ -n "$BASE" ] && awk -v r="$BASE" 'BEGIN{exit !(r>0.2)}'; then GATE=on; else GATE=off; BASE=""; fi
+log "camera gate=$GATE baseline=${BASE:-none} cycles/s"
+
+START=$(date +%s); DEADLINE=$((START + DEADLINE_MIN*60)); STOP=""; done_steps=""
+prev_c=""; prev_t=""
+window(){  # sets r = the rate over the last ~60 s, or NA (no subshell: prev_c/prev_t must persist)
+  local c t; r=NA; c=$(cyc); t=$(date +%s)
+  if [ -n "$c" ] && [ -n "$prev_c" ] && [ "$t" -gt "$prev_t" ]; then r=$(awk -v a="$prev_c" -v b="$c" -v d=$((t-prev_t)) 'BEGIN{printf "%.3f",(b-a)/d}'); fi
+  prev_c=$c; prev_t=$t; }
+for U in $STEPS; do
+  u=$(unalloc); [ "${u:-0}" -ge "$TARGET" ] && { log "target reached before -dusage=$U"; break; }
+  [ "$(date +%s)" -ge "$DEADLINE" ] && { STOP="deadline before -dusage=$U"; break; }
+  t0=$(date +%s); log "-dusage=$U start unalloc=$(gib "$u") GiB"
+  ionice -c3 btrfs balance start -dusage="$U" "$FS" >>"$LOG" 2>&1 & bp=$!
+  sleep 5; state=running; nlow=0; nhigh=0; pat=0; prev_c=$(cyc); prev_t=$(date +%s)
+  while active; do
+    sleep 60; window; now=$(date +%s)
+    if [ "$GATE" = off ] && [ "$r" != NA ]; then GATE=on; BASE=$r; log "tracker appeared: gate on, baseline $BASE"; fi
+    # API silent AND nothing listens on :8100 = the tracker was stopped (depart.sh --leave), not a stall: gate off, resume
+    if [ "$GATE" = on ] && [ "$r" = NA ] && ! ss -Hltn 'sport = :8100' 2>/dev/null | grep -q .; then
+      GATE=off; log "tracker stopped (nothing on :8100): gate off"
+      if [ "$state" = paused ]; then ionice -c3 btrfs balance resume "$FS" >>"$LOG" 2>&1 & bp=$!; state=running; sleep 5; fi
+    fi
+    log "U=$U state=$state rate=$r base=${BASE:-none} unalloc=$(gib "$(unalloc)") | $(btrfs balance status $FS 2>&1 | sed -n 2p)"
+    if [ "$now" -ge "$DEADLINE" ]; then STOP="deadline ${DEADLINE_MIN} min during -dusage=$U"; btrfs balance cancel "$FS" >>"$LOG" 2>&1; break; fi
+    [ "$GATE" = off ] && continue
+    lo=$(awk -v r="$r" -v b="$BASE" 'BEGIN{print (r=="NA"||r<0.6*b)?1:0}')
+    hi=$(awk -v r="$r" -v b="$BASE" 'BEGIN{print (r!="NA"&&r>=0.8*b)?1:0}')
+    if [ "$state" = running ]; then
+      [ "$lo" = 1 ] && nlow=$((nlow+1)) || nlow=0
+      if [ "$nlow" -ge 2 ]; then log "camera $r < 60% of $BASE twice -> pause"; btrfs balance pause "$FS" >>"$LOG" 2>&1; state=paused; pat=$now; nhigh=0; fi
+    else
+      [ "$hi" = 1 ] && nhigh=$((nhigh+1)) || nhigh=0
+      if [ "$nhigh" -ge 2 ]; then log "camera back ($r) -> resume after $((now-pat)) s"; ionice -c3 btrfs balance resume "$FS" >>"$LOG" 2>&1 & bp=$!; state=running; nlow=0; sleep 5
+      elif [ $((now-pat)) -ge "$PAUSE_MAX" ]; then STOP="camera stayed below 80% of baseline for 20 min while paused (not the balance) at -dusage=$U"; btrfs balance cancel "$FS" >>"$LOG" 2>&1; break; fi
+    fi
+  done
+  wait "$bp" 2>/dev/null
+  log "-dusage=$U took $(( $(date +%s)-t0 )) s unalloc=$(gib "$(unalloc)") GiB"
+  done_steps="$done_steps $U"
+  [ -n "$STOP" ] && break
+done
+U1=$(unalloc); S1=$(data_slack)
+RES="btrfs-autobalance $(date -u +%FT%TZ): unallocated $(gib "$U0") -> $(gib "$U1") GiB, data slack $(gib "$S0") -> $(gib "$S1") GiB, steps${done_steps:- none}, gate $GATE, $(( ($(date +%s)-START)/60 )) min${STOP:+, stopped: $STOP}"
+log "$RES"; echo "$RES" > "$STATE/last.txt"; chmod 644 "$STATE/last.txt"
+notify "Desktop disk: ran the btrfs balance by itself (half-empty chunks). Unallocated $(gib "$U0") -> $(gib "$U1") GiB in $(( ($(date +%s)-START)/60 )) min${STOP:+; stopped early: $STOP}. Nothing deleted."

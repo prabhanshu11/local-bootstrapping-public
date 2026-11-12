@@ -1,0 +1,3 @@
+"""
+hyprwhspr patch source modules
+"""

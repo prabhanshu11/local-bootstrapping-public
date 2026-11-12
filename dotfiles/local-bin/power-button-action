@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Physical power button behavior:
+# - if the screen is locked, suspend immediately
+# - otherwise, show Omarchy's system menu
+#
+# The suspend goes through sleep-verified (2026-10-03): it still suspends at
+# once, then proves it slept and says so loudly if it did not (a process stuck
+# in FUSE kept the laptop awake behind the lock screen until it died).
+
+if pgrep -x hyprlock >/dev/null 2>&1; then
+    if [[ -x "$HOME/.local/bin/sleep-verified" ]]; then
+        exec "$HOME/.local/bin/sleep-verified" --reason power-button
+    fi
+    exec systemctl suspend
+else
+    exec omarchy-menu system
+fi

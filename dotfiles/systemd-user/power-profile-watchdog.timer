@@ -1,0 +1,15 @@
+[Unit]
+Description=Check every minute whether the CPU is clamped below its rated ceiling
+
+[Timer]
+# OnCalendar (wall-clock) instead of OnBootSec/OnUnitActiveSec: the monotonic
+# pair silently died on 2026-08-05 — OnUnitActiveSec schedules relative to the
+# service's last activation, so if the service never runs after a boot there is
+# no reference point and the timer sits "active (elapsed)" forever with no next
+# trigger. Watchdog was dead Aug 5-13 because of exactly this. A calendar spec
+# always has a next trigger. Same trap as the swayosd-health timer incident.
+OnCalendar=*-*-* *:*:30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

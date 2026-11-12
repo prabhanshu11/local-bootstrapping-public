@@ -1,0 +1,31 @@
+#!/bin/bash
+# Detect current keyboard layout in Hyprland
+# Returns: "dvorak", "us", or the raw layout name
+
+set -euo pipefail
+
+get_layout() {
+    local layout
+    layout=$(hyprctl devices -j | jq -r '
+        .keyboards[] |
+        select(.main == true or (.name | ascii_downcase | contains("keyboard"))) |
+        .active_keymap' | head -1)
+
+    # Normalize common layout names
+    case "$layout" in
+        *[Dd]vorak*)
+            echo "dvorak"
+            ;;
+        *[Uu][Ss]*|*[Qq][Ww][Ee][Rr][Tt][Yy]*)
+            echo "us"
+            ;;
+        *)
+            echo "$layout"
+            ;;
+    esac
+}
+
+# If run directly, print layout
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    get_layout
+fi

@@ -1,0 +1,13 @@
+# Let the desktop user set the keyboard backlight level without root.
+#
+# /sys/class/leds/tpacpi::kbd_backlight/brightness is root-owned 0644 by
+# default. brightnessctl can still write it from an interactive session via
+# logind's SetBrightness D-Bus method, but kbd-backlight-keeper.service runs as
+# a systemd --user unit outside any login session, where that fallback is not
+# reliable. Granting the `input` group (which prabhanshu is in) write access
+# makes the direct sysfs write work from anywhere.
+#
+# Same idiom as the Arch wiki's backlight rule, scoped to keyboard LEDs.
+# Consumed by ~/.local/bin/kbd-backlight (waybar widget + keep-on watchdog).
+
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="*kbd_backlight", RUN+="/usr/bin/chgrp input /sys/class/leds/%k/brightness", RUN+="/usr/bin/chmod g+w /sys/class/leds/%k/brightness"

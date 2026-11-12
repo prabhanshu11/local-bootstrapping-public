@@ -1,0 +1,10 @@
+[Unit]
+Description=battery-guard live test — one unattended firing (temporary; disables itself when done)
+After=graphical-session.target
+# See docs/issues/laptop-low-battery-suspend-TESTPLAN.md
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/battery-guard-test-runner
+# A firing spans a 5-minute warning, the suspend, and however long the user takes to wake it.
+TimeoutStartSec=infinity

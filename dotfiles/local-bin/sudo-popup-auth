@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Opens a popup terminal window for manual sudo authentication.
+# Called by sudo-with-notify after 3 failed fingerprint/YubiKey attempts.
+# The popup runs "sudo -v" to cache credentials, then exits.
+# The calling script can then use sudo without re-prompting.
+#
+# Usage: sudo-popup-auth ["description"]
+# Exit code: 0 if authenticated, 1 if user closed without authenticating
+#
+# 2026-10-06: the popup terminal is started with its stdio detached and is killed
+# when this script is killed. Before, the window inherited the caller's stdout
+# pipe and outlived sudo-with-notify's 30-min timeout (which kills only this
+# script), so a `sudo-with-notify ... | tail` in a Claude tool call stayed stuck
+# for as long as the abandoned "Press Enter to close" window was open (lb-drift
+# agent found one 33 min old). A failed window now also closes itself after 10 min.
+
+description="${1:-Manual sudo authentication required}"
+
+# Determine terminal emulator (prefer foot on Wayland/Hyprland, fallback to others)
+if command -v foot &>/dev/null; then
+    TERM_CMD=(foot --title "Sudo Authentication" --app-id sudo-popup-auth)
+elif command -v ghostty &>/dev/null; then
+    # Ghostty is the daily-driver terminal on the laptop; without this branch
+    # the password fallback died with "No supported terminal emulator found"
+    # whenever fingerprint auth timed out (hit 2026-08-07).
+    TERM_CMD=(ghostty --title="Sudo Authentication" -e)
+elif command -v kitty &>/dev/null; then
+    TERM_CMD=(kitty --title "Sudo Authentication")
+elif command -v alacritty &>/dev/null; then
+    TERM_CMD=(alacritty --title "Sudo Authentication" -e)
+else
+    echo "Error: No supported terminal emulator found (foot, ghostty, kitty, alacritty)" >&2
+    exit 1
+fi
+
+# Create a temp script that the popup terminal will execute
+auth_script=$(mktemp /tmp/sudo-auth-XXXXXX.sh)
+auth_result=$(mktemp /tmp/sudo-auth-result-XXXXXX)
+echo "1" > "$auth_result"  # default: failed
+
+cat > "$auth_script" << 'INNER_EOF'
+#!/usr/bin/env bash
+result_file="$1"
+description="$2"
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Sudo Authentication (manual fallback)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "  $description"
+echo ""
+echo "  Fingerprint/YubiKey failed 3 times."
+echo "  Please type your password below."
+echo ""
+
+if sudo -v; then
+    echo "0" > "$result_file"
+    echo ""
+    echo "  ✓ Authenticated successfully."
+    echo "  This window will close in 1 second."
+    sleep 1
+else
+    echo "1" > "$result_file"
+    echo ""
+    echo "  ✗ Authentication failed."
+    echo "  Press Enter to close (auto-closes in 10 min)."
+    read -r -t 600 || true
+fi
+INNER_EOF
+chmod +x "$auth_script"
+
+# Launch popup terminal detached from our stdio (never inherit the caller's pipe)
+# and wait for it; if we are killed (sudo-with-notify's timeout), take the window with us.
+"${TERM_CMD[@]}" "$auth_script" "$auth_result" "$description" </dev/null >/dev/null 2>&1 &
+term_pid=$!
+trap 'kill "$term_pid" 2>/dev/null; rm -f "$auth_script" "$auth_result"; exit 1' TERM INT HUP
+wait "$term_pid"
+trap - TERM INT HUP
+
+# Read result
+exit_code=$(cat "$auth_result" 2>/dev/null || echo 1)
+
+# Signal Claude Code that user interacted with popup (user is back at computer)
+signal_file="/tmp/sudo-auth-signal"
+authenticated=$( [ "$exit_code" = "0" ] && echo true || echo false )
+cat > "$signal_file" << SIGNAL_EOF
+{"timestamp":"$(date -Iseconds)","authenticated":$authenticated,"description":"$description"}
+SIGNAL_EOF
+
+# Cleanup
+rm -f "$auth_script" "$auth_result"
+
+exit "$exit_code"

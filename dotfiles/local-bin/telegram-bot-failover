@@ -1,0 +1,87 @@
+#!/bin/bash
+# Telegram Bot Failover - Desktop primary, laptop backup
+# Runs on timer (every 2 min) to check if failover needed
+
+set -e
+
+STATE_DIR="/tmp/telegram-claude-bot"
+FAILOVER_STATE="$STATE_DIR/failover.json"
+WATCHER_PID="$STATE_DIR/watcher.pid"
+
+# Device IPs (from devices.conf)
+DESKTOP_IP="100.64.0.1"
+LAPTOP_IP="100.64.0.2"
+
+# Get this device's Tailscale IP
+MY_IP=$(tailscale ip -4 2>/dev/null || echo "")
+
+is_desktop() {
+    [[ "$MY_IP" == "$DESKTOP_IP" ]]
+}
+
+is_laptop() {
+    [[ "$MY_IP" == "$LAPTOP_IP" ]]
+}
+
+# Check if a device is online via Tailscale
+is_device_online() {
+    local ip="$1"
+    tailscale ping --timeout=2s "$ip" &>/dev/null
+}
+
+# Check if watcher is running on a remote device
+is_remote_watcher_running() {
+    local ip="$1"
+    ssh -o ConnectTimeout=3 -o BatchMode=yes "prabhanshu@$ip" \
+        "test -f /tmp/telegram-claude-bot/watcher.pid && kill -0 \$(cat /tmp/telegram-claude-bot/watcher.pid) 2>/dev/null" \
+        2>/dev/null
+}
+
+is_local_watcher_running() {
+    [[ -f "$WATCHER_PID" ]] && kill -0 "$(cat "$WATCHER_PID")" 2>/dev/null
+}
+
+start_local_watcher() {
+    echo "[$(date)] Starting local watcher (failover)"
+    systemctl --user start telegram-watcher.service
+}
+
+stop_local_watcher() {
+    echo "[$(date)] Stopping local watcher (primary back online)"
+    systemctl --user stop telegram-watcher.service
+}
+
+mkdir -p "$STATE_DIR"
+
+# Desktop: Always try to run, it's the primary
+if is_desktop; then
+    if ! is_local_watcher_running; then
+        echo "[$(date)] Desktop: watcher not running, starting..."
+        start_local_watcher
+    fi
+    exit 0
+fi
+
+# Laptop: Only run if desktop is down
+if is_laptop; then
+    desktop_online=$(is_device_online "$DESKTOP_IP" && echo "yes" || echo "no")
+    desktop_watcher=$(is_remote_watcher_running "$DESKTOP_IP" && echo "yes" || echo "no")
+
+    if [[ "$desktop_online" == "yes" && "$desktop_watcher" == "yes" ]]; then
+        # Desktop is handling it, stop local if running
+        if is_local_watcher_running; then
+            echo "[$(date)] Laptop: Desktop watcher active, stopping local"
+            stop_local_watcher
+        fi
+    else
+        # Desktop down or watcher not running - take over
+        if ! is_local_watcher_running; then
+            echo "[$(date)] Laptop: Desktop unavailable, starting local watcher"
+            start_local_watcher
+        fi
+    fi
+    exit 0
+fi
+
+echo "[$(date)] Unknown device: $MY_IP"
+exit 1

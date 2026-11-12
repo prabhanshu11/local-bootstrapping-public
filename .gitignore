@@ -1,0 +1,10 @@
+device-role.conf
+progress_actual.md
+TODO.md
+.venv/
+.pytest_cache/
+__pycache__/
+dotfiles/.opencode/
+
+# Claude Code account-synced skills cache (rewritten per machine by Claude Code)
+dotfiles/.claude/skills/synced/

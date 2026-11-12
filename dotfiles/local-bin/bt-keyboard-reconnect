@@ -1,0 +1,45 @@
+#!/bin/bash
+# bt-keyboard-reconnect: Poll paired ASTRA keyboards and reconnect if disconnected
+# Uses D-Bus directly to avoid bluetoothctl's stuck InProgress state
+
+POLL_INTERVAL=3
+
+# Find all paired ASTRA keyboards
+mapfile -t KEYBOARD_MACS < <(bluetoothctl devices Paired | grep -i "ASTRA" | awk '{print $2}')
+
+if [ ${#KEYBOARD_MACS[@]} -eq 0 ]; then
+    echo "No paired ASTRA keyboards found"
+    exit 1
+fi
+
+echo "Monitoring keyboards: ${KEYBOARD_MACS[*]}"
+
+is_connected() {
+    local mac="$1"
+    local path="/org/bluez/hci0/dev_${mac//:/_}"
+    dbus-send --system --print-reply --dest=org.bluez "$path" \
+        org.freedesktop.DBus.Properties.Get \
+        string:"org.bluez.Device1" string:"Connected" 2>/dev/null \
+        | grep -q "true"
+}
+
+try_connect() {
+    local mac="$1"
+    local path="/org/bluez/hci0/dev_${mac//:/_}"
+    dbus-send --system --print-reply --dest=org.bluez "$path" \
+        org.bluez.Device1.Connect 2>/dev/null
+}
+
+while true; do
+    for mac in "${KEYBOARD_MACS[@]}"; do
+        if ! is_connected "$mac"; then
+            try_connect "$mac" &>/dev/null &
+            # Wait for connect to finish or timeout after 4s
+            CONNECT_PID=$!
+            sleep 4
+            kill "$CONNECT_PID" 2>/dev/null
+            wait "$CONNECT_PID" 2>/dev/null
+        fi
+    done
+    sleep "$POLL_INTERVAL"
+done

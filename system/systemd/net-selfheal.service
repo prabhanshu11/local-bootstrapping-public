@@ -1,0 +1,14 @@
+[Unit]
+Description=Self-heal the desktop's wired LAN path (enp4s0 -> C50 bridge -> C6); never touches Tailscale login
+Documentation=file:///home/prabhanshu/Programs/local-bootstrapping/docs/issues/desktop-away-2026-11-01.md
+ConditionPathExists=/usr/local/bin/net-selfheal
+After=systemd-networkd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/net-selfheal
+# The script restarts systemd-networkd and tailscaled and may call reboot: keep it
+# out of their lifecycles. A link bounce + 3 pings fits well inside this.
+TimeoutStartSec=90
+StandardOutput=journal
+StandardError=journal

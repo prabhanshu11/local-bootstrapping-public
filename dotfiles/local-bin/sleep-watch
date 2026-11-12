@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""
+sleep-watch — verify EVERY sleep, whoever asked for it.
+
+Why (2026-10-03, docs/issues/laptop-suspend-fails-freeze-2026-10-03.md):
+sleep-verified only protects the callers that use it (battery-guard, the
+power button on the lock screen). The suspend he chose at 01:39 came from the
+Omarchy menu, and the hypridle ladder and UPower's 4 % action call logind
+directly too: when the kernel cannot freeze a task those fail silently, the
+laptop stays on behind the lock screen and dies. His words that day: "From now
+on let's develop the project in such a way that this kind of work loss doesn't
+happen. The policies that you create which prevent the suspend need to be
+smart enough to respect my custom choices."
+
+How: logind broadcasts PrepareForSleep(true) before every sleep and
+PrepareForSleep(false) after it (or after it failed). This daemon listens with
+`gdbus monitor --system` (no root, no inhibitor lock) and
+
+  true:  notes /sys/power/suspend_stats/success, the wall/boot clocks, starts
+         laptop-state-snapshot in the background (never waited for). If a
+         sleep-verified run holds $XDG_RUNTIME_DIR/sleep-verified.active the
+         sleep is its; the watcher only logs.
+  false: SLEPT if success went up or the boot clock ran > 60 s ahead of the
+         monotonic clock (= time asleep); else FAILED. A SLEPT sleep is
+         recorded in ~/.local/state/sleep-verified/last.json + history.jsonl
+         (so the tooltip's "Last sleep" covers every path). A FAILED one is
+         handed to `sleep-verified --post-mortem`: analyse the kernel log,
+         unstick his hung FUSE mounts (UNSTICK_FUSE), retry ONCE (somebody
+         asked to sleep; finishing that request respects his choice), sticky
+         card + beep + one Telegram line if it still fails.
+         The retry waits RETRY_GRACE (60) s first behind a sticky card "Sleep
+         failed at X % — retrying in 60 s; press a key, move the mouse or touch
+         the screen to cancel" and input-activity-wait: if he is back, the
+         retry is cancelled ("Retry cancelled: you're back", one Telegram
+         line). 2026-10-06, his words: "give me some grace period if I am back
+         at the keyboard or do something then the sleep should be interrupted."
+         ACTIVITY_CANCELS=never restores the immediate retry.
+
+It never blocks, delays or inhibits a sleep and never kills anything
+(KILL_BLOCKERS / LAST_RESORT belong to battery-guard's limits). The retry's
+own true/false pair is ignored (the post-mortem holds the marker and is the
+watcher's child), and the watcher retries at most once per 10 minutes.
+
+Usage
+  sleep-watch                    # the daemon (sleep-watch.service)
+  sleep-watch --parse LINE...    # tests: true / false / - per line
+Test hooks (env): SLEEP_WATCH_SOURCE_CMD (a command printing gdbus lines,
+replaces gdbus), SLEEP_WATCH_EXIT_ON_EOF=1, SLEEP_WATCH_SV (sleep-verified
+path), SLEEP_WATCH_SNAPSHOT, SLEEP_WATCH_JOURNAL_CMD; sleep-verified's
+SLEEP_VERIFIED_SYS / _STATE_DIR / _MARKER / _CONF apply.
+"""
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SV_PATH = os.environ.get("SLEEP_WATCH_SV") or os.path.join(HERE, "sleep-verified")
+GDBUS = ["gdbus", "monitor", "--system", "--dest", "org.freedesktop.login1",
+         "--object-path", "/org/freedesktop/login1"]
+RETRY_CAP = 600          # s: at most one watcher retry per 10 minutes
+SETTLE = float(os.environ.get("SLEEP_WATCH_SETTLE", "2"))   # s after false before reading the logs
+
+SIGNAL_RE = re.compile(r"\.Manager\.PrepareForSleep \((?:boolean )?(true|false),?\)")
+
+
+def load_sv():
+    loader = importlib.machinery.SourceFileLoader("sleep_verified", SV_PATH)
+    spec = importlib.util.spec_from_loader("sleep_verified", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+SV = load_sv()
+SNAPSHOT = os.environ.get("SLEEP_WATCH_SNAPSHOT") or SV.SNAPSHOT
+WATCH_STATE = os.path.join(SV.STATE, "watch.json")
+
+
+def log(msg):
+    try:
+        subprocess.run(["logger", "-t", "sleep-watch", "--", msg], timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if sys.stderr.isatty() or os.environ.get("SLEEP_WATCH_ECHO"):
+        print(msg, file=sys.stderr, flush=True)
+
+
+def parse_signal(line):
+    """True / False for a PrepareForSleep line from gdbus monitor, None for anything else."""
+    m = SIGNAL_RE.search(line or "")
+    return None if not m else m.group(1) == "true"
+
+
+# What logind wrote around the request: which operation, and a hint of who asked.
+CONTEXT_RULES = [
+    (re.compile(r"Power key pressed"), "power-key"),
+    (re.compile(r"Lid closed"), "lid"),
+    (re.compile(r"Suspend key pressed"), "suspend-key"),
+]
+OP_RE = re.compile(r"The system will (suspend|sleep|hibernate|suspend and hibernate|hybrid-sleep)\w* now")
+
+
+def context_from_journal(text):
+    """'watch/<hint>' from logind's lines just before the sleep.
+
+    logind does not log the caller. "will sleep now" = a Sleep() call, which
+    here is UPower's PercentageAction (logind's SleepOperation=suspend);
+    "will suspend now" = systemctl suspend (menu, hypridle, a terminal);
+    a power-key / lid line in the same window names that path.
+    """
+    op, hint = None, None
+    for line in text.splitlines():
+        m = OP_RE.search(line)
+        if m:
+            op = m.group(1)
+        for rx, name in CONTEXT_RULES:
+            if rx.search(line):
+                hint = name
+    if hint:
+        return f"watch/{hint}"
+    if op == "sleep":
+        return "watch/sleep-call"     # Sleep(): UPower's battery action, usually
+    return f"watch/{op or 'unknown'}"
+
+
+def journal_around(t):
+    cmd = os.environ.get("SLEEP_WATCH_JOURNAL_CMD")
+    cmd = shlex.split(cmd) if cmd else ["journalctl", "--no-pager", "-o", "short-unix", "-t", "systemd-logind",
+                                         "--since", f"@{int(t) - 30}", "--until", f"@{int(t) + 5}"]
+    rc, out, _ = SV.run(cmd, timeout=10)
+    return out if rc == 0 else ""
+
+
+def wstate_load():
+    try:
+        return json.load(open(WATCH_STATE))
+    except (OSError, ValueError):
+        return {}
+
+
+def wstate_save(d):
+    os.makedirs(SV.STATE, exist_ok=True)
+    tmp = WATCH_STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f)
+    os.replace(tmp, WATCH_STATE)
+
+
+class Watcher:
+    def __init__(self):
+        self.pending = None      # what we noted at PrepareForSleep(true)
+        self.child = None        # the running sleep-verified --post-mortem
+        self.bg = []             # snapshot processes, reaped lazily
+
+    def reap(self):
+        self.bg = [p for p in self.bg if p.poll() is None]
+        if self.child and self.child.poll() is not None:
+            log(f"post-mortem finished (exit {self.child.returncode})")
+            self.child = None
+
+    def owner(self):
+        """Who owns the current sleep: a sleep-verified run, our post-mortem, or nobody."""
+        self.reap()
+        if self.child is not None:
+            return f"sleep-watch's post-mortem (pid {self.child.pid})"
+        pid = SV.marker_active()
+        return f"sleep-verified (pid {pid})" if pid else None
+
+    def on_true(self):
+        self.reap()
+        owner = self.owner()
+        stats = SV.suspend_stats()
+        self.pending = {"t_wall": time.time(), "t_mono": time.monotonic(), "gap": SV.sleep_clock(),
+                        "success": stats.get("success"), "fail": stats.get("fail"), "owner": owner}
+        if owner:
+            log(f"PrepareForSleep(true): owned by {owner}; watcher only logs "
+                f"(success={stats.get('success')})")
+            return
+        log(f"PrepareForSleep(true): unverified sleep starting (success={stats.get('success')} "
+            f"fail={stats.get('fail')}); snapshot in the background")
+        if os.access(SNAPSHOT, os.X_OK):
+            try:
+                self.bg.append(subprocess.Popen([SNAPSHOT, "--quiet"], stdout=subprocess.DEVNULL,
+                                                stderr=subprocess.DEVNULL))
+            except OSError as e:
+                log(f"snapshot failed to start: {e}")
+
+    def on_false(self):
+        p, self.pending = self.pending, None
+        if p is None:
+            log("PrepareForSleep(false) without a true (watcher started mid-sleep); ignored")
+            return
+        owner = p["owner"] or self.owner()
+        after = SV.suspend_stats()
+        slept = round(max(SV.sleep_clock() - p["gap"],
+                          (time.time() - p["t_wall"]) - (time.monotonic() - p["t_mono"])), 1)
+        verdict = SV.verdict_of({"success": p["success"]}, after, slept)
+        if owner:
+            log(f"PrepareForSleep(false): {verdict} (slept {slept}s), owned by {owner}; left to it")
+            return
+        time.sleep(SETTLE)
+        reason = context_from_journal(journal_around(p["t_wall"]))
+        log(f"PrepareForSleep(false): {verdict} ({reason}) slept={slept}s success "
+            f"{p['success']}->{after.get('success')} fail {p['fail']}->{after.get('fail')}")
+        if verdict == "SLEPT":
+            pct, _ = SV.battery()
+            SV.write_record({"ts": int(p["t_wall"]), "reason": reason, "verdict": "SLEPT", "source": "sleep-watch",
+                             "battery_pct": pct, "slept_s": slept, "remedy_applied": [], "blockers": [], "fuse": [],
+                             "attempts": [{"n": 0, "observed": True, "verdict": "SLEPT", "slept_s": slept,
+                                           "success": [p["success"], after.get("success")]}],
+                             "done": int(time.time())})
+            return
+        ws = wstate_load()
+        retry = time.time() - ws.get("last_retry", 0) >= RETRY_CAP
+        cmd = [SV_PATH, "--post-mortem", "--reason", reason, "--since", str(int(p["t_wall"]) - 1),
+               "--slept", str(slept)]
+        if isinstance(p["success"], int):
+            cmd += ["--success-before", str(p["success"])]
+        if not retry:
+            cmd.append("--no-retry")
+        else:
+            ws["last_retry"] = int(time.time())
+        ws["last_failed"] = int(time.time())
+        wstate_save(ws)
+        log(f"FAILED sleep nobody verified ({reason}); post-mortem"
+            + (" + one retry" if retry else ", no retry (one already within 10 min)"))
+        try:
+            self.child = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            log(f"post-mortem failed to start: {e}")
+
+    def feed(self, line):
+        ev = parse_signal(line)
+        if ev is True:
+            self.on_true()
+        elif ev is False:
+            self.on_false()
+        elif line.startswith("Monitoring signals") or line.startswith("The name org.freedesktop.login1"):
+            log(f"subscribed: {line.strip()}")
+
+
+def source():
+    cmd = os.environ.get("SLEEP_WATCH_SOURCE_CMD")
+    argv = ["bash", "-c", cmd] if cmd else GDBUS
+    return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+
+
+def main(argv):
+    if argv[:1] == ["--parse"]:
+        for line in argv[1:]:
+            ev = parse_signal(line)
+            print("-" if ev is None else str(ev).lower())
+        return 0
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    if argv[:1] == ["--context"]:          # tests: context from journal text on stdin
+        print(context_from_journal(sys.stdin.read()))
+        return 0
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    w = Watcher()
+    once = os.environ.get("SLEEP_WATCH_EXIT_ON_EOF") == "1"
+    log(f"starting: watching logind PrepareForSleep ({'test source' if os.environ.get('SLEEP_WATCH_SOURCE_CMD') else 'gdbus monitor --system'}); "
+        f"post-mortem via {SV_PATH}")
+    backoff = 2
+    while True:
+        p = source()
+        started = time.monotonic()
+        for line in p.stdout:
+            w.feed(line.rstrip("\n"))
+        p.wait()
+        if once:
+            if w.child:
+                w.child.wait()
+                w.reap()
+            return 0
+        backoff = 2 if time.monotonic() - started > 60 else min(backoff * 2, 60)
+        log(f"monitor exited ({p.returncode}); resubscribing in {backoff}s")
+        time.sleep(backoff)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

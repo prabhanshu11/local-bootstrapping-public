@@ -1,0 +1,10 @@
+[Unit]
+Description=Move idle, clean, pushed agent lane clones off the root SSD (verified, symlinked back; .venv dropped)
+Documentation=file:///home/prabhanshu/Programs/local-bootstrapping/docs/issues/btrfs-commit-stall/desktop-space-permanent-1101.md
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/lane-reaper --run
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=4h

@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""
+waybar-clock — the bar clock (waybar "custom/clock"), replacing the built-in
+clock so the tooltip can say whether daylight saving is on beside each zone
+that has it (asked 2026-09-25: "DST on/off next to New York").
+
+Waybar's built-in clock cannot: extra zones only come from {tz_list} with one
+shared format, and fmt chrono has %Z/%z but no DST flag. See docs/touch-bar.md.
+
+  waybar-clock run        continuous: one JSON line per second (waybar exec, no
+                          "interval", so there is no process per tick)
+  waybar-clock toggle     time <-> full date on the bar (the tap / click)
+  waybar-clock shift N    move the tooltip calendar N months (scroll); 0 = back
+                          to this month
+  waybar-clock card       the long-press card text (bar-touch "state")
+
+toggle / shift write a state file and send SIGUSR1 to every `run` (one per bar),
+which redraws at once instead of on the next second.
+"""
+import calendar
+import json
+import os
+import signal
+import sys
+import time
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
+
+# Zones listed under the local one in the tooltip.
+ZONES = ["America/New_York", "Etc/UTC"]
+
+STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "waybar-clock")
+ALT_FILE = os.path.join(STATE_DIR, "alt")
+SHIFT_FILE = os.path.join(STATE_DIR, "shift")
+
+GREEN = "#a6e3a1"   # today, the local zone
+NEON = "#39FF14"    # the seconds on the bar
+BLUE = "#89b4fa"    # weekdays, other zones
+TEXT = "#cdd6f4"    # month title
+DIM = "#585b70"     # week numbers, rule
+DIMMER = "#6c7086"  # "local"
+YELLOW = "#f9e2af"  # "DST on"
+
+
+def read_state(path, default):
+    try:
+        with open(path) as f:
+            return f.read().strip() or default
+    except OSError:
+        return default
+
+
+def write_state(path, value):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(str(value))
+
+
+def local_zone():
+    """The system zone, re-read every call so a right-click zone change shows up."""
+    try:
+        target = os.readlink("/etc/localtime")
+        key = target.split("zoneinfo/", 1)[1]
+        return ZoneInfo(key)
+    except (OSError, IndexError, ValueError, KeyError):
+        return datetime.now().astimezone().tzinfo
+
+
+def has_dst(tz, year):
+    """True when the zone's offset differs between January and July."""
+    jan = datetime(year, 1, 15, tzinfo=tz).utcoffset()
+    jul = datetime(year, 7, 15, tzinfo=tz).utcoffset()
+    return jan != jul
+
+
+def bar_text(now):
+    if read_state(ALT_FILE, "0") == "1":
+        return now.strftime("%d %B W%V %Y")
+    return now.strftime(f"%a %b %d <span color='{NEON}'>%H:%M:%S</span>")
+
+
+def month_calendar(today, shift):
+    """Waybar's month layout: ISO weeks (Monday first), week numbers on the right."""
+    m = today.year * 12 + today.month - 1 + shift
+    year, month = divmod(m, 12)
+    month += 1
+    lines = [f"<span color='{TEXT}'><b>{calendar.month_name[month]} {year}</b></span>",
+             f"<span color='{BLUE}'><b>Mo Tu We Th Fr Sa Su</b></span>"]
+    for week in calendar.Calendar(0).monthdatescalendar(year, month):
+        cells = []
+        for d in week:
+            if d.month != month:
+                cells.append("  ")
+            elif d == today:
+                cells.append(f"<span color='{GREEN}'><b><u>{d.day:2d}</u></b></span>")
+            else:
+                cells.append(f"{d.day:2d}")
+        wk = week[0].isocalendar()[1]
+        lines.append(" ".join(cells) + f" <span color='{DIM}'>W{wk:02d}</span>")
+    return lines
+
+
+def zone_table(now_utc):
+    """One row per zone: abbreviation, time, date, and DST / local notes."""
+    ltz = local_zone()
+    rows = [(now_utc.astimezone(ltz), ltz, GREEN, True)]
+    rows += [(now_utc.astimezone(ZoneInfo(z)), ZoneInfo(z), BLUE, False) for z in ZONES]
+    width = max(len(t.strftime("%Z")) for t, *_ in rows)
+    out = []
+    for t, tz, colour, is_local in rows:
+        notes = []
+        if is_local:
+            notes.append(f"<span color='{DIMMER}'>local</span>")
+        if isinstance(tz, ZoneInfo) and has_dst(tz, t.year):
+            if t.dst():
+                notes.append(f"<span color='{YELLOW}'><b>DST on</b></span>")
+            else:
+                notes.append(f"<span color='{TEXT}'>DST off</span>")
+        line = (f"<span color='{colour}'><b>{t.strftime('%Z').ljust(width)}</b></span>"
+                f"   <b>{t:%H:%M}</b>   {t:%a %d %b}")
+        if notes:
+            line += "   " + " · ".join(notes)
+        out.append(line)
+    return out
+
+
+def tooltip_body(now_utc):
+    today = now_utc.astimezone(local_zone()).date()
+    shift = int(read_state(SHIFT_FILE, "0") or 0)
+    lines = month_calendar(today, shift)
+    lines.append(f"<span color='{DIM}'>{'─' * 28}</span>")
+    lines += zone_table(now_utc)
+    return "\n".join(lines)
+
+
+def payload():
+    now_utc = datetime.now(timezone.utc)
+    now = now_utc.astimezone(local_zone())
+    return {
+        "text": bar_text(now),
+        "tooltip": f"<tt><span size='large'>{tooltip_body(now_utc)}</span></tt>",
+        "class": "alt" if read_state(ALT_FILE, "0") == "1" else "time",
+    }
+
+
+def run():
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+    while True:
+        try:
+            sys.stdout.write(json.dumps(payload(), ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+        except BrokenPipeError:          # waybar went away (reload / exit)
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+            return
+        # Sleep to the next whole second, or until toggle / shift pokes us.
+        signal.sigtimedwait({signal.SIGUSR1}, 1.0 - time.time() % 1.0 + 0.005)
+
+
+def poke():
+    """SIGUSR1 to every `waybar-clock run`, matched on exact argv: a shell whose
+    command line merely contains the words would die of the signal."""
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+                continue
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = f.read().rstrip(b"\0").split(b"\0")
+        except OSError:
+            continue
+        if len(argv) >= 2 and argv[-1] == b"run" and argv[-2].endswith(b"/waybar-clock"):
+            try:
+                os.kill(int(pid), signal.SIGUSR1)
+            except OSError:
+                pass
+
+
+def card():
+    now_utc = datetime.now(timezone.utc)
+    now = now_utc.astimezone(local_zone())
+    head = f"<b>{now:%A %-d %B %Y  %H:%M:%S}</b>  <span color='{DIM}'>(week {now:%V})</span>"
+    print(f"<tt>{head}\n\n{tooltip_body(now_utc)}</tt>")
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "run"
+    if cmd == "run":
+        run()
+    elif cmd == "toggle":
+        write_state(ALT_FILE, "0" if read_state(ALT_FILE, "0") == "1" else "1")
+        poke()
+    elif cmd == "shift":
+        n = int(argv[2]) if len(argv) > 2 else 0
+        cur = int(read_state(SHIFT_FILE, "0") or 0)
+        write_state(SHIFT_FILE, 0 if n == 0 else cur + n)
+        poke()
+    elif cmd == "card":
+        card()
+    else:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

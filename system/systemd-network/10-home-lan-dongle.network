@@ -1,0 +1,42 @@
+# Home-LAN USB Wi-Fi dongle (laptop) — deployed to /etc/systemd/network/
+#
+# TP-Link Archer T2U PLUS (RTL8821AU, rtw88_8821au), permanent MAC 02:00:00:00:00:04.
+# Joins the Archer C6 SSID `home-wifi-5g` (192.168.0.0/24) while the built-in
+# Intel wlan0 stays on whatever gives internet (phone hotspot, Tata Wi-Fi).
+#
+# This link is LAN-ONLY: no default route, no DNS, no IPv6 RA. The kernel sends
+# 192.168.0.0/24 (connected route) and 192.168.1.0/24 (Tata box, via the C6) out of
+# the dongle; everything else keeps using wlan0's default route. Apps need no change.
+# Issue: docs/issues/home-lan-unreachable-when-internet-down-2026-09-24.md
+# Sorts before 20-wlan.network, so it wins for this adapter only.
+
+[Match]
+PermanentMACAddress=02:00:00:00:00:04
+
+[Link]
+RequiredForOnline=no
+
+[Network]
+DHCP=ipv4
+IPv6AcceptRA=no
+LinkLocalAddressing=no
+MulticastDNS=no
+LLMNR=no
+DNSDefaultRoute=no
+
+[DHCPv4]
+UseGateway=no
+UseDNS=no
+UseDomains=no
+UseNTP=no
+UseHostname=no
+SendHostname=yes
+RouteMetric=50
+
+# Tata box LAN (192.168.1.0/24) sits on the C6's WAN side; reachable through the C6 NAT.
+# If the dongle is ever on a non-home network, 192.168.0.1 is not on-link and this
+# route simply is not installed.
+[Route]
+Destination=192.168.1.0/24
+Gateway=192.168.0.1
+Metric=50

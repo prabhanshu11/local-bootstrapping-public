@@ -1,0 +1,14 @@
+[Unit]
+Description=Hyprland Monitor Configuration Persistence Service
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.config/hypr/scripts/monitor-persist.sh
+Restart=on-failure
+RestartSec=5
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin"
+
+[Install]
+WantedBy=graphical-session.target

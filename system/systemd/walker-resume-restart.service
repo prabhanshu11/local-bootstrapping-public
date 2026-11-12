@@ -1,0 +1,28 @@
+[Unit]
+# Walker (the Omarchy menu launcher) renders via Vulkan. When the GPU powers
+# down across a suspend/resume cycle, Walker's Vulkan context is invalidated and
+# it spins on VK_ERROR_DEVICE_LOST forever — the process stays alive, so nothing
+# looks broken, but every menu it serves silently fails to render.
+#
+# User-visible symptom: the physical power button stops popping up the system
+# menu (bindld XF86PowerOff -> power-button-action -> omarchy-menu system).
+# Super+Space and any other Walker-backed menu break the same way.
+#
+# History: hit on 2026-06-17 (fixed by hand, commit f62d60d) and again on
+# 2026-07-20 after an s2idle resume. This unit removes the manual step.
+# See docs/walker-resume-restart.md.
+Description=Restart Walker after resume (Vulkan device lost)
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+User=prabhanshu
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+# Settle before restarting: the GPU needs to finish reinitialising, otherwise the
+# fresh Walker instance can pick up a still-invalid device and lose it again.
+ExecStartPre=/usr/bin/sleep 2
+ExecStart=/usr/bin/systemctl --user restart elephant.service
+ExecStart=/usr/bin/systemctl --user restart app-walker@autostart.service
+
+[Install]
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# dicons-keepalive: run dicons (the desktop icons layer, ~/Desktop/*.desktop)
+# and start it again if it crashes.
+#
+# Why: dicons segfaulted on 2026-11-02 06:51 (GTK, inside
+# gdk_window_get_device_position). It was started once by exec-once, so the
+# icons stayed gone for 4 days, including the "Restart Topbar" icon.
+#
+# A clean exit (status 0, or killed with SIGTERM/SIGINT, e.g. `pkill dicons`
+# on purpose) ends the wrapper. A crash restarts dicons after 2 s. More than
+# 5 crashes in 60 s = give up and send one notification, so a crash loop
+# never spins forever.
+# Started from dotfiles/hypr/autostart.conf: exec-once = dicons-keepalive
+# Log: ~/.local/state/dicons-keepalive.log
+
+set -u
+DICONS=${DICONS:-/usr/local/bin/dicons}
+LOG="$HOME/.local/state/dicons-keepalive.log"
+mkdir -p "$(dirname "$LOG")"
+log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >>"$LOG"; }
+
+# Only one wrapper per session.
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/dicons-keepalive.lock"
+if ! flock -n 9; then
+    log "another dicons-keepalive is running; exiting"
+    exit 0
+fi
+
+crashes=()
+while :; do
+    log "starting $DICONS"
+    "$DICONS"
+    rc=$?
+    # 0 = normal exit; 130/143 = SIGINT/SIGTERM (stopped on purpose).
+    if [ "$rc" -eq 0 ] || [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then
+        log "dicons exited with $rc (normal stop); not restarting"
+        exit 0
+    fi
+    now=$(date +%s)
+    log "dicons crashed (exit $rc); restarting in 2 s"
+    recent=()
+    for t in "${crashes[@]}" "$now"; do
+        [ $((now - t)) -lt 60 ] && recent+=("$t")
+    done
+    crashes=("${recent[@]}")
+    if [ "${#crashes[@]}" -gt 5 ]; then
+        log "more than 5 crashes in 60 s; giving up"
+        notify-send -u critical "Desktop icons" \
+            "dicons keeps crashing (exit $rc); stopped restarting it. Log: $LOG" 2>/dev/null
+        exit 1
+    fi
+    sleep 2
+done

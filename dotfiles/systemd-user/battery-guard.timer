@@ -1,0 +1,11 @@
+[Unit]
+Description=Check the battery limits once a minute
+
+[Timer]
+# OnCalendar, not OnUnitActiveSec — see power-profile-watchdog.timer for why
+# monotonic timers silently die on this machine.
+OnCalendar=*-*-* *:*:15
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

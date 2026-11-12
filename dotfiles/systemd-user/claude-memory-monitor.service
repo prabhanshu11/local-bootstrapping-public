@@ -1,0 +1,22 @@
+[Unit]
+Description=Claude Code Memory Monitor
+Documentation=file:///home/prabhanshu/Programs/utilities/freeze-monitor/MEMORY-MANAGEMENT-DESIGN.md
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/home/prabhanshu/Programs/utilities/freeze-monitor/claude-memory-monitor.sh
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-memory-monitor
+
+# Resource limits (monitor shouldn't use much)
+MemoryMax=100M
+CPUQuota=10%
+
+[Install]
+WantedBy=default.target

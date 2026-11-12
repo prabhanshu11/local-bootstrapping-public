@@ -1,0 +1,6 @@
+#!/bin/bash
+killall waybar 2>/dev/null || true
+sleep 0.3
+if ! hyprctl dispatch exec waybar >/dev/null 2>&1; then
+    waybar >/dev/null 2>&1 & disown
+fi

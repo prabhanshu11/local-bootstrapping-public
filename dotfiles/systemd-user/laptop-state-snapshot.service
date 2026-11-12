@@ -1,0 +1,9 @@
+[Unit]
+Description=Snapshot open windows and Claude Code sessions (laptop-state-snapshot)
+# See the laptop-state-snapshot header and docs/issues/laptop-suspend-fails-freeze-2026-10-03.md
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/laptop-state-snapshot --quiet
+Nice=10
+TimeoutStartSec=30

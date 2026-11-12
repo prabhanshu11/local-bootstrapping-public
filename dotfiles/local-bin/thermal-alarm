@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# thermal-alarm — Waybar custom module: CPU temperature + fan RPM
+# Outputs JSON: {"text":"...", "tooltip":"...", "class":"..."}
+# Replaces broken built-in temperature module (thermal-zone doesn't exist on desktop)
+
+WARN_TEMP=75
+CRIT_TEMP=92
+
+# Find k10temp sensor dynamically (survives hwmon reordering across boots)
+find_sensor() {
+    for hwmon in /sys/class/hwmon/hwmon*; do
+        if [[ "$(cat "$hwmon/name" 2>/dev/null)" == "k10temp" ]]; then
+            echo "$hwmon/temp1_input"
+            return 0
+        fi
+    done
+    # Fallback: first thermal zone (laptop)
+    for zone in /sys/class/thermal/thermal_zone*; do
+        if [[ -f "$zone/temp" ]]; then
+            echo "$zone/temp"
+            return 0
+        fi
+    done
+    return 1
+}
+
+SENSOR=$(find_sensor) || { echo '{}'; exit 0; }
+raw=$(cat "$SENSOR" 2>/dev/null || echo 0)
+temp=$(( raw / 1000 ))
+
+# Alarm state
+if (( temp >= CRIT_TEMP )); then
+    class="critical"
+    icon="󰸁"
+elif (( temp >= WARN_TEMP )); then
+    class="warning"
+    icon="󰔏"
+else
+    class=""
+    icon="󰔏"
+fi
+
+# Fan RPM (nct6798 — desktop only, silent on laptop)
+fan_rpm=""
+fan_text=""
+for hwmon in /sys/class/hwmon/hwmon*; do
+    if [[ "$(cat "$hwmon/name" 2>/dev/null)" == "nct6798" ]]; then
+        fan_rpm=$(cat "$hwmon/fan2_input" 2>/dev/null)
+        break
+    fi
+done
+
+if [[ -n "$fan_rpm" && "$fan_rpm" -gt 0 ]]; then
+    if (( fan_rpm >= 1000 )); then
+        fan_text=" 🌀 $(( fan_rpm / 1000 )).$(( (fan_rpm % 1000) / 100 ))k"
+    else
+        fan_text=" 🌀 ${fan_rpm}"
+    fi
+fi
+
+# Tooltip
+tooltip="CPU: ${temp}°C"
+if [[ -n "$fan_rpm" ]]; then
+    tooltip="${tooltip}\\nFan: ${fan_rpm} RPM"
+fi
+
+# Check if thermal guard has overridden fans
+if [[ -f /tmp/thermal-alarm-fan-override ]]; then
+    tooltip="${tooltip}\\nFans: OVERRIDE MAX"
+fi
+
+tooltip="${tooltip}\\nWarn: ${WARN_TEMP}°C | Crit: ${CRIT_TEMP}°C"
+
+printf '{"text":"%s %d°%s","tooltip":"%s","class":"%s"}\n' \
+    "$icon" "$temp" "$fan_text" "$tooltip" "$class"

@@ -1,0 +1,160 @@
+#!/bin/bash
+# workspace-pair — KDE-style virtual desktops across two monitors.
+#
+# Desktop N = workspace N on the external monitor + workspace N+10 on the
+# internal (eDP*) monitor, switched together so every desktop gives real
+# estate on both screens. workspace-pairs-daemon keeps the pair in sync for
+# switches that bypass this script (touchpad swipe, waybar clicks).
+#
+# Single monitor (external unplugged, 2026-10-11): Hyprland piles 1-10 onto
+# eDP-1 next to 11-20, so plain `workspace N` only ever reached the windows
+# that had been on the external screen and the laptop's own windows on N+10
+# were unreachable by keyboard. Now Super+N picks a half of pair N:
+#   active is N    -> N+10        active is N+10 -> N   (repeat = toggle)
+#   otherwise      -> the half that has windows; N+10 if both or neither.
+# move/movesilent target the half that `switch` would show.
+#
+# Usage: workspace-pair switch|move|movesilent <1-10>
+#        workspace-pair next|prev|last
+# Dry run: WORKSPACE_PAIR_DRY_RUN=1 prints dispatches instead of running them.
+#   For simulation also set WORKSPACE_PAIR_MONITORS_JSON / _WORKSPACES_JSON /
+#   _ACTIVEWINDOW_JSON to files holding `hyprctl -j` output to use instead.
+
+set -euo pipefail
+
+STATE_FILE="${XDG_RUNTIME_DIR:-/tmp}/workspace-pair-last"
+DRY_RUN="${WORKSPACE_PAIR_DRY_RUN:-0}"
+
+# Read-only queries, optionally replaced by canned JSON for simulation.
+query() {
+    local what=$1 var
+    case "$what" in
+        monitors)     var=WORKSPACE_PAIR_MONITORS_JSON ;;
+        workspaces)   var=WORKSPACE_PAIR_WORKSPACES_JSON ;;
+        activewindow) var=WORKSPACE_PAIR_ACTIVEWINDOW_JSON ;;
+    esac
+    if [[ -n "${!var:-}" ]]; then cat "${!var}"; else hyprctl "$what" -j; fi
+}
+
+# Every state-changing hyprctl call goes through here.
+hc() {
+    if [[ "$DRY_RUN" == 1 ]]; then
+        echo "DRY-RUN: hyprctl $*"
+    else
+        hyprctl "$@" >/dev/null
+    fi
+}
+
+remember_last() {
+    [[ "$DRY_RUN" == 1 ]] && return 0
+    echo "$1" > "$STATE_FILE"
+}
+
+mons_json=$(query monitors | jq '[.[] | select(.disabled | not)]')
+internal=$(jq -r '[.[] | select(.name | startswith("eDP"))][0].name // empty' <<<"$mons_json")
+external=$(jq -r '[.[] | select(.name | startswith("eDP") | not)][0].name // empty' <<<"$mons_json")
+
+paired() { [[ -n "$external" && -n "$internal" ]]; }
+
+active_ws() { jq -r --arg m "$1" '.[] | select(.name == $m) | .activeWorkspace.id' <<<"$mons_json"; }
+
+focused_mon() {
+    local f
+    f=$(jq -r '[.[] | select(.focused)][0].name // empty' <<<"$mons_json")
+    echo "${f:-${external:-$internal}}"
+}
+
+to_desktop() {
+    local ws=$1
+    if (( ws > 10 && ws <= 20 )); then ws=$((ws - 10)); fi
+    echo "$ws"
+}
+
+current_desktop() {
+    if paired; then
+        to_desktop "$(active_ws "$external")"
+    else
+        to_desktop "$(active_ws "$(focused_mon)")"
+    fi
+}
+
+ws_windows() {
+    local n
+    n=$(query workspaces | jq --argjson id "$1" '[.[] | select(.id == $id) | .windows][0] // 0')
+    echo "${n:-0}"
+}
+
+# Single-monitor: which half of pair d to show (see header).
+single_target() {
+    local d=$1 cur lo hi
+    cur=$(active_ws "$(focused_mon)")
+    if [[ "$cur" == "$d" ]]; then echo $((d + 10)); return; fi
+    if [[ "$cur" == $((d + 10)) ]]; then echo "$d"; return; fi
+    lo=$(ws_windows "$d")
+    hi=$(ws_windows $((d + 10)))
+    if (( lo > 0 && hi == 0 )); then echo "$d"; else echo $((d + 10)); fi
+}
+
+do_switch() {
+    local d=$1 prev
+    prev=$(current_desktop)
+    if ! paired; then
+        hc dispatch workspace "$(single_target "$d")"
+    else
+        # Focus follows the last dispatch, so end on the user's monitor.
+        if [[ "$(focused_mon)" == "$internal" ]]; then
+            hc --batch "dispatch workspace $d ; dispatch workspace $((d + 10))"
+        else
+            hc --batch "dispatch workspace $((d + 10)) ; dispatch workspace $d"
+        fi
+    fi
+    if [[ "$prev" != "$d" ]]; then remember_last "$prev"; fi
+}
+
+move_target() {
+    # Paired: windows keep their monitor when changing desktop — internal-
+    # monitor windows go to d+10, external ones to d.
+    local d=$1 win_mon_id win_mon
+    if ! paired; then single_target "$d"; return; fi
+    win_mon_id=$(query activewindow | jq -r '.monitor // -1')
+    win_mon=$(jq -r --argjson id "$win_mon_id" \
+        '.[] | select(.id == $id) | .name' <<<"$mons_json")
+    if [[ "$win_mon" == "$internal" ]]; then
+        echo $((d + 10))
+    else
+        echo "$d"
+    fi
+}
+
+cycle() {
+    local dir=$1 d n idx i
+    d=$(current_desktop)
+    # Desktops in use = any workspace 1-20 that exists, folded to 1-10.
+    mapfile -t desks < <(query workspaces \
+        | jq -r '.[].id | select(. >= 1 and . <= 20)' \
+        | awk '{ print ($1 > 10) ? $1 - 10 : $1 }' | sort -n -u)
+    n=${#desks[@]}
+    (( n == 0 )) && return 0
+    idx=0
+    for i in "${!desks[@]}"; do
+        [[ "${desks[i]}" == "$d" ]] && idx=$i
+    done
+    if [[ "$dir" == next ]]; then
+        idx=$(( (idx + 1) % n ))
+    else
+        idx=$(( (idx - 1 + n) % n ))
+    fi
+    do_switch "${desks[idx]}"
+}
+
+case "${1:-}" in
+    switch)     do_switch "${2:?desktop number required}" ;;
+    move)       hc dispatch movetoworkspace \
+                    "$(move_target "${2:?desktop number required}")" ;;
+    movesilent) hc dispatch movetoworkspacesilent \
+                    "$(move_target "${2:?desktop number required}")" ;;
+    next|prev)  cycle "$1" ;;
+    last)       if [[ -f "$STATE_FILE" ]]; then do_switch "$(cat "$STATE_FILE")"; fi ;;
+    *)  echo "usage: workspace-pair switch|move|movesilent <1-10> | next|prev|last" >&2
+        exit 1 ;;
+esac

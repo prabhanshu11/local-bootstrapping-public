@@ -1,0 +1,567 @@
+@import "/usr/lib/hyprwhspr/config/waybar/hyprwhspr-style.css";
+@import "../omarchy/current/theme/waybar.css";
+
+* {
+  background-color: @background;
+  color: @foreground;
+
+  border: none;
+  border-radius: 0;
+  min-height: 0;
+  font-family: 'JetBrainsMono Nerd Font Mono';
+  font-size: 12px;
+}
+
+/* Bar height lives here, not in config.jsonc, so touch mode can change it.
+   Touch mode overrides this under window#waybar.waybar-touch at the end. */
+window#waybar > box {
+  min-height: 26px;
+}
+
+.modules-left {
+  margin-left: 8px;
+}
+
+.modules-right {
+  margin-right: 8px;
+}
+
+#workspaces button {
+  all: initial;
+  padding: 0 6px;
+  margin: 0 1.5px;
+  min-width: 9px;
+}
+
+#workspaces button.empty {
+  opacity: 0.5;
+}
+
+/* The active workspace keeps its number (no square icon): when two screens
+   share one number the style tells them apart. Picked by him 2026-11-02 from
+   three test rounds (illusions that make the digit pop out):
+   - main workspaces 1-10: red digit with a magenta/cyan split (half a pixel
+     each way), on an embossed teal tile with 1 px scanlines;
+   - secondary 11-20 (#workspaces.secondary, drawn as 1-0): amber digit on
+     sparse scanlines (1 px on, 2 off), no tile.
+   Full opacity even when the workspace is empty. Inner nodes go transparent:
+   the global * rule paints every node, which hides the button background. */
+#workspaces button.active * {
+  background-color: transparent;
+  background-image: none;
+}
+#workspaces button.active {
+  opacity: 1;
+  border-radius: 4px;
+  background-image:
+    repeating-linear-gradient(to bottom,
+      rgba(255, 255, 255, 0.18) 0px, rgba(255, 255, 255, 0.18) 1px,
+      rgba(0, 0, 0, 0) 1px, rgba(0, 0, 0, 0) 2px),
+    linear-gradient(to bottom, #00a8a8, #002a2a);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.7), inset 0 -1px rgba(0, 0, 0, 0.8);
+}
+#workspaces button.active label {
+  color: #ff1a1a;
+  font-weight: bold;
+  text-shadow: -0.5px 0 0 rgba(255, 0, 200, 0.9), 0.5px 0 0 rgba(0, 255, 255, 0.9);
+}
+#workspaces.secondary button.active {
+  background-color: transparent;
+  box-shadow: none;
+  background-image: repeating-linear-gradient(to bottom,
+    rgba(255, 255, 255, 0.45) 0px, rgba(255, 255, 255, 0.45) 1px,
+    rgba(0, 0, 0, 0) 1px, rgba(0, 0, 0, 0) 3px);
+}
+#workspaces.secondary button.active label {
+  color: #ffb000;
+  text-shadow: 0 0 2px #000000, 0 0 1px #000000;
+}
+
+#workspaces button:hover,
+#custom-omarchy:hover,
+#custom-touch-mode:hover,
+#custom-mouse-mode:hover,
+#custom-windows:hover,
+#cpu:hover,
+#memory:hover,
+#custom-clock:hover,
+#custom-thermal-alarm:hover,
+#custom-power-loss:hover,
+#custom-monitor:hover,
+#custom-telegram:hover,
+#custom-datalake:hover,
+#custom-hyprwhspr:hover,
+#custom-read-aloud:hover,
+#custom-moonlight:hover,
+#custom-clipboard:hover,
+#custom-mpv-history:hover,
+#custom-kbd-backlight:hover,
+#hyprland-language:hover,
+#tray:hover,
+#bluetooth:hover,
+#network:hover,
+#pulseaudio:hover,
+#backlight:hover,
+#custom-power-profile:hover,
+#custom-battery:hover,
+#custom-update:hover,
+#custom-screenrecording-indicator:hover {
+  background-color: rgba(205, 214, 244, 0.12);
+  color: @foreground;
+  box-shadow: inset 0 -2px @foreground;
+}
+
+#workspaces button:hover *,
+#custom-omarchy:hover *,
+#custom-touch-mode:hover *,
+#custom-mouse-mode:hover *,
+#custom-windows:hover *,
+#cpu:hover *,
+#memory:hover *,
+#custom-clock:hover *,
+#custom-thermal-alarm:hover *,
+#custom-power-loss:hover *,
+#custom-monitor:hover *,
+#custom-telegram:hover *,
+#custom-datalake:hover *,
+#custom-hyprwhspr:hover *,
+#custom-read-aloud:hover *,
+#custom-moonlight:hover *,
+#custom-clipboard:hover *,
+#custom-mpv-history:hover *,
+#custom-kbd-backlight:hover *,
+#hyprland-language:hover *,
+#tray:hover *,
+#bluetooth:hover *,
+#network:hover *,
+#pulseaudio:hover *,
+#backlight:hover *,
+#custom-power-profile:hover *,
+#custom-battery:hover *,
+#custom-update:hover *,
+#custom-screenrecording-indicator:hover * {
+  background-color: transparent;
+}
+
+/* ── Left: touch mode toggle ──
+   Placed one inch to the right of workspace "1", centre to centre: 1 inch =
+   157 px on the laptop panel (1920 px over 310 mm, scale 1). The distance is
+   #ws (the workspaces group) min-width, not a margin on the toggle, because a margin would sit
+   inside the toggle's click area and a tap anywhere in the gap would flip the
+   mode. With more than five workspaces open the toggle is pushed further right. */
+/* TOCH: the touch mode toggle, "TO" over "CH" as a 2x2 letter block. Off =
+   dim; on = lit (bright amber with a glow), readable by brightness alone. */
+#custom-touch-mode {
+  font-size: 9px;
+  font-weight: bold;
+  letter-spacing: 2px;
+  padding: 0 6px;
+  margin: 0 2px;
+}
+#custom-touch-mode.off {
+  opacity: 0.4;
+}
+#custom-touch-mode.on {
+  color: #f9e2af;
+  text-shadow: 0 0 4px rgba(249, 226, 175, 0.9);
+}
+
+/* The hand: mouse mode (see ~/.local/bin/bar-touch). Same dim/lit rule. */
+#custom-mouse-mode {
+  min-width: 12px;
+  padding: 0 7px;
+  margin-left: 8px;
+}
+/* Open-windows overview button (touch twin of Alt+Tab / Super+W). */
+#custom-windows {
+  min-width: 12px;
+  padding: 0 7px;
+  margin-left: 4px;
+}
+#custom-mouse-mode.off {
+  opacity: 0.55;
+}
+#custom-mouse-mode.on {
+  color: #89dceb;
+  font-weight: bold;
+  text-shadow: 0 0 4px rgba(137, 220, 235, 0.9);
+}
+#ws {
+  min-width: 154px;
+}
+
+/* ── Center: system stats + clock ── */
+#cpu,
+#memory {
+  margin: 0 6px;
+}
+
+#custom-thermal-alarm {
+  margin: 0 6px;
+  color: #FF3333;
+}
+
+#custom-clock {
+  margin: 0 8px;
+  font-weight: bold;
+}
+
+#custom-omarchy,
+#custom-screenrecording-indicator,
+#custom-update {
+  min-width: 12px;
+  margin: 0 7.5px;
+}
+
+#custom-update {
+  font-size: 10px;
+}
+
+/* local-bootstrapping drift (lb-drift): only visible when a Claude agent is
+   due or open. Amber = agent due/opened, blue = agent working now. Not
+   hue-only: the tooltip/card say which. */
+#custom-lb-drift {
+  min-width: 12px;
+  margin: 0 7.5px;
+  font-size: 12px;
+  color: #f9e2af;
+}
+#custom-lb-drift.agent {
+  color: #89b4fa;
+}
+
+#custom-screenrecording-indicator {
+  min-width: 12px;
+  margin-left: 8.75px;
+  font-size: 10px;
+}
+
+#custom-screenrecording-indicator.active {
+  color: #a55555;
+}
+
+#temperature.critical {
+  color: #f38ba8;
+}
+
+/* ── Right: separators ── */
+#custom-sep,
+#custom-sep-2 {
+  color: #585b70;
+  margin: 0 4px;
+}
+
+/* Voice typing: no red icon / underline on the bar while recording; the mic
+   OSD at the bottom of the screen is the indicator (2026-09-25). Overrides
+   hyprwhspr-style.css (imported first). */
+#custom-hyprwhspr.recording {
+  color: inherit;
+  border-bottom-color: transparent;
+}
+
+/* ── Right: fixed-slot layout for icon modules ── */
+#custom-monitor,
+#custom-telegram,
+#custom-datalake,
+#custom-hyprwhspr,
+#custom-read-aloud,
+#custom-moonlight,
+#custom-clipboard,
+#custom-mpv-history,
+#custom-kbd-backlight,
+#backlight,
+#custom-power-profile,
+#custom-battery,
+#pulseaudio,
+#bluetooth,
+#network {
+  min-width: 14px;
+  margin: 0 5px;
+}
+
+#tray {
+  min-width: 14px;
+  margin: 0 5px;
+  margin-right: 10px;
+}
+
+tooltip,
+tooltip.background {
+  background-color: @background;
+  border: 1px solid rgba(205, 214, 244, 0.35);
+  padding: 6px 8px;
+}
+
+tooltip label {
+  background-color: @background;
+  color: @foreground;
+}
+
+.hidden {
+  opacity: 0;
+}
+
+/* ── Power profile indicator ── */
+#custom-power-profile.performance {
+  color: #f38ba8;  /* Red */
+}
+#custom-power-profile.balanced {
+  color: #89b4fa;  /* Blue */
+}
+#custom-power-profile.power-saver {
+  color: #a6e3a1;  /* Green */
+}
+/* CPU pinned below its rated ceiling and auto-heal failed. Peach so it cannot be
+   mistaken for any of the three normal mode colours above. */
+#custom-power-profile.clamped {
+  color: #fab387;  /* Peach */
+  font-weight: bold;
+}
+/* A tap landed and power-profiles-daemon has not confirmed it yet (2026-11-01,
+   power-profile-daemon): the new colour shows at once, dimmed; after 0.5 s the
+   text also gets "…" (a pattern, not only a shade: he is slightly colour-blind). */
+#custom-power-profile.pending {
+  opacity: 0.6;
+}
+
+/* ── Power loss monitor ── */
+#custom-power-loss {
+  min-width: 14px;
+  margin: 0 5px;
+}
+#custom-power-loss.power-loss {
+  color: #f38ba8;  /* Red */
+}
+#custom-power-loss.reboot {
+  color: #89b4fa;  /* Blue */
+}
+#custom-power-loss.clean {
+  color: #a6e3a1;  /* Green */
+}
+#custom-power-loss.unknown {
+  color: #585b70;
+  opacity: 0.5;
+}
+
+/* ── Battery charging indicator ── */
+#custom-battery.charging {
+  color: #a6e3a1;  /* Green — charging */
+}
+#custom-battery.plugged {
+  color: #a6e3a1;  /* Green — plugged (full or charge-limited) */
+}
+/* Amber — plugged in but losing charge (charger too weak), or on battery <=20%.
+   Not hue-only: charging shows the bolt glyph, these show the plain level. */
+#custom-battery.ac-drain,
+#custom-battery.warning {
+  color: #f9e2af;
+}
+#custom-battery.critical {
+  color: #f38ba8;  /* Red — on battery <=10% */
+}
+
+/* ── Read aloud (custom/read-aloud, star-trek-computer): off = dim, on = lit (same rule as
+   touch mode: readable by brightness alone), down = on but broken. ── */
+#custom-read-aloud {
+  font-size: 16px;   /* the text-to-speech glyph is finely drawn: 12 px reads as a speck */
+}
+#custom-read-aloud.off {
+  opacity: 0.4;
+}
+#custom-read-aloud.on {
+  color: #f9e2af;
+  text-shadow: 0 0 4px rgba(249, 226, 175, 0.9);
+}
+#custom-read-aloud.down {
+  color: #f38ba8;
+}
+
+/* ── Keystroke logger health (custom/keystroke, keystroke-bar) ── */
+#custom-keystroke.ok {
+  color: #a6e3a1;  /* Green — capturing */
+}
+#custom-keystroke.blind {
+  color: #f38ba8;  /* Red — BLIND: a keyboard grab is defeating capture */
+}
+#custom-keystroke.stopped {
+  color: #585b70;  /* Grey — service stopped */
+}
+/* .idle (on, nothing typed yet) keeps the default foreground colour. */
+
+/* ── VDI (custom/moonlight): a photo of the Moon as the icon, state as colour under it ──
+   The image is icons/moon-22.png (touch mode: moon-32.png), relative to this file's
+   directory (~/.config/waybar/icons -> dotfiles/waybar/icons). The module text is a
+   badge (empty, "●" streaming, "!" error) drawn right of the moon. */
+#custom-moonlight {
+  background-image: url("icons/moon-22.png");
+  background-repeat: no-repeat;
+  background-position: 4px center;
+  background-size: 22px 22px;
+  min-width: 22px;
+  padding-left: 28px;
+  padding-right: 4px;
+  font-size: 11px;
+  font-weight: bold;
+  border-bottom: 2px solid transparent;
+}
+#custom-moonlight.off { opacity: 0.45; }                       /* no desktop reachable */
+#custom-moonlight.ready { border-bottom-color: #a6e3a1; }       /* green: desktop answers */
+#custom-moonlight.connected { border-bottom-color: #89b4fa; color: #89b4fa; }   /* blue: streaming */
+#custom-moonlight.hidden { border-bottom-color: #89b4fa; color: #89b4fa; opacity: 0.7; }
+#custom-moonlight.error { border-bottom-color: #f38ba8; color: #f38ba8; }       /* red: capture failing */
+
+/* ── Monitor chooser ── */
+#custom-monitor.single {
+  color: #585b70;
+  opacity: 0.5;
+}
+#custom-monitor.extended {
+  color: #89b4fa;  /* Blue */
+}
+#custom-monitor.mirror {
+  color: #a6e3a1;  /* Green */
+}
+#custom-monitor.error {
+  color: #f38ba8;  /* Red */
+}
+
+/* ── Keyboard backlight ──
+   Level is carried by colour here; the green 󰐃 pin appended by the script
+   means the keep-on watchdog is holding the light against the EC's auto-off
+   timer. The pin is coloured inline with Pango, not by a class, so that the
+   armed state and the level stay independently readable. */
+#custom-kbd-backlight.off {
+  color: #585b70;
+  opacity: 0.5;
+}
+#custom-kbd-backlight.low {
+  color: #a6adc8;
+}
+#custom-kbd-backlight.high {
+  color: #f9e2af;  /* Yellow — full brightness */
+}
+#custom-kbd-backlight.error {
+  color: #f38ba8;  /* Red — armed but the watchdog is not running */
+  opacity: 1;
+}
+
+/* ══ TOUCH MODE ══════════════════════════════════════════════════════════
+   Active when ~/.config/waybar/touch-mode.jsonc sets "name": "waybar-touch"
+   (waybar adds the name as a class on the window). Toggle: the hand icon, or
+   `touch-mode toggle`. Bar 26 -> 33 px (x1.25); icons 12 -> 22 px. Stays in
+   the Mono Nerd Font: its icons fit their own advance width, while the
+   non-Mono variant's overflow into the neighbour. At 22 px the line box is
+   30 px, which fits the 33 px bar. */
+window#waybar.waybar-touch > box {
+  min-height: 33px;
+}
+
+window#waybar.waybar-touch #custom-omarchy,
+window#waybar.waybar-touch #custom-mouse-mode,
+window#waybar.waybar-touch #custom-windows,
+window#waybar.waybar-touch #custom-update,
+window#waybar.waybar-touch #custom-lb-drift,
+window#waybar.waybar-touch #custom-screenrecording-indicator,
+window#waybar.waybar-touch #custom-power-loss,
+window#waybar.waybar-touch #custom-monitor,
+window#waybar.waybar-touch #custom-moonlight,
+window#waybar.waybar-touch #custom-telegram,
+window#waybar.waybar-touch #custom-datalake,
+window#waybar.waybar-touch #custom-hyprwhspr,
+window#waybar.waybar-touch #custom-read-aloud,
+window#waybar.waybar-touch #custom-keystroke,
+window#waybar.waybar-touch #custom-clipboard,
+window#waybar.waybar-touch #custom-mpv-history,
+window#waybar.waybar-touch #custom-kbd-backlight,
+window#waybar.waybar-touch #bluetooth,
+window#waybar.waybar-touch #network,
+window#waybar.waybar-touch #pulseaudio,
+window#waybar.waybar-touch #backlight,
+window#waybar.waybar-touch #custom-power-profile,
+window#waybar.waybar-touch #custom-battery {
+  font-size: 22px;
+}
+
+/* Wider slots so a fingertip lands on one icon, not between two */
+window#waybar.waybar-touch #custom-monitor,
+window#waybar.waybar-touch #custom-moonlight,
+window#waybar.waybar-touch #custom-telegram,
+window#waybar.waybar-touch #custom-datalake,
+window#waybar.waybar-touch #custom-hyprwhspr,
+window#waybar.waybar-touch #custom-read-aloud,
+window#waybar.waybar-touch #custom-keystroke,
+window#waybar.waybar-touch #custom-clipboard,
+window#waybar.waybar-touch #custom-mpv-history,
+window#waybar.waybar-touch #custom-kbd-backlight,
+window#waybar.waybar-touch #custom-power-loss,
+window#waybar.waybar-touch #custom-lb-drift,
+window#waybar.waybar-touch #bluetooth,
+window#waybar.waybar-touch #network,
+window#waybar.waybar-touch #pulseaudio,
+window#waybar.waybar-touch #backlight,
+window#waybar.waybar-touch #custom-power-profile,
+window#waybar.waybar-touch #custom-battery {
+  margin: 0 9px;
+}
+
+window#waybar.waybar-touch #custom-omarchy {
+  margin: 0 10px;
+}
+
+/* Two 11 px lines = 29 px, inside the 33 px bar */
+window#waybar.waybar-touch #custom-touch-mode {
+  font-size: 11px;
+  letter-spacing: 3px;
+  padding: 0 8px;
+}
+window#waybar.waybar-touch #custom-mouse-mode {
+  margin-left: 12px;
+}
+
+/* hyprwhspr's own stylesheet gives this module 2 px top + bottom borders (the
+   bottom one is the red recording underline). At 22 px that is 30 + 4 = 34 px
+   and pushed the whole bar past 33. The top border is always transparent, so
+   drop it here and keep the underline. */
+window#waybar.waybar-touch #custom-hyprwhspr {
+  border-top-width: 0;
+}
+
+/* Text reads a little larger in the taller bar */
+window#waybar.waybar-touch #cpu,
+window#waybar.waybar-touch #memory,
+window#waybar.waybar-touch #custom-clock,
+window#waybar.waybar-touch #custom-thermal-alarm,
+window#waybar.waybar-touch #hyprland-language,
+window#waybar.waybar-touch #custom-sep,
+window#waybar.waybar-touch #custom-sep-2 {
+  font-size: 15px;
+}
+
+/* Workspace numbers are touch targets too. The label is styled directly
+   because the global * rule pins every node, labels included, to 12 px. */
+window#waybar.waybar-touch #workspaces button {
+  padding: 0 8px;
+}
+window#waybar.waybar-touch #workspaces button label {
+  font-size: 18px;
+}
+/* Five 18 px workspace buttons take 150 px, so the inch still fits
+   (TOCH centre measured 157-158 px from the "1" centre in both modes) */
+window#waybar.waybar-touch #ws {
+  min-width: 153px;
+}
+
+/* ── mpv watch history (custom/mpv-history, docs/mpv-history.md) ── */
+#custom-mpv-history.empty {
+  opacity: 0.5;
+}
+
+/* VDI moon at touch size: the 32 px render, a wider slot */
+window#waybar.waybar-touch #custom-moonlight {
+  background-image: url("icons/moon-32.png");
+  background-size: 30px 30px;
+  background-position: 4px center;
+  min-width: 30px;
+  padding-left: 36px;
+  font-size: 14px;
+}

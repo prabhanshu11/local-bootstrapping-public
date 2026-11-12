@@ -1,0 +1,98 @@
+#!/bin/bash
+# Reset AMD Zeppelin USB 3.0 xHCI controller when WiFi+BT disappears
+#
+# Root cause: xHCI host controller crash during rapid BT profile switching
+# (A2DP ↔ HFP). The controller stops responding to endpoint commands,
+# kernel marks it dead, and all USB bus 5 devices disappear (WiFi, BT, etc.)
+#
+# Kernel log signature:
+#   xhci_hcd 0000:08:00.3: xHCI host not responding to stop endpoint command
+#   xhci_hcd 0000:08:00.3: xHCI host controller not responding, assume dead
+#   xhci_hcd 0000:08:00.3: HC died; cleaning up
+#
+# Recovery: PCI FLR reset, or unbind/rebind the xHCI driver.
+# After reset, WiFi may re-enumerate as wlan1 (not wlan0).
+#
+# Usage: sudo reset-usb-wifi
+#        reset-usb-wifi  (will prompt for sudo)
+
+set -euo pipefail
+
+PCI_DEV="0000:08:00.3"
+DRIVER="xhci_hcd"
+RESET_PATH="/sys/bus/pci/devices/$PCI_DEV/reset"
+UNBIND_PATH="/sys/bus/pci/drivers/$DRIVER/unbind"
+BIND_PATH="/sys/bus/pci/drivers/$DRIVER/bind"
+
+# Ensure running as root
+if [[ $EUID -ne 0 ]]; then
+    echo "Needs root. Re-running with sudo..."
+    exec sudo "$0" "$@"
+fi
+
+echo "=== xHCI Controller Recovery ==="
+echo "Target: $PCI_DEV ($DRIVER)"
+
+# Check if controller exists
+if [[ ! -d "/sys/bus/pci/devices/$PCI_DEV" ]]; then
+    echo "ERROR: PCI device $PCI_DEV not found"
+    exit 1
+fi
+
+# Option A: PCI Function Level Reset
+echo ""
+echo "Attempting PCI FLR reset..."
+if echo 1 > "$RESET_PATH" 2>/dev/null; then
+    echo "FLR reset sent. Waiting for re-enumeration..."
+    sleep 3
+else
+    echo "FLR failed. Falling back to driver unbind/rebind..."
+    # Option B: Unbind and rebind driver
+    echo "$PCI_DEV" > "$UNBIND_PATH" 2>/dev/null || true
+    sleep 2
+    echo "$PCI_DEV" > "$BIND_PATH" 2>/dev/null || {
+        echo "ERROR: Failed to rebind driver"
+        exit 1
+    }
+    echo "Driver rebound. Waiting for re-enumeration..."
+    sleep 3
+fi
+
+# Check WiFi recovery — find the wireless interface dynamically
+echo ""
+WLAN_DEV=$(iw dev 2>/dev/null | awk '/Interface/{print $2}' | head -1)
+
+if [[ -n "$WLAN_DEV" ]]; then
+    echo "WiFi recovered: $WLAN_DEV"
+    # Try to reconnect to a known network
+    if command -v iwctl &>/dev/null; then
+        KNOWN_NET=$(iwctl known-networks list 2>/dev/null | awk 'NR==5{print $1}')
+        if [[ -n "$KNOWN_NET" ]]; then
+            echo "Reconnecting to $KNOWN_NET..."
+            iwctl station "$WLAN_DEV" connect "$KNOWN_NET" 2>/dev/null || true
+            sleep 2
+            if iwctl station "$WLAN_DEV" show 2>/dev/null | grep -q "connected"; then
+                echo "WiFi connected."
+            else
+                echo "Auto-reconnect failed. Manual: iwctl station $WLAN_DEV connect <SSID>"
+            fi
+        fi
+    fi
+else
+    echo "WiFi NOT recovered. Reboot may be needed."
+    exit 1
+fi
+
+# Check BT recovery
+echo ""
+if command -v bluetoothctl &>/dev/null; then
+    if bluetoothctl show 2>/dev/null | grep -q "Powered: yes"; then
+        echo "Bluetooth recovered."
+    else
+        echo "Bluetooth not powered. Trying to power on..."
+        bluetoothctl power on 2>/dev/null || true
+    fi
+fi
+
+echo ""
+echo "=== Recovery complete ==="

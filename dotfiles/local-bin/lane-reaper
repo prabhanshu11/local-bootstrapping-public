@@ -1,0 +1,101 @@
+#!/bin/bash
+# lane-reaper: move idle agent lane clones off the desktop root SSD (desktop-space-permanent-1101, 2026-11-01).
+# His words 2026-11-01 ~20:25 IST: "please fix my desktop space situation.. its always falling low, beacues of silly
+# reasons. even thoug I have ample storage in ext. and networked drives." ~/lanes held 143 clones / 29 GB on 11-01;
+# every lane leaves one behind and nothing moved them. Data is gold: nothing is deleted except a clone's .venv (uv,
+# re-creatable; his 10-26 word).
+#
+# A dir in ~/lanes is a candidate when ALL hold:
+#   - a real dir (not already a symlink), no process has its cwd or an open file under it;
+#   - idle: no file outside .venv and .git modified for IDLE_DAYS (default 3; git status and commit-graph upkeep touch .git);
+#   - git clone: worktree clean (no modified or untracked files) and HEAD is on a remote-tracking branch (pushed);
+#     not a git dir (lane output dirs): idle is enough, the move is lossless.
+# Move = rsync -aH (without .venv) -> sha256 of every source file re-checked AT the destination -> symlink list equal
+#   -> nothing changed during the copy -> mv aside, ln -s DEST SRC (paths keep resolving), rm -rf the aside copy.
+# Destination (auto): /mnt/external/lanes-archive while the 2 TB external keeps > EXT_RESERVE_GB (100) free after the
+#   copy, else /mnt/pi-archive/desktop-lanes (Pi 5 Seagate 4 TB, NFS, slow: 0.24 MB/s on 11-01) while > 200 GB; else stop.
+# Log: ~/logs/lane-reaper/reaper.tsv (one row per lane) + DEST/MANIFEST.tsv + DEST/<name>.sha256.
+#   lane-reaper                 dry run: list candidates and why the rest are kept
+#   lane-reaper --run [--idle-days N] [--max-gb N] [--dest external|pi]
+#   lane-reaper --summary       print "moved N lanes, X GB" of the last --run (for disk-upkeep)
+set -uo pipefail
+LANES=${LANES:-$HOME/lanes}
+IDLE_DAYS=3; RUN=0; MAX_GB=0; DEST_PICK=auto; EXT_RESERVE_GB=100; PI_RESERVE_GB=200
+LOGDIR=$HOME/logs/lane-reaper; mkdir -p "$LOGDIR"; TSV=$LOGDIR/reaper.tsv; LAST=$LOGDIR/last-run.txt
+EXT=/mnt/external/lanes-archive; PI=/mnt/pi-archive/desktop-lanes
+while [ $# -gt 0 ]; do case "$1" in
+  --run) RUN=1;; --idle-days) IDLE_DAYS=$2; shift;; --max-gb) MAX_GB=$2; shift;; --dest) DEST_PICK=$2; shift;;
+  --summary) cat "$LAST" 2>/dev/null; exit 0;;
+  -h|--help) sed -n 2,24p "$0"; exit 0;; *) echo "unknown arg $1"; exit 2;; esac; shift; done
+exec 9>"$LOGDIR/lock"; flock -n 9 || { echo "lane-reaper already running"; exit 0; }
+
+avail_gb(){ df -B1G --output=avail "$1" 2>/dev/null | tail -1 | tr -d ' '; }
+size_kb(){ du -sk --exclude=.venv "$1" 2>/dev/null | cut -f1; }
+in_use(){  # cwd or open fd under $1, by any of my processes
+  local p=$1
+  ls -l /proc/[0-9]*/cwd /proc/[0-9]*/fd/ 2>/dev/null | grep -qF -- "-> $p/" && return 0
+  ls -l /proc/[0-9]*/cwd 2>/dev/null | grep -qE -- "-> $p\$" && return 0
+  return 1; }
+why_keep(){  # prints a reason to keep $1, or nothing if it is a candidate
+  local d=$1
+  [ -L "$d" ] && { echo "already-moved"; return; }
+  [ -d "$d" ] || { echo "not-a-dir"; return; }
+  [ -n "$(find "$d" \( -name .venv -o -name .git \) -prune -o -newermt "$IDLE_DAYS days ago" -print -quit 2>/dev/null)" ] && { echo "active<${IDLE_DAYS}d"; return; }
+  if [ -e "$d/.git" ]; then
+    [ -n "$(git -C "$d" status --porcelain --untracked-files=normal 2>/dev/null | head -1)" ] && { echo "git-dirty"; return; }
+    [ -z "$(git -C "$d" branch -r --contains HEAD 2>/dev/null | head -1)" ] && { echo "not-pushed"; return; }
+  fi
+  in_use "$d" && { echo "in-use"; return; }
+  echo ""; }
+pick_dest(){  # $1 = size in GB needed. The 2 TB external first (local USB, ~100+ MB/s) while it keeps > 100 GB free;
+  # the Pi 5 Seagate over NFS only after that: on 11-01 it took lane clones at 0.24 MB/s, 1 file/s (wireless bridge).
+  local need=$1 a
+  if [ "$DEST_PICK" != pi ] && mountpoint -q /mnt/external && [ -w "$EXT" ]; then
+    a=$(avail_gb /mnt/external); [ $((a - need)) -gt "$EXT_RESERVE_GB" ] && { echo "$EXT"; return; }
+  fi
+  if [ "$DEST_PICK" != external ] && mountpoint -q /mnt/pi-archive 2>/dev/null; then
+    mkdir -p "$PI" 2>/dev/null
+    a=$(avail_gb /mnt/pi-archive); [ -w "$PI" ] && [ $((a - need)) -gt "$PI_RESERVE_GB" ] && { echo "$PI"; return; }
+  fi
+  echo ""; }
+row(){ printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -Is)" "$1" "$2" "$3" "$4" "$5" "$(avail_gb /)" | tee -a "$TSV" ${6:+"$6/MANIFEST.tsv"} >/dev/null; }
+
+move_one(){  # src dest_root -> 0 moved, 4 failed (source untouched)
+  local src=$1 root=$2 name dest man marker n kb nv aside
+  name=$(basename "$src"); dest=$root/$name
+  [ -e "$dest" ] && { row "$src" "$dest" 0 0 "SKIP:dest-exists"; return 4; }
+  marker=$(mktemp); nv=$(find "$src" -name .venv -type d -prune | wc -l)
+  ionice -c3 nice -n10 rsync -aH --exclude='.venv/' "$src/" "$dest/" || { row "$src" "$dest" 0 0 "FAIL:rsync" "$root"; rm -f "$marker"; return 4; }
+  man=$dest.sha256
+  ( cd "$src" && find . -name .venv -prune -o -type f -print0 | sort -z | xargs -0 -r ionice -c3 sha256sum ) > "$man" \
+    || { row "$src" "$dest" 0 0 "FAIL:manifest" "$root"; rm -f "$marker"; return 4; }
+  n=$(wc -l < "$man"); kb=$(size_kb "$src")
+  ( cd "$dest" && ionice -c3 sha256sum -c --quiet --strict "$man" ) >/dev/null 2>&1 || { row "$src" "$dest" "$n" "$kb" "FAIL:verify" "$root"; rm -f "$marker"; return 4; }
+  links(){ ( cd "$1" && find . -name .venv -prune -o -type l -printf '%p %l\n' | sort ); }
+  [ "$(links "$src")" = "$(links "$dest")" ] || { row "$src" "$dest" "$n" "$kb" "FAIL:symlinks" "$root"; rm -f "$marker"; return 4; }
+  [ -z "$(find "$src" -name .venv -prune -o -newer "$marker" -print -quit)" ] || { row "$src" "$dest" "$n" "$kb" "FAIL:changed-during-copy" "$root"; rm -f "$marker"; return 4; }
+  rm -f "$marker"; aside=$src.reaper-verified-aside
+  if mv "$src" "$aside"; then
+    if ln -s "$dest" "$src"; then rm -rf "$aside"; row "$src" "$dest" "$n" "$kb" "MOVED;venvs-dropped=$nv" "$root"; return 0; fi
+    mv "$aside" "$src"; row "$src" "$dest" "$n" "$kb" "FAIL:link-back(restored)" "$root"; return 4
+  fi
+  row "$src" "$dest" "$n" "$kb" "FAIL:mv-aside" "$root"; return 4; }
+
+before=$(avail_gb /); moved=0; moved_kb=0; failed=0; declare -A kept=()
+mapfile -t dirs < <(find "$LANES" -mindepth 1 -maxdepth 1 -printf '%T@ %p\n' | sort -n | cut -d' ' -f2-)
+for d in "${dirs[@]}"; do
+  r=$(why_keep "$d")
+  if [ -n "$r" ]; then kept[$r]=$(( ${kept[$r]:-0} + 1 )); continue; fi
+  kb=$(size_kb "$d"); gb=$(( (kb + 1048575) / 1048576 ))
+  if [ "$RUN" = 0 ]; then echo "candidate $(basename "$d") $((kb/1024)) MB (+.venv dropped)"; moved=$((moved+1)); moved_kb=$((moved_kb+kb)); continue; fi
+  [ "$MAX_GB" -gt 0 ] && [ $(( (moved_kb + kb) / 1048576 )) -gt "$MAX_GB" ] && { kept[max-gb]=$(( ${kept[max-gb]:-0} + 1 )); continue; }
+  root=$(pick_dest "$gb"); [ -z "$root" ] && { echo "no destination with room; stop"; kept[no-dest]=$(( ${kept[no-dest]:-0} + 1 )); break; }
+  mkdir -p "$root"
+  if move_one "$d" "$root"; then moved=$((moved+1)); moved_kb=$((moved_kb+kb)); echo "moved $(basename "$d") $((kb/1024)) MB -> $root"
+  else failed=$((failed+1)); fi
+done
+k=""; for r in "${!kept[@]}"; do k="$k $r=${kept[$r]}"; done
+verb=$([ "$RUN" = 1 ] && echo moved || echo "would move")
+S="lane-reaper $(date -Is): $verb $moved lane dirs ($(awk -v k="$moved_kb" 'BEGIN{printf "%.1f", k/1048576}') GB without .venv), failed $failed, kept:$k; root free ${before} -> $(avail_gb /) GB"
+echo "$S"; [ "$RUN" = 1 ] && echo "$S" > "$LAST"
+exit 0

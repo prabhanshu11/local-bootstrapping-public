@@ -1,0 +1,17 @@
+# Mounts the iPhone's VLC "Documents" folder at ~/iPhone-VLC while the phone is plugged in.
+# Started by udev (system/udev-rules/90-iphone-vlc-mount.rules); stops + unmounts on unplug (BindsTo).
+# Retries every 5 s while the phone is locked / waiting for "Trust this computer".
+[Unit]
+Description=Mount iPhone VLC folder at ~/iPhone-VLC
+BindsTo=sys-subsystem-usb-iphone.device
+After=sys-subsystem-usb-iphone.device
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/mkdir -p %h/iPhone-VLC
+ExecStartPre=-/usr/bin/fusermount3 -uz %h/iPhone-VLC
+ExecStart=/usr/bin/ifuse -f --documents org.videolan.vlc-ios %h/iPhone-VLC
+ExecStopPost=-/usr/bin/fusermount3 -uz %h/iPhone-VLC
+Restart=on-failure
+RestartSec=5

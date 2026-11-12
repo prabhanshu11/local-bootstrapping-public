@@ -1,0 +1,29 @@
+[Unit]
+Description=ThinkPad keyboard backlight keep-on watchdog
+After=graphical-session.target
+
+# Both conditions make "nothing to do" a SKIP, not a failure:
+#  - no tpacpi LED  -> other machines (the desktop) never start this at all
+#  - keep-on absent -> disarmed costs literally nothing, and arming across a
+#                      reboot resumes automatically because the flag persists
+ConditionPathExists=/sys/class/leds/tpacpi::kbd_backlight/brightness
+ConditionPathExists=%h/.config/kbd-backlight/keep-on
+
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/kbd-backlight daemon
+Restart=on-failure
+RestartSec=10
+Nice=10
+
+# Belt and braces. The loop is a `sleep`-driven shell loop with a 2s floor and
+# no unbounded state, but the user has been burned by a runaway memory leak
+# before, so the kernel enforces the budget regardless of what the code does.
+MemoryMax=32M
+CPUQuota=5%
+
+[Install]
+WantedBy=graphical-session.target

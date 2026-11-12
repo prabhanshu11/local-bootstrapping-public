@@ -1,0 +1,11 @@
+[Unit]
+Description=Keep ThinkPad DYTC lap mode (CQL) disabled so the EC never clamps the CPU
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/disable-lapmode.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

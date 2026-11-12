@@ -1,0 +1,14 @@
+[Unit]
+Description=Thermal Screenshot Guard - captures all workspaces before thermal shutdown
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/thermal-screenshot-guard --warn-temp 88 --crit-temp 92 --poll 10
+Restart=on-failure
+RestartSec=10
+PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR HYPRLAND_INSTANCE_SIGNATURE PATH
+
+[Install]
+WantedBy=graphical-session.target

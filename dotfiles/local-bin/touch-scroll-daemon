@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""
+Touch-to-scroll daemon for Hyprland.
+
+Monitors touchscreen events and injects mouse scroll wheel events
+when a single-finger vertical drag is detected. Only injects scroll
+for apps that don't handle wl_touch scroll natively (e.g. Ghostty).
+Apps like Firefox handle touch scrolling via Wayland's wl_touch protocol,
+so injecting wheel events there causes double-scrolling.
+
+How it works:
+- Reads raw touch events from the touchscreen evdev device
+- Tracks focused window via Hyprland IPC activewindow events
+- When a single finger drags vertically AND the focused app is in the
+  allowlist, injects scroll wheel events via a virtual uinput device
+- Horizontal drags and multi-finger gestures are ignored (passed through)
+- Uses a dead zone to distinguish taps/selections from intentional scrolls
+"""
+
+import evdev
+from evdev import UInput, ecodes
+import signal
+import sys
+import os
+import json
+import socket
+import subprocess
+import threading
+
+# Configuration
+SCROLL_THRESHOLD = 30      # pixels of vertical movement before scroll activates
+SCROLL_SPEED = 1           # wheel ticks per SCROLL_STEP pixels
+SCROLL_STEP = 20           # pixels of movement per scroll tick
+HORIZONTAL_RATIO = 1.5     # if horizontal > vertical * ratio, it's not a scroll
+
+TOUCHSCREEN_NAME = "ELAN Touchscreen"
+STATE_FILE = os.path.expanduser("~/.local/state/screen-transform")
+
+# Only inject scroll events when these app classes are focused.
+# Apps not in this list handle touch scrolling natively via wl_touch.
+SCROLL_INJECT_CLASSES = {"com.mitchellh.ghostty"}
+
+
+def read_screen_transform():
+    """Read current screen transform from state file. Returns True if flipped (180°)."""
+    try:
+        with open(STATE_FILE) as f:
+            return f.read().strip() == "2"
+    except FileNotFoundError:
+        return False
+
+
+def get_hyprland_socket_path():
+    """Get the Hyprland IPC event socket path (.socket2.sock)."""
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig:
+        return None
+    return f"/run/user/{os.getuid()}/hypr/{sig}/.socket2.sock"
+
+
+def get_active_window_class():
+    """Query hyprctl for the currently focused window class."""
+    try:
+        result = subprocess.run(
+            ["hyprctl", "activewindow", "-j"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            data = json.loads(result.stdout)
+            return data.get("class", "")
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+        pass
+    return ""
+
+
+def start_focus_listener(state):
+    """Background thread that subscribes to Hyprland IPC activewindow events.
+
+    Updates state["focused_class"] on each focus change.
+    """
+    sock_path = get_hyprland_socket_path()
+    if not sock_path:
+        print("HYPRLAND_INSTANCE_SIGNATURE not set, focus tracking disabled",
+              file=sys.stderr)
+        return
+
+    def listener():
+        while True:
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.connect(sock_path)
+                buf = b""
+                while True:
+                    data = sock.recv(4096)
+                    if not data:
+                        break
+                    buf += data
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        line = line.decode("utf-8", errors="replace")
+                        # Format: "activewindow>>CLASS,TITLE"
+                        if line.startswith("activewindow>>"):
+                            payload = line[len("activewindow>>"):]
+                            # CLASS may contain commas, but the first comma
+                            # separates class from title
+                            window_class = payload.split(",", 1)[0]
+                            old = state["focused_class"]
+                            state["focused_class"] = window_class
+                            if old != window_class:
+                                inject = window_class in SCROLL_INJECT_CLASSES
+                                print(f"Focus: {window_class} "
+                                      f"(scroll inject: {inject})")
+            except (ConnectionRefusedError, FileNotFoundError, OSError) as e:
+                print(f"IPC connection error: {e}, retrying in 2s",
+                      file=sys.stderr)
+                import time
+                time.sleep(2)
+
+    t = threading.Thread(target=listener, daemon=True)
+    t.start()
+
+
+def find_touchscreen():
+    """Find the main touchscreen device."""
+    devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
+    for dev in devices:
+        if dev.name == TOUCHSCREEN_NAME:
+            caps = dev.capabilities(verbose=True)
+            # Look for the device with ABS_MT_POSITION_X (multitouch)
+            for cap_type, cap_codes in caps.items():
+                if cap_type[0] == 'EV_ABS':
+                    for code_info in cap_codes:
+                        if code_info[0][0] == 'ABS_MT_POSITION_X':
+                            return dev
+    return None
+
+
+def create_virtual_scroll_device():
+    """Create a virtual mouse device that can emit scroll events."""
+    capabilities = {
+        ecodes.EV_REL: [ecodes.REL_WHEEL, ecodes.REL_HWHEEL],
+    }
+    return UInput(capabilities, name="touch-scroll-daemon")
+
+
+def main():
+    touchscreen = find_touchscreen()
+    if not touchscreen:
+        print(f"Could not find touchscreen '{TOUCHSCREEN_NAME}'", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Monitoring: {touchscreen.name} ({touchscreen.path})")
+
+    vdev = create_virtual_scroll_device()
+    print(f"Virtual scroll device: {vdev.name}")
+
+    # Screen flip state — invert scroll when display is rotated 180°
+    flip_state = {"flipped": read_screen_transform()}
+    print(f"Screen flipped: {flip_state['flipped']}")
+
+    def handle_sigusr1(sig, frame):
+        flip_state["flipped"] = read_screen_transform()
+        print(f"SIGUSR1: screen flipped = {flip_state['flipped']}")
+
+    signal.signal(signal.SIGUSR1, handle_sigusr1)
+
+    # Focus tracking — only inject scroll for allowlisted apps
+    focus_state = {"focused_class": get_active_window_class()}
+    inject = focus_state["focused_class"] in SCROLL_INJECT_CLASSES
+    print(f"Initial focus: {focus_state['focused_class']} "
+          f"(scroll inject: {inject})")
+    start_focus_listener(focus_state)
+
+    # State tracking
+    tracking_slots = {}  # slot_id -> {x, y, start_x, start_y, scrolling}
+    current_slot = 0
+    finger_count = 0
+    scroll_accumulator = 0.0
+    last_y = None
+
+    def cleanup(sig=None, frame=None):
+        vdev.close()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+
+    try:
+        for event in touchscreen.read_loop():
+            if event.type == ecodes.EV_ABS:
+                if event.code == ecodes.ABS_MT_SLOT:
+                    current_slot = event.value
+
+                elif event.code == ecodes.ABS_MT_TRACKING_ID:
+                    if event.value >= 0:
+                        # Finger down
+                        tracking_slots[current_slot] = {
+                            'x': 0, 'y': 0,
+                            'start_x': 0, 'start_y': 0,
+                            'scrolling': False,
+                        }
+                        finger_count = len(tracking_slots)
+                    else:
+                        # Finger up
+                        if current_slot in tracking_slots:
+                            del tracking_slots[current_slot]
+                        finger_count = len(tracking_slots)
+                        scroll_accumulator = 0.0
+                        last_y = None
+
+                elif event.code == ecodes.ABS_MT_POSITION_X:
+                    if current_slot in tracking_slots:
+                        slot = tracking_slots[current_slot]
+                        if slot['start_x'] == 0:
+                            slot['start_x'] = event.value
+                        slot['x'] = event.value
+
+                elif event.code == ecodes.ABS_MT_POSITION_Y:
+                    if current_slot in tracking_slots:
+                        slot = tracking_slots[current_slot]
+                        if slot['start_y'] == 0:
+                            slot['start_y'] = event.value
+                        slot['y'] = event.value
+
+                        # Only scroll with exactly 1 finger
+                        if finger_count != 1:
+                            continue
+
+                        dy = slot['y'] - slot['start_y']
+                        dx = slot['x'] - slot['start_x']
+
+                        # Check if this is a horizontal movement (not scroll)
+                        if abs(dx) > abs(dy) * HORIZONTAL_RATIO and not slot['scrolling']:
+                            continue
+
+                        # Activate scrolling after threshold
+                        if not slot['scrolling']:
+                            if abs(dy) > SCROLL_THRESHOLD:
+                                slot['scrolling'] = True
+                                last_y = slot['y']
+                                scroll_accumulator = 0.0
+                            continue
+
+                        # Only inject scroll for allowlisted apps
+                        if focus_state["focused_class"] not in SCROLL_INJECT_CLASSES:
+                            last_y = slot['y']
+                            continue
+
+                        # Emit scroll events
+                        if last_y is not None:
+                            delta = slot['y'] - last_y
+                            if flip_state["flipped"]:
+                                delta = -delta
+                            scroll_accumulator += delta
+
+                            while abs(scroll_accumulator) >= SCROLL_STEP:
+                                if scroll_accumulator > 0:
+                                    # Finger moving down = scroll up (natural scrolling)
+                                    vdev.write(ecodes.EV_REL, ecodes.REL_WHEEL, SCROLL_SPEED)
+                                    vdev.syn()
+                                    scroll_accumulator -= SCROLL_STEP
+                                else:
+                                    # Finger moving up = scroll down (natural scrolling)
+                                    vdev.write(ecodes.EV_REL, ecodes.REL_WHEEL, -SCROLL_SPEED)
+                                    vdev.syn()
+                                    scroll_accumulator += SCROLL_STEP
+
+                        last_y = slot['y']
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cleanup()
+
+
+if __name__ == "__main__":
+    main()

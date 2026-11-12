@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""token-usage — what is my context size, and how big are my subagents?
+
+Claude Code gives the MODEL no native way to read its own context size; the
+terminal statusline and /context are for the human. This CLI answers it from
+the session's transcript files (stdlib only, <50 ms):
+
+  this agent      current context (last turn's input+cache+output) vs window
+  subagents       every agent transcript in this session: context, level
+                  (ok / warn / RETIRE), turns, tool uses, last activity, name
+  overrides       [long-context-ok] exceptions granted this session (ledger)
+
+Usage:
+  token-usage                 human-readable report
+  token-usage --json          machine-readable
+  token-usage --session ID    another session (default: $CLAUDE_CODE_SESSION_ID)
+  token-usage --agent ID      force "this agent" to a given subagent id
+  token-usage --brief         one line: "context 141k/1000k (14%) · 3 subagents, 1 RETIRE"
+
+Self-identification: when run from a subagent's Bash tool, the calling
+transcript is the one whose LAST assistant turn is a Bash tool_use containing
+"token-usage" with no tool_result yet. Falls back to the main session.
+"""
+import argparse
+import glob
+import importlib.util
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+HOOK = HERE.parent / "hooks" / "subagent-context-guard.py"
+HOME = Path.home()
+
+
+def load_guard():
+    spec = importlib.util.spec_from_file_location("guard", HOOK)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+G = load_guard()
+
+
+def k(n):
+    return "?" if n is None else f"{n/1000:.0f}k"
+
+
+def find_main_transcript(sid):
+    hits = glob.glob(str(HOME / ".claude/projects" / "*" / f"{sid}.jsonl"))
+    return Path(hits[0]) if hits else None
+
+
+def context_window():
+    """From ~/.claude/settings.json model string: '[1m]' => 1M, else 200k."""
+    try:
+        s = json.loads((HOME / ".claude/settings.json").read_text())
+        model = str(s.get("model", ""))
+        return 1_000_000 if "[1m]" in model else 200_000
+    except Exception:
+        return 200_000
+
+
+def scan_transcript(path):
+    """Full pass: turns, tool uses, last budget reminder, last usage, first user prompt."""
+    turns = tools = 0
+    budget = None
+    first_prompt = None
+    try:
+        with open(path, "rb") as f:
+            for raw in f:
+                if b'"assistant"' in raw and b'"usage"' in raw:
+                    try:
+                        d = json.loads(raw)
+                    except Exception:
+                        continue
+                    if d.get("type") == "assistant":
+                        turns += 1
+                        for b in (d.get("message") or {}).get("content") or []:
+                            if isinstance(b, dict) and b.get("type") == "tool_use":
+                                tools += 1
+                elif b"total_tokens_reminder" in raw:
+                    m = re.search(rb"<total_tokens>(\d+) tokens left", raw)
+                    if m:
+                        budget = int(m.group(1))
+                if first_prompt is None and b'"type":"user"' in raw.replace(b" ", b""):
+                    try:
+                        d = json.loads(raw)
+                        c = (d.get("message") or {}).get("content")
+                        if isinstance(c, str):
+                            first_prompt = c.strip().split("\n")[0][:70]
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return turns, tools, budget, first_prompt
+
+
+def is_caller(path):
+    """True if this transcript's last assistant turn is a pending Bash tool_use running token-usage."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 64 * 1024))
+            lines = f.read().split(b"\n")
+        for raw in reversed(lines):
+            if not raw.strip():
+                continue
+            d = json.loads(raw)
+            if d.get("type") != "assistant":
+                return False
+            for b in (d.get("message") or {}).get("content") or []:
+                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Bash":
+                    if "token-usage" in str((b.get("input") or {}).get("command", "")):
+                        return True
+            return False
+    except Exception:
+        return False
+    return False
+
+
+def age(ts):
+    s = int(time.time() - ts)
+    return f"{s}s" if s < 90 else f"{s//60}m" if s < 5400 else f"{s//3600}h"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    ap.add_argument("--agent", help="treat this subagent id as 'this agent'")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--brief", action="store_true")
+    a = ap.parse_args()
+    if not a.session:
+        sys.exit("no session id: set CLAUDE_CODE_SESSION_ID or pass --session")
+
+    main_tp = find_main_transcript(a.session)
+    if not main_tp:
+        sys.exit(f"no transcript found for session {a.session}")
+    sub_dir = main_tp.with_suffix("") / "subagents"
+    inp = {"session_id": a.session, "transcript_path": str(main_tp)}
+    st = G.load_state(inp)
+    window = context_window()
+
+    subs = []
+    for p in sorted(sub_dir.glob("agent-*.jsonl") if sub_dir.is_dir() else [],
+                    key=lambda p: p.stat().st_mtime, reverse=True):
+        aid = p.stem[len("agent-"):]
+        ctx = G.measure_context(p)
+        turns, tools, _, first = scan_transcript(p)
+        rec = st.get(aid) or {}
+        subs.append({
+            "id": aid, "ctx": ctx, "level": G.level(ctx), "turns": turns, "tool_uses": tools,
+            "last_activity": int(p.stat().st_mtime),
+            "name": rec.get("description") or rec.get("agent_name") or first or "",
+            "overrides": rec.get("overrides", 0), "caller": is_caller(p),
+        })
+
+    me = None
+    if a.agent:
+        me = next((s for s in subs if s["id"] == a.agent), None)
+    if me is None:
+        me = next((s for s in subs if s["caller"]), None)
+    if me is None:
+        ctx = G.measure_context(main_tp)
+        turns, tools, budget, _ = scan_transcript(main_tp)
+        me = {"id": "main", "ctx": ctx, "level": G.level(ctx), "turns": turns,
+              "tool_uses": tools, "budget_left": budget, "name": "main session"}
+    else:
+        me = dict(me)
+        me["budget_left"] = None
+
+    n_retire = sum(1 for s in subs if s["level"] == "RETIRE")
+    n_warn = sum(1 for s in subs if s["level"] == "WARN")
+    report = {
+        "session": a.session, "window": window, "warn": G.WARN, "retire": G.RETIRE,
+        "me": me, "subagents": subs,
+        "summary": {"subagents": len(subs), "warn": n_warn, "retire": n_retire,
+                    "overrides": sum(s["overrides"] for s in subs)},
+    }
+
+    if a.json:
+        print(json.dumps(report, indent=1))
+        return
+    pct = f"{100*me['ctx']/window:.0f}%" if me["ctx"] else "?"
+    if a.brief:
+        extra = f", {n_retire} RETIRE" if n_retire else ""
+        extra += f", {n_warn} warn" if n_warn else ""
+        print(f"context {k(me['ctx'])}/{k(window)} ({pct}) · {len(subs)} subagents{extra}")
+        return
+
+    print(f"token-usage · session {a.session[:8]} · window {k(window)} · warn {k(G.WARN)} · retire {k(G.RETIRE)}")
+    who = "main session" if me["id"] == "main" else f"subagent {me['id'][:8]} ({me['name']})"
+    line = f"this agent: {who} · context {k(me['ctx'])} ({pct} of window) · {me['turns']} turns · {me['tool_uses']} tool uses"
+    if me.get("budget_left"):
+        line += f" · budget left {me['budget_left']/1e6:.2f}M"
+    if me["level"] in ("WARN", "RETIRE"):
+        line += f"  <- {me['level']}"
+    print(line)
+    if not subs:
+        print("subagents: none")
+        return
+    print(f"subagents ({len(subs)}; {n_retire} RETIRE, {n_warn} warn):")
+    print(f"  {'id':<9}{'ctx':>6} {'level':<7}{'turns':>5} {'tools':>5} {'last':>5}  name")
+    for s in subs:
+        flag = "*" if s.get("caller") else " "
+        ov = f" [overrides:{s['overrides']}]" if s["overrides"] else ""
+        print(f" {flag}{s['id'][:8]:<9}{k(s['ctx']):>6} {s['level'] or '?':<7}{s['turns']:>5} "
+              f"{s['tool_uses']:>5} {age(s['last_activity']):>5}  {s['name'][:60]}{ov}")
+    if n_retire:
+        print(f"  {n_retire} agent(s) at/over {k(G.RETIRE)}: new work to them is gated; "
+              f"retire with a handover + fresh successor, or tag [long-context-ok: why].")
+    ledger = G.STATE_DIR / "guard.log"
+    if ledger.is_file():
+        rows = [l.rstrip() for l in ledger.read_text().splitlines()
+                if a.session[:8] in l and ("OVERRIDE" in l or "DENY" in l)]
+        if rows:
+            print("ledger (this session):")
+            for r in rows[-8:]:
+                print("  " + r)
+
+
+if __name__ == "__main__":
+    main()

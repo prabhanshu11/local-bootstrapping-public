@@ -1,0 +1,12 @@
+[Unit]
+Description=Every 60 s: probe the C6 (LAN) and 1.1.1.1 (uplink), escalate only on the LAN path
+
+[Timer]
+# 120 s after boot: DHCP + Tailscale have had a fair chance (power-on -> ssh ~65 s).
+OnBootSec=120
+OnUnitActiveSec=60
+AccuracySec=5s
+Unit=net-selfheal.service
+
+[Install]
+WantedBy=timers.target

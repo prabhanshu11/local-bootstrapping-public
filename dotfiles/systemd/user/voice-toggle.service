@@ -1,0 +1,25 @@
+# CRITICAL: Do NOT use "Wants=graphical-session.target" with "WantedBy=default.target"
+# This combination can prematurely activate graphical-session.target BEFORE the compositor
+# starts, causing UWSM to refuse to launch Hyprland with:
+#   "A compositor or graphical-session* target is already active!"
+# Result: Black screen, no GUI, system appears bricked.
+#
+# Correct pattern for graphical services:
+#   - After=graphical-session.target (wait for compositor)
+#   - WantedBy=graphical-session.target (start WITH compositor, not before)
+#
+# See: https://wiki.archlinux.org/title/Systemd/User#Graphical_session_targets
+
+[Unit]
+Description=Voice Toggle (Go) - Voice typing controller
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/voice-toggle
+Restart=on-failure
+RestartSec=2
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+[Install]
+WantedBy=graphical-session.target

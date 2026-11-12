@@ -1,0 +1,141 @@
+#!/usr/bin/python3
+"""
+input-activity-wait — wait up to N seconds for him to touch the laptop.
+
+Why (2026-10-06, his words): "give me some grace period if I am back at the
+keyboard or do something then the sleep should be interrupted." sleep-verified's
+post-mortem (sleep-watch's retry of a sleep that failed) and, with
+ACTIVITY_CANCELS=watcher+upper, battery-guard's upper-limit grace call this and
+cancel when it reports activity. docs/issues/laptop-suspend-fails-freeze-2026-10-03.md
+
+Listens on every readable /dev/input/event* (he is in the `input` group; it
+only reads, never grabs, so nothing else loses an event) and rescans every 2 s
+for devices that appear later (a Bluetooth mouse waking up).
+
+Activity = any EV_KEY, EV_REL or EV_ABS event (keyboard, power key, mouse,
+trackpoint, touchpad, touchscreen, the bar-touch / touch-scroll helpers that
+turn his touches into events). Not activity: EV_SYN / EV_MSC / EV_LED / EV_SND
+/ EV_REP / EV_FF (bookkeeping, not a person), EV_SW (lid, headphone jack,
+tablet mode: hardware state, not a person), anything in the first --settle
+seconds (the key that woke the screen), and devices whose name matches
+--ignore-name (default: ydotoold, which is agents' automation, not him).
+
+Usage
+  input-activity-wait [--seconds N] [--settle S] [--device PATH]... [--ignore-name REGEX] [--quiet]
+Exit 0 = activity seen (one line on stdout: device, type, code), 1 = timeout,
+2 = no readable input device / python-evdev missing / bad arguments.
+System python3 + python-evdev (pacman), no uv: bash scripts call it directly.
+"""
+
+import os
+import re
+import select
+import sys
+import time
+
+ACTIVITY_TYPES = {1, 2, 3}     # EV_KEY, EV_REL, EV_ABS
+RESCAN = 2.0
+
+
+def is_activity(ev_type, code=0, value=0):
+    """True for an event a person makes (key, mouse, touch); False for SYN/MSC/SW/LED/..."""
+    return ev_type in ACTIVITY_TYPES
+
+
+def parse(argv):
+    a = {"seconds": 60.0, "settle": 1.0, "devices": [], "ignore": r"^ydotoold", "quiet": False}
+    i = 0
+    while i < len(argv):
+        k = argv[i]
+        if k in ("--seconds", "--settle") and i + 1 < len(argv):
+            a[k[2:]] = float(argv[i + 1])
+            i += 1
+        elif k == "--device" and i + 1 < len(argv):
+            a["devices"].append(argv[i + 1])
+            i += 1
+        elif k == "--ignore-name" and i + 1 < len(argv):
+            a["ignore"] = argv[i + 1]
+            i += 1
+        elif k == "--quiet":
+            a["quiet"] = True
+        elif k in ("-h", "--help"):
+            print(__doc__.strip())
+            sys.exit(0)
+        else:
+            raise ValueError(f"unknown argument {k}")
+        i += 1
+    return a
+
+
+def main(argv):
+    try:
+        a = parse(argv)
+    except ValueError as e:
+        print(f"input-activity-wait: {e}", file=sys.stderr)
+        return 2
+    try:
+        import evdev
+    except ImportError:
+        print("input-activity-wait: python-evdev missing (pacman -S python-evdev)", file=sys.stderr)
+        return 2
+    ignore = re.compile(a["ignore"]) if a["ignore"] else None
+    fixed = bool(a["devices"])
+    open_devs, skipped = {}, set()
+
+    def scan():
+        paths = a["devices"] if fixed else evdev.list_devices()
+        for p in paths:
+            if p in skipped or any(d.path == p for d in open_devs.values()):
+                continue
+            try:
+                d = evdev.InputDevice(p)
+            except OSError:
+                continue                 # not readable (yet: udev sets the group a moment later) or gone
+            if ignore and ignore.search(d.name or ""):
+                skipped.add(p)
+                d.close()
+                continue
+            open_devs[d.fd] = d
+
+    t0 = time.monotonic()
+    end, settle_until = t0 + a["seconds"], t0 + a["settle"]
+    scan()
+    if not open_devs and not fixed:
+        print("input-activity-wait: no readable /dev/input/event* (not in the input group?)", file=sys.stderr)
+        return 2
+    next_scan = t0 + RESCAN
+    while True:
+        now = time.monotonic()
+        if now >= end:
+            return 1
+        if now >= next_scan:
+            scan()                       # hotplugged devices (or a --device that appeared late)
+            next_scan = now + RESCAN
+        try:
+            r, _, _ = select.select(list(open_devs), [], [], max(0.0, min(end, next_scan) - now))
+        except (OSError, ValueError):
+            r = []
+        for fd in r:
+            d = open_devs.get(fd)
+            if d is None:
+                continue
+            try:
+                events = list(d.read())
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:              # device unplugged
+                open_devs.pop(fd, None)
+                skipped.discard(d.path)
+                continue
+            if time.monotonic() < settle_until:
+                continue                 # the key that woke the screen
+            for ev in events:
+                if is_activity(ev.type, ev.code, ev.value):
+                    if not a["quiet"]:
+                        print(f"activity: {d.name} ({d.path}) type={evdev.ecodes.EV.get(ev.type, ev.type)} "
+                              f"code={ev.code} after {time.monotonic() - t0:.1f}s", flush=True)
+                    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

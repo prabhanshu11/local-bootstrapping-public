@@ -1,0 +1,114 @@
+#!/bin/bash
+# screenshot-save — the screenshot keys (Print, Shift+Print, Super+H,
+# Super+Shift+H, Super+Shift+S; dotfiles/hypr/bindings-screenshot.conf).
+#
+# His words 2026-11-06: "when the screenshot button is pressed, and no area
+# gets selected, the popup doesn't come up, instead the screenshot simply gets
+# saved into the pictures folder. And move all the folders under
+# pictures/screenshots/ and from now on the screenshots get saved there."
+#
+# Same selection as Omarchy's omarchy-cmd-screenshot (smart: click a window or
+# drag a region, frozen screen), plus:
+#   * nothing selected (Esc, or a click outside any window) -> the focused
+#     monitor is saved straight to ~/Pictures/screenshots/, copied to the
+#     clipboard and announced; no satty editor.
+#   * pressing a screenshot key again while selecting ABORTS (nothing saved).
+#   * while it runs (and 1 s after) the workspace-labels popup ignores input,
+#     so the popup can be captured: flag $XDG_RUNTIME_DIR/screenshot-busy.
+#
+# Usage: screenshot-save [smart|region|windows|fullscreen] [edit|clipboard]
+set -u
+OUTPUT_DIR="${OMARCHY_SCREENSHOT_DIR:-$HOME/Pictures/screenshots}"
+mkdir -p "$OUTPUT_DIR"
+RUN="${XDG_RUNTIME_DIR:-/tmp}"
+BUSY="$RUN/screenshot-busy"
+ABORT="$RUN/screenshot-abort"
+STATE="$HOME/.local/state/screenshot-save"
+LOG="$STATE/screenshot-save.log"
+mkdir -p "$STATE"
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+# A second press while selecting = abort the first one.
+if pkill -x slurp; then
+    touch "$ABORT"
+    log "abort: second key press while selecting"
+    exit 0
+fi
+
+MODE="${1:-smart}"
+PROCESSING="${2:-edit}"
+rm -f "$ABORT"
+echo $$ > "$BUSY"
+finish() { rm -f "$BUSY"; touch "$RUN/screenshot-done"; }
+trap finish EXIT
+
+monitor_geom() {
+    hyprctl monitors -j | jq -r '.[] | select(.focused == true) | "\(.x),\(.y) \((.width / .scale) | floor)x\((.height / .scale) | floor)"'
+}
+get_rectangles() {
+    local ws
+    ws=$(hyprctl monitors -j | jq -r '.[] | select(.focused == true) | .activeWorkspace.id')
+    hyprctl monitors -j | jq -r --arg ws "$ws" '.[] | select(.activeWorkspace.id == ($ws | tonumber)) | "\(.x),\(.y) \((.width / .scale) | floor)x\((.height / .scale) | floor)"'
+    hyprctl clients -j | jq -r --arg ws "$ws" '.[] | select(.workspace.id == ($ws | tonumber)) | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"'
+}
+select_area() {   # $1 = rectangles to snap to (may be empty)
+    wayfreeze & local pid=$!
+    sleep .1
+    if [[ -n "$1" ]]; then SELECTION=$(echo "$1" | slurp 2>/dev/null); else SELECTION=$(slurp 2>/dev/null); fi
+    kill $pid 2>/dev/null
+}
+
+SELECTION=""
+case "$MODE" in
+    region)     select_area "" ;;
+    windows)    RECTS=$(get_rectangles); wayfreeze & PID=$!; sleep .1
+                SELECTION=$(echo "$RECTS" | slurp -r 2>/dev/null); kill $PID 2>/dev/null ;;
+    fullscreen) SELECTION=$(monitor_geom) ;;
+    smart|*)
+        RECTS=$(get_rectangles)
+        select_area "$RECTS"
+        # a tiny drag (< 20 px area) = a click: snap to the window under it (Omarchy's rule)
+        if [[ "$SELECTION" =~ ^([0-9]+),([0-9]+)[[:space:]]([0-9]+)x([0-9]+)$ ]] && (( BASH_REMATCH[3] * BASH_REMATCH[4] < 20 )); then
+            cx=${BASH_REMATCH[1]}; cy=${BASH_REMATCH[2]}
+            while IFS= read -r rect; do
+                if [[ "$rect" =~ ^([0-9]+),([0-9]+)[[:space:]]([0-9]+)x([0-9]+) ]] &&
+                   (( cx >= BASH_REMATCH[1] && cx < BASH_REMATCH[1] + BASH_REMATCH[3] &&
+                      cy >= BASH_REMATCH[2] && cy < BASH_REMATCH[2] + BASH_REMATCH[4] )); then
+                    SELECTION="$rect"; break
+                fi
+            done <<< "$RECTS"
+        fi ;;
+esac
+
+if [[ -f "$ABORT" ]]; then
+    rm -f "$ABORT"
+    exit 0
+fi
+
+FILE="$OUTPUT_DIR/screenshot-$(date +'%Y-%m-%d_%H-%M-%S').png"
+if [[ -z "$SELECTION" ]]; then
+    # nothing selected: whole focused monitor, saved, no editor
+    if grim -g "$(monitor_geom)" "$FILE"; then
+        wl-copy < "$FILE"
+        hint=""
+        if [[ ! -f "$STATE/told-abort" ]]; then
+            hint=" (to cancel instead, press the screenshot key again while selecting)"
+            touch "$STATE/told-abort"
+        fi
+        notify-send -a screenshot "Screenshot saved" "$FILE — copied to the clipboard$hint" -t 4000
+        log "no selection -> full monitor saved: $FILE"
+    else
+        notify-send -a screenshot "Screenshot failed" "grim could not capture the screen" -u critical
+        log "no selection -> grim FAILED"
+    fi
+    exit 0
+fi
+
+if [[ "$PROCESSING" == "edit" ]]; then
+    grim -g "$SELECTION" - | satty --filename - --output-filename "$FILE" \
+        --early-exit --actions-on-enter save-to-clipboard --save-after-copy --copy-command 'wl-copy'
+    log "selection $SELECTION -> satty ($FILE)"
+else
+    grim -g "$SELECTION" - | wl-copy
+    log "selection $SELECTION -> clipboard"
+fi

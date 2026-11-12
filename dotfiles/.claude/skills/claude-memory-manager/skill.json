@@ -1,0 +1,29 @@
+{
+  "name": "claude-memory-manager",
+  "version": "1.0.0",
+  "description": "Memory management and self-awareness for Claude Code sessions",
+  "author": "main1",
+  "entry": "memory.sh",
+  "actions": [
+    {
+      "name": "check",
+      "description": "Check current memory usage",
+      "script": "check-memory.sh"
+    },
+    {
+      "name": "kill-children",
+      "description": "Kill child processes to free memory",
+      "script": "kill-children.sh"
+    },
+    {
+      "name": "low-memory",
+      "description": "Enable/disable low-memory mode",
+      "script": "low-memory-mode.sh"
+    },
+    {
+      "name": "restart",
+      "description": "Restart session with state preservation",
+      "script": "restart-session.sh"
+    }
+  ]
+}

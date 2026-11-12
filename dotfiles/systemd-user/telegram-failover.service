@@ -1,0 +1,6 @@
+[Unit]
+Description=Telegram Bot Failover Check
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/telegram-bot-failover

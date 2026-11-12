@@ -1,0 +1,12 @@
+# Python test dependencies for local-bootstrapping
+
+# Core testing
+pytest>=8.0.0
+pytest-testinfra>=10.0.0
+
+# Visual testing (uses urllib from stdlib + pillow for image handling)
+pillow>=10.0.0
+
+# Optional: coverage and parallel execution
+pytest-cov>=4.0.0
+pytest-xdist>=3.0.0

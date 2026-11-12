@@ -1,0 +1,13 @@
+[Unit]
+Description=Rotate wallpaper every 30 minutes
+
+[Timer]
+# OnActiveSec, not OnBootSec: in a USER manager OnBootSec counts from system boot; a
+# session that starts later never gets the first run and the timer sits "elapsed"
+# forever (stuck 2026-10-06 -> 2026-11-09; see local-bootstrapping-sync.timer).
+OnActiveSec=1min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

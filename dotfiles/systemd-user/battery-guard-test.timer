@@ -1,0 +1,10 @@
+[Unit]
+Description=Fire the battery-guard live test every 30 min until the plan is done
+
+[Timer]
+# OnCalendar, not monotonic — see power-profile-watchdog.timer.
+OnCalendar=*-*-* *:10,40:00
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

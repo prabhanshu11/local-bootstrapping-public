@@ -1,0 +1,759 @@
+#!/usr/bin/env python3
+"""power-profile-daemon: the power-profile bar button, resident in RAM.
+
+His words (2026-11-01): "power mode button needs to be upgraded. Its process
+should live in the RAM, so that the button is responsive, that process can
+concur with the params in the disk at times efficiently."
+
+Why: btrfs commits on this laptop block every write/create/atime update for
+25-35 s (docs/issues/btrfs-commit-stall/). The old tap path (bash
+power-profile-monitor toggle) appended a log row and read a log file before it
+redrew the icon, so a tap during a commit showed nothing for half a minute.
+Design + risks: docs/issues/power-button-ram-resident-risk-analysis.md.
+
+The daemon keeps the state in RAM (profile, pending tap, AC, battery, lap mode,
+clamp/override flags), listens to power-profiles-daemon on D-Bus, and the moment
+a tap arrives signals waybar (SIGRTMIN+10), whose exec `power-profile-daemon
+state` reads the new JSON from RAM; `watch` subscribers get the line pushed. Nothing
+on the tap path writes to btrfs: the override flag is /tmp (tmpfs), the log row
+goes to a spool in /run/user (tmpfs) that the per-minute watchdog drains into
+~/logs. Disk is only read at start (nothing to read today).
+
+Usage:
+  power-profile-daemon daemon            run the daemon (systemd user unit)
+  power-profile-daemon state             waybar exec (interval 30 + signal 10: the
+                                         daemon signals waybar on every change) and
+                                         the bar-touch long-press card; one-shot JSON
+  power-profile-daemon watch             one JSON line per change (tests, probes;
+                                         falls back to `power-profile-monitor status`
+                                         every 30 s while the daemon is down)
+  power-profile-daemon toggle            cycle PRF -> BAL -> SAV (bar tap)
+  power-profile-daemon set <profile>     pick a profile (battery panel buttons)
+  power-profile-daemon ping              re-emit the current line with a seq (tests)
+  power-profile-daemon dryrun <secs>     taps show + pend but never reach ppd (tests)
+  power-profile-daemon debug             state + the in-RAM event ring
+
+`toggle`/`set` fall back to `power-profile-monitor` ONLY when the socket cannot
+be connected; a slow reply never causes a second toggle (the old bar-touch
+fallback did, after 0.4 s). `--no-fallback` exits 3 instead of falling back.
+
+Test mode: PPD_FAKE=1 replaces power-profiles-daemon with an in-RAM fake
+(PPD_FAKE_DELAY_MS = how long its Set takes), PPD_SOCK moves the socket, and
+PPD_FLAG_DIR moves the /tmp flag files. tests/power-profile/ uses all three.
+"""
+
+import json
+import os
+import socket
+import sys
+import time
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+SOCK = os.environ.get("PPD_SOCK") or os.path.join(RUNTIME, "power-profile.sock")
+MONITOR = os.environ.get("PPD_MONITOR") or os.path.expanduser("~/.local/bin/power-profile-monitor")
+PROFILES = ("performance", "balanced", "power-saver")
+NEXT = {"performance": "balanced", "balanced": "power-saver"}   # anything else -> performance
+
+
+# ─────────────────────────────── client side ────────────────────────────────
+# Kept import-light (no gi): it runs on every tap.
+
+def connect(timeout=0.5):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(SOCK)
+    except OSError:
+        s.close()
+        return None
+    return s
+
+
+def request(line, reply_timeout=5.0):
+    """None = could not connect (daemon down). "" = sent, no reply in time
+    (the daemon HAS the request: never act on it a second time)."""
+    s = connect()
+    if s is None:
+        return None
+    try:
+        s.settimeout(reply_timeout)
+        s.sendall((line + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return buf.decode(errors="replace").strip()
+    except OSError:
+        return ""
+    finally:
+        s.close()
+
+
+def fallback(args):
+    env = dict(os.environ, PPM_DIRECT="1")   # the monitor must not delegate back here
+    os.execvpe(MONITOR, [MONITOR, *args], env)
+
+
+def client_action(args, no_fallback):
+    reply = request(" ".join(args))
+    if reply is None:
+        if no_fallback:
+            sys.exit(3)
+        fallback(args)
+    if reply:
+        try:
+            if "error" in json.loads(reply):
+                print(reply, file=sys.stderr)
+                sys.exit(1)
+        except ValueError:
+            pass
+
+
+def client_state():
+    reply = request("state")
+    if reply:
+        print(reply)
+        return
+    os.execv(MONITOR, [MONITOR, "status"])
+
+
+def client_watch():
+    """waybar's exec. Streams the daemon's lines; while the daemon is down it
+    behaves like the old module (status every 30 s) and retries every 2 s."""
+    last_status = 0.0
+
+    def out(line):
+        try:
+            sys.stdout.write(line.rstrip("\n") + "\n")
+            sys.stdout.flush()
+        except BrokenPipeError:
+            sys.exit(0)                   # waybar went away
+
+    while True:
+        s = connect()
+        if s is not None:
+            try:
+                s.settimeout(None)
+                s.sendall(b"watch\n")
+                f = s.makefile("r", encoding="utf-8", errors="replace")
+                for line in f:
+                    if line.strip():
+                        out(line)
+            except OSError:
+                pass
+            finally:
+                s.close()
+            last_status = 0.0             # daemon gone: show the script's view at once
+        now = time.monotonic()
+        if now - last_status >= 30:
+            import subprocess
+            try:
+                r = subprocess.run([MONITOR, "status"], capture_output=True, text=True, timeout=20)
+                if r.stdout.strip():
+                    out(r.stdout.strip().splitlines()[-1])
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            last_status = time.monotonic()
+        time.sleep(2)
+
+
+# ─────────────────────────────── daemon side ────────────────────────────────
+
+def daemon_main():
+    import collections
+    import datetime
+    import subprocess
+    import threading
+
+    from gi.repository import Gio, GLib
+
+    FAKE = os.environ.get("PPD_FAKE") == "1"
+    FLAG_DIR = os.environ.get("PPD_FLAG_DIR") or "/tmp"
+    OVERRIDE = os.path.join(FLAG_DIR, "power-profile-override")
+    CLAMPED = os.path.join(FLAG_DIR, "power-profile-clamped")
+    HEALING = os.path.join(FLAG_DIR, "power-profile-healing")
+    SPOOL = os.environ.get("PPD_SPOOL") or os.path.join(RUNTIME, "power-profile-spool.csv")
+    SYS = os.environ.get("PPD_SYS", "")
+    AC_FILE = SYS + "/sys/class/power_supply/AC/online"
+    BAT_DIR = SYS + "/sys/class/power_supply/BAT0"
+    LAPMODE = SYS + "/sys/bus/platform/devices/thinkpad_acpi/dytc_lapmode"
+    BUS_NAME, OBJ, IFACE = "net.hadess.PowerProfiles", "/net/hadess/PowerProfiles", "net.hadess.PowerProfiles"
+    SET_TIMEOUT_MS = 60000        # a 35 s btrfs commit inside ppd must not look like a failure
+    PENDING_MARK_S = 0.5          # after this a still-pending tap shows "…" (a pattern, not a hue)
+    PENDING_EXPIRY_S = 90
+    HEAL_HOLD_MAX_S = 15
+
+    ring = collections.deque(maxlen=400)
+
+    def note(msg):
+        ring.append(f"{time.strftime('%H:%M:%S')}.{int(time.time() * 1000) % 1000:03d} {msg}")
+
+    def say(msg):                 # journald: start-up and errors only
+        note(msg)
+        print(msg, flush=True)
+
+    def read(path, default=None):
+        try:
+            with open(path) as f:
+                return f.read().strip()
+        except OSError:
+            return default
+
+    def iso_now():
+        return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+    import signal as _signal
+    NO_SIGNAL = os.environ.get("PPD_NO_SIGNAL") == "1"
+    WAYBAR_SIG = _signal.SIGRTMIN + 10        # the module's "signal": 10
+
+    def waybar_mains():
+        """Running waybar instances, NOT their forked children: a fork that has not
+        exec'd yet is also named waybar, and signals sent to it have made it abort
+        (36 zombie + SIGABRT cores seen 2026-10-30..11-01). procfs only: no disk."""
+        procs = {}
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            try:
+                with open(f"/proc/{d}/stat") as f:
+                    st = f.read()
+            except OSError:
+                continue
+            if st[st.find("(") + 1:st.rfind(")")] != "waybar":
+                continue
+            fields = st[st.rfind(")") + 2:].split()
+            if fields[0] != "Z":
+                procs[int(d)] = int(fields[1])
+        return [pid for pid, ppid in procs.items() if ppid not in procs]
+
+    def signal_waybar():
+        """Tell waybar to re-run the module's exec (`power-profile-daemon state`).
+        Waybar 0.15 lost the continuous `watch` exec after a SIGUSR2 reload twice
+        on 2026-11-01 (a forked child aborted, the module never restarted it), so
+        the bar is signal-driven: one short exec per change, plus every 30 s."""
+        if NO_SIGNAL:
+            return
+        for pid in waybar_mains():
+            try:
+                os.kill(pid, WAYBAR_SIG)
+            except OSError:
+                pass
+
+    class FakePPD:
+        """In-RAM stand-in for power-profiles-daemon (tests only)."""
+        def __init__(self, d):
+            self.d, self.profile = d, os.environ.get("PPD_FAKE_START", "balanced")
+            self.delay = int(os.environ.get("PPD_FAKE_DELAY_MS", "0"))
+            self.sets = 0
+
+        def get(self, cb):
+            GLib.idle_add(lambda: (cb(self.profile, None), False)[1])
+
+        def set(self, p, cb):
+            def done():
+                self.sets += 1
+                changed = p != self.profile
+                self.profile = p
+                if changed:
+                    self.d.on_active(p, "fake-signal")
+                cb(None)
+                return False
+            GLib.timeout_add(self.delay, done)
+
+    class RealPPD:
+        def __init__(self, d):
+            self.d = d
+            self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+            self.bus.signal_subscribe(None, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                                      OBJ, None, Gio.DBusSignalFlags.NONE, self.on_signal)
+            Gio.bus_watch_name_on_connection(self.bus, BUS_NAME, Gio.BusNameWatcherFlags.NONE,
+                                             self.on_appeared, self.on_vanished)
+
+        def on_signal(self, _conn, _sender, _path, _iface, _sig, params):
+            iface, changed, _inv = params.unpack()
+            if iface == IFACE and "ActiveProfile" in changed:
+                self.d.on_active(changed["ActiveProfile"], "signal")
+
+        def on_appeared(self, *_):
+            note("ppd appeared")
+            self.d.reconcile("ppd-appeared")
+
+        def on_vanished(self, *_):
+            note("ppd vanished")
+
+        def get(self, cb):
+            def done(conn, res):
+                try:
+                    cb(conn.call_finish(res).unpack()[0], None)
+                except GLib.Error as e:
+                    cb(None, e.message)
+            self.bus.call(BUS_NAME, OBJ, "org.freedesktop.DBus.Properties", "Get",
+                          GLib.Variant("(ss)", (IFACE, "ActiveProfile")), GLib.VariantType("(v)"),
+                          Gio.DBusCallFlags.NONE, SET_TIMEOUT_MS, None, done)
+
+        def set(self, p, cb):
+            def done(conn, res):
+                try:
+                    conn.call_finish(res)
+                    cb(None)
+                except GLib.Error as e:
+                    cb(e.message)
+            self.bus.call(BUS_NAME, OBJ, "org.freedesktop.DBus.Properties", "Set",
+                          GLib.Variant("(ssv)", (IFACE, "ActiveProfile", GLib.Variant("s", p))),
+                          None, Gio.DBusCallFlags.NONE, SET_TIMEOUT_MS, None, done)
+
+    class Daemon:
+        def __init__(self):
+            self.active = None          # what ppd last told us
+            self.desired = None         # a tap's target, until ppd confirms it
+            self.desired_t = 0.0
+            self.desired_src = ""
+            self.inflight = None        # the profile a Set call is carrying now
+            self.set_failed = False
+            self.held = None            # profile shown while the watchdog's heal bounces ppd
+            self.queued = False         # a tap waits for the heal to finish
+            self.dry_until = 0.0
+            self.dry_timer = None
+            self.sys = {}
+            self.subs = {}              # fd -> socket
+            self.last_line = None
+            self.seq = 0
+            self.read_sysfs()
+            self.ppd = FakePPD(self) if FAKE else RealPPD(self)
+            self.reconcile("start")
+            GLib.timeout_add_seconds(2, self.poll)
+            GLib.timeout_add_seconds(30, self.periodic_reconcile)
+            GLib.timeout_add(250, self.tick_pending)
+
+        # ── inputs (all RAM: sysfs, tmpfs, D-Bus) ──
+        def read_sysfs(self):
+            has_bat = os.path.isdir(BAT_DIR)
+            self.sys = {
+                "has_bat": has_bat,
+                "ac": read(AC_FILE, "1" if not has_bat else "0"),
+                "bat": read(BAT_DIR + "/capacity", "100"),
+                "lap": read(LAPMODE, "0"),
+                "clamped": os.path.exists(CLAMPED),
+                "override": os.path.exists(OVERRIDE),
+            }
+
+        def healing(self):
+            try:
+                return time.time() - os.stat(HEALING).st_mtime < HEAL_HOLD_MAX_S
+            except OSError:
+                return False
+
+        def poll(self):
+            self.read_sysfs()
+            if (self.held is not None or self.queued) and not self.healing():
+                note(f"heal hold released (active={self.active})")
+                self.held, self.queued = None, False
+                self.pump()
+            self.emit()
+            return True
+
+        def periodic_reconcile(self):
+            self.reconcile("30s")
+            return True
+
+        def tick_pending(self):
+            if self.desired is not None:
+                age = time.monotonic() - self.desired_t
+                if age > PENDING_EXPIRY_S and self.inflight is None:
+                    note(f"pending {self.desired} expired after {age:.0f}s; showing ppd's {self.active}")
+                    self.desired = None
+                self.emit()
+            return True
+
+        def reconcile(self, why):
+            def done(value, err):
+                if err:
+                    note(f"Get failed ({why}): {err}")
+                    return
+                if value != self.active:
+                    note(f"reconcile ({why}): ppd says {value}, RAM had {self.active}")
+                self.on_active(value, f"get:{why}")
+            self.ppd.get(done)
+
+        def on_active(self, value, src):
+            prev = self.active
+            if self.healing() and self.held is None and prev is not None and src == "signal":
+                self.held = prev
+                note(f"heal bounce seen: holding display on {prev}")
+            self.active = value
+            if prev != value:
+                note(f"active {prev} -> {value} ({src})")
+            if self.desired is not None and not self.dry():
+                if value == self.desired:
+                    note(f"confirmed {value} {1000 * (time.monotonic() - self.desired_t):.0f} ms after the tap")
+                    self.desired = None
+                elif self.set_failed and self.inflight is None:
+                    note(f"Set failed: dropping pending {self.desired}, showing {value}")
+                    self.desired = None
+            self.emit()
+
+        # ── taps ──
+        def dry(self):
+            return time.monotonic() < self.dry_until
+
+        def shown_profile(self):
+            if self.desired is not None:
+                return self.desired
+            if self.held is not None:
+                return self.held
+            return self.active
+
+        def request(self, target, src):
+            now = time.monotonic()
+            old = self.shown_profile()
+            self.desired, self.desired_t, self.desired_src = target, now, src
+            self.set_failed = False
+            note(f"{src}: {old} -> {target}{' (dry run)' if self.dry() else ''}")
+            if self.dry():
+                self.emit()
+                if self.dry_timer:
+                    GLib.source_remove(self.dry_timer)
+                self.dry_timer = GLib.timeout_add(1500, self.dry_revert)
+                return
+            try:                                  # tmpfs: never blocks on btrfs
+                with open(OVERRIDE, "w") as f:
+                    f.write(target + "\n")
+                if os.path.exists(CLAMPED):
+                    os.unlink(CLAMPED)            # his own toggle is the fix: stop flagging
+            except OSError as e:
+                note(f"flag write failed: {e}")
+            self.read_sysfs()
+            self.emit()
+            self.pump()
+
+        def dry_revert(self):
+            self.dry_timer = None
+            self.desired = None
+            self.emit()
+            return False
+
+        def pump(self):
+            """One Set in flight at a time; the latest tap wins."""
+            if self.inflight is not None or self.desired is None or self.dry():
+                return
+            if self.held is not None or self.healing():
+                note("heal in progress: tap queued")
+                self.queued = True
+                return
+            target, t0, old = self.desired, time.monotonic(), self.active
+            self.inflight = target
+
+            def done(err):
+                ms = 1000 * (time.monotonic() - t0)
+                self.inflight = None
+                if err:
+                    self.set_failed = True
+                    say(f"Set {target} failed after {ms:.0f} ms: {err}")
+                else:
+                    note(f"Set {target} returned in {ms:.0f} ms")
+                    self.spool(old, target)
+                if self.desired is not None and self.desired != target:
+                    self.pump()                   # he tapped again meanwhile
+                    return
+                self.reconcile("after-set")
+            self.ppd.set(target, done)
+
+        # ── output ──
+        def render(self):
+            prof = self.shown_profile()
+            text, cls = {"performance": ("PRF", "performance"), "balanced": ("BAL", "balanced"),
+                         "power-saver": ("SAV", "power-saver")}.get(prof, ("???", "unknown"))
+            s = self.sys
+            notes = ""
+            if s["override"]:
+                notes += "\nManual override active"
+            if s["clamped"]:
+                cls = "clamped"
+                notes += "\n⚠ CPU CLAMPED — auto-heal did not release it"
+            if s["lap"] == "1":
+                cls = "clamped"
+                notes += ("\n🛋 LAP MODE — firmware capping CPU (soft/moving surface detected); "
+                          "toggles won't help, lift onto a hard surface")
+            classes = [cls]
+            if self.desired is not None:
+                classes.append("pending")
+                if time.monotonic() - self.desired_t >= PENDING_MARK_S:
+                    text += "…"
+                notes += f"\nSwitching to {self.desired}…"
+            if s["has_bat"]:
+                ac = "Plugged In" if s["ac"] == "1" else "On Battery"
+                power = f"AC: {ac}\nBattery: {s['bat']}%"
+            else:
+                power = "AC: Mains (no battery)"
+            name = (prof or "unknown")
+            tooltip = f"Power: {name[:1].upper() + name[1:]}\n{power}{notes}\n\nLeft-click: Cycle profiles"
+            return {"text": text, "class": classes[0] if len(classes) == 1 else classes, "tooltip": tooltip}
+
+        def emit(self, force=False, extra=None):
+            data = self.render()
+            if extra:
+                data.update(extra)
+            line = json.dumps(data, ensure_ascii=False)
+            if line == self.last_line and not force:
+                return
+            self.last_line = line
+            payload = (line + "\n").encode()
+            for fd, conn in list(self.subs.items()):
+                try:
+                    conn.send(payload)
+                except OSError:
+                    self.drop(fd)
+            signal_waybar()
+
+        def drop(self, fd):
+            conn = self.subs.pop(fd, None)
+            if conn is not None:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+        def state_line(self):
+            return json.dumps(self.render(), ensure_ascii=False)
+
+        # ── log row: tmpfs spool, drained into ~/logs by the watchdog ──
+        def spool(self, old, new):
+            ts = iso_now()
+
+            def work():
+                cppc = SYS + "/sys/devices/system/cpu/cpu0/acpi_cppc"
+                cpuf = SYS + "/sys/devices/system/cpu/cpu0/cpufreq"
+
+                def watts(path):
+                    v = read(path, "")
+                    return str(int(v) // 1000000) if v.isdigit() else "NA"
+
+                psys = "NA"
+                try:
+                    for d in sorted(os.listdir(SYS + "/sys/class/powercap")):
+                        if read(f"{SYS}/sys/class/powercap/{d}/name") == "psys":
+                            psys = watts(f"{SYS}/sys/class/powercap/{d}/constraint_0_power_limit_uw")
+                            break
+                except OSError:
+                    pass
+                cur = 0
+                try:
+                    for c in os.listdir(SYS + "/sys/devices/system/cpu"):
+                        v = read(f"{SYS}/sys/devices/system/cpu/{c}/cpufreq/scaling_cur_freq", "")
+                        if v.isdigit():
+                            cur = max(cur, int(v))
+                except OSError:
+                    pass
+                pd_on, pd_cur = "0", "0"
+                try:
+                    for p in os.listdir(SYS + "/sys/class/power_supply"):
+                        if p.startswith("ucsi") and read(f"{SYS}/sys/class/power_supply/{p}/online") == "1":
+                            pd_on = "1"
+                            v = read(f"{SYS}/sys/class/power_supply/{p}/current_max", "")
+                            pd_cur = str(int(v) // 1000) if v.isdigit() else "NA"
+                            break
+                except OSError:
+                    pass
+                temp = 0
+                try:
+                    for z in os.listdir(SYS + "/sys/class/thermal"):
+                        v = read(f"{SYS}/sys/class/thermal/{z}/temp", "")
+                        if v.isdigit():
+                            temp = max(temp, int(v))
+                except OSError:
+                    pass
+                video, src = "none", "none"
+                try:
+                    out = subprocess.run(["pactl", "list", "sink-inputs"], capture_output=True,
+                                         text=True, timeout=3).stdout
+                    corked = ""
+                    for ln in out.splitlines():
+                        if "Corked: no" in ln:
+                            corked = "no"
+                        elif "Corked: yes" in ln:
+                            corked = "yes"
+                        elif "media.name" in ln:
+                            this = ("youtube" if "youtube" in ln.lower() else
+                                    "hotstar" if any(k in ln for k in ("Hotstar", "hotstar", "JioCinema")) else "other")
+                            if corked == "no":
+                                video, src = "playing", this
+                            elif video != "playing":
+                                video = "paused"
+                                src = this if src == "none" else src
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                load = (read("/proc/loadavg", "NA") or "NA").split()[0]
+                row = [ts, f"TOGGLE:{old}>{new}", new, read(SYS + "/sys/firmware/acpi/platform_profile", "NA"),
+                       read(cppc + "/highest_perf", "NA"), read(cppc + "/guaranteed_perf", "NA"),
+                       read(cpuf + "/scaling_max_freq", "NA"), str(cur), "NA", load,
+                       watts(SYS + "/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw"), psys,
+                       pd_on, pd_cur, read(LAPMODE, "NA"), self.sys.get("ac", "NA"),
+                       read(SYS + "/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count", "NA"),
+                       str(temp // 1000), video, src]
+                try:
+                    with open(SPOOL, "a") as f:
+                        f.write(",".join(row) + "\n")
+                except OSError as e:
+                    note(f"spool write failed: {e}")
+            threading.Thread(target=work, daemon=True).start()
+
+        # ── socket ──
+        def serve(self):
+            try:
+                os.unlink(SOCK)
+            except OSError:
+                pass
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(SOCK)
+            os.chmod(SOCK, 0o600)
+            srv.listen(32)
+            srv.setblocking(False)
+            self.srv = srv
+            GLib.io_add_watch(srv.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN, self.on_accept)
+
+        def on_accept(self, *_):
+            try:
+                conn, _ = self.srv.accept()
+            except OSError:
+                return True
+            conn.setblocking(False)
+            buf = bytearray()
+
+            def on_data(_fd, cond):
+                # Read before honouring HUP: a fire-and-forget client (bar-touch
+                # click-socket) may close right after its line arrives.
+                try:
+                    chunk = conn.recv(4096)
+                except BlockingIOError:
+                    if not cond & (GLib.IO_HUP | GLib.IO_ERR):
+                        return True
+                    chunk = b""
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    if conn.fileno() in self.subs:
+                        self.drop(conn.fileno())
+                    else:
+                        conn.close()
+                    return False
+                if conn.fileno() in self.subs:
+                    return True               # subscribers have nothing more to say
+                buf.extend(chunk)
+                if b"\n" not in buf:
+                    return len(buf) < 4096
+                line = bytes(buf).split(b"\n", 1)[0].decode(errors="replace").strip()
+                return self.handle(conn, line)
+            GLib.io_add_watch(conn.fileno(), GLib.PRIORITY_DEFAULT,
+                              GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, on_data)
+            return True
+
+        def reply(self, conn, obj):
+            try:
+                conn.setblocking(True)
+                conn.settimeout(1)
+                conn.sendall((json.dumps(obj, ensure_ascii=False) + "\n").encode())
+            except OSError:
+                pass
+            conn.close()
+            return False
+
+        def handle(self, conn, line):
+            parts = line.split()
+            cmd = parts[0] if parts else ""
+            if cmd == "watch":
+                self.subs[conn.fileno()] = conn
+                try:
+                    conn.send((self.state_line() + "\n").encode())
+                except OSError:
+                    self.drop(conn.fileno())
+                    return False
+                return True
+            if cmd == "toggle":
+                target = NEXT.get(self.shown_profile(), "performance")
+                self.request(target, "toggle")
+                return self.reply(conn, {"ok": True, "to": target})
+            if cmd == "set":
+                target = parts[1] if len(parts) > 1 else ""
+                if target not in PROFILES:
+                    return self.reply(conn, {"error": f"unknown profile {target!r}"})
+                self.request(target, "set")
+                return self.reply(conn, {"ok": True, "to": target})
+            if cmd == "state":
+                conn.setblocking(True)
+                conn.settimeout(1)
+                try:
+                    conn.sendall((self.state_line() + "\n").encode())
+                except OSError:
+                    pass
+                conn.close()
+                return False
+            if cmd == "ping":
+                self.seq += 1
+                self.emit(force=True, extra={"seq": self.seq})
+                return self.reply(conn, {"seq": self.seq, "subs": len(self.subs)})
+            if cmd == "dryrun":
+                secs = min(float(parts[1]) if len(parts) > 1 else 60, 600)
+                self.dry_until = time.monotonic() + secs
+                note(f"dry run for {secs:.0f}s")
+                return self.reply(conn, {"dry_run_s": secs})
+            if cmd == "reconcile":
+                self.reconcile("asked")
+                return self.reply(conn, {"ok": True})
+            if cmd == "debug":
+                return self.reply(conn, {
+                    "active": self.active, "desired": self.desired, "inflight": self.inflight,
+                    "held": self.held, "dry": self.dry(), "subs": len(self.subs), "sys": self.sys,
+                    "fake_sets": getattr(self.ppd, "sets", None), "line": self.last_line,
+                    "ring": list(ring)})
+            return self.reply(conn, {"error": f"unknown cmd {cmd!r}"})
+
+    d = Daemon()
+    d.serve()
+    say(f"power-profile-daemon up: socket {SOCK}{' (FAKE ppd)' if FAKE else ''}")
+    loop = GLib.MainLoop()
+    import signal
+    try:
+        from gi.repository import GLibUnix
+        add_signal = GLibUnix.signal_add
+    except ImportError:
+        add_signal = GLib.unix_signal_add
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        add_signal(GLib.PRIORITY_DEFAULT, sig, loop.quit)
+    loop.run()
+    try:
+        os.unlink(SOCK)
+    except OSError:
+        pass
+
+
+def main():
+    args = sys.argv[1:]
+    no_fallback = "--no-fallback" in args
+    args = [a for a in args if a != "--no-fallback"]
+    cmd = args[0] if args else "watch"
+    if cmd == "daemon":
+        daemon_main()
+    elif cmd == "watch":
+        client_watch()
+    elif cmd == "state":
+        client_state()
+    elif cmd in ("toggle", "set"):
+        if cmd == "set" and (len(args) < 2 or args[1] not in PROFILES):
+            print("Usage: power-profile-daemon set {performance|balanced|power-saver}", file=sys.stderr)
+            sys.exit(1)
+        client_action(args[:2], no_fallback)
+    elif cmd in ("ping", "dryrun", "debug", "reconcile"):
+        reply = request(" ".join(args))
+        if reply is None:
+            print("power-profile-daemon is not running", file=sys.stderr)
+            sys.exit(3)
+        print(reply)
+    else:
+        print(__doc__.split("Usage:")[1].split("`toggle`")[0], file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

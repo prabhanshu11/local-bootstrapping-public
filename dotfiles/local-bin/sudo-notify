@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Sudo authentication notification with audio beep
+# Usage: sudo-notify "message" [delay_seconds]
+# Examples:
+#   sudo-notify "Installing package" && sudo pacman -S package  # Default 2s delay
+#   sudo-notify "Quick operation" 1 && sudo -v                   # 1s delay
+#   sudo-notify "Immediate" 0 && sudo command                    # No delay
+
+#   sudo-notify --clear                                        # Remove the notification (auth finished)
+
+# One notification slot for the whole family. Critical notifications never
+# expire in mako (omarchy core.ini: default-timeout=0), and mako keeps its
+# single surface on the monitor where the first visible notification was born.
+# 2026-09-17: eight stale "Authentication Required/Failed" popups pinned that
+# surface to eDP-1 while the user worked on HDMI-A-2 — every later notification
+# landed on the wrong screen, unseen. So: one replaceable slot, an expiry, and
+# an explicit --clear when authentication is over.
+SYNC_HINT="string:x-canonical-private-synchronous:sudo-auth"
+id_file="${XDG_RUNTIME_DIR:-/tmp}/sudo-notify.id"
+
+if [[ "$1" == "--clear" ]]; then
+    if [[ -s "$id_file" ]]; then
+        makoctl dismiss -n "$(cat "$id_file")" >/dev/null 2>&1 || true
+        rm -f "$id_file"
+    fi
+    [[ -e "$id_file.hypr" ]] && { hyprctl dismissnotify 1 >/dev/null 2>&1; rm -f "$id_file.hypr"; }
+    exit 0
+fi
+
+message="${1:-sudo authentication required}"
+delay="${2:-2}"  # Default 2 seconds for fingerprint positioning
+
+# Only play audio if not SSH session or if explicitly enabled
+# Beeps play on the machine where sudo runs, not where SSH client is
+if [[ -z "$SSH_TTY" ]] || [[ "$SUDO_NOTIFY_AUDIO" == "1" ]]; then
+    # 1kHz beep for 200ms through audio output (laptop speakers)
+    # Use ffplay to generate and play sine wave
+    (ffplay -nodisp -autoexit -t 0.2 -f lavfi -i "sine=frequency=1000:duration=0.2" >/dev/null 2>&1 &)
+fi
+
+# Visual notification (works on desktop, fails silently on headless)
+# If mako's surface already sits on a monitor other than the focused one (some
+# other app's sticky notification), ours would be drawn there too — also raise a
+# Hyprland-native notification, which always renders on the focused monitor.
+if command -v hyprctl >/dev/null && command -v jq >/dev/null; then
+    focused=$(hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused) | .name' 2>/dev/null)
+    pinned=$(hyprctl layers -j 2>/dev/null | jq -r 'to_entries[] | select([.value.levels[][] | select(.namespace == "notifications")] | length > 0) | .key' 2>/dev/null)
+    if [[ -n "$focused" && -n "$pinned" ]] && ! grep -qxF "$focused" <<<"$pinned"; then
+        [[ -e "$id_file.hypr" ]] && hyprctl dismissnotify 1 >/dev/null 2>&1   # replace, don't stack
+        hyprctl notify 0 40000 "rgb(ff5555)" "fontsize:18 Authentication Required — $message" >/dev/null 2>&1 && : > "$id_file.hypr"
+    fi
+fi
+nid=$(notify-send -p -u critical -t 45000 -h "$SYNC_HINT" "Authentication Required" "$message" 2>/dev/null) || true
+[[ -n "$nid" ]] && echo "$nid" > "$id_file"
+
+# Wait for user to position finger for fingerprint auth
+# This delay helps sync beep → finger position → sudo prompt timing
+sleep "$delay"

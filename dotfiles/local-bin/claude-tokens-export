@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""claude-tokens-export: Claude Code tokens per local day on THIS machine.
+
+His words (2026-10-01): the habits view must "include claude code tokens spent
+also in that view". The desktop's datalake misses most laptop rows, so each
+machine counts its own usage from the raw transcripts and the laptop pushes its
+file to the desktop, where life-dashboard (/api/habits/tokens) merges it.
+
+Reads   ~/.claude/projects/**/*.jsonl  (main sessions AND subagents/*.jsonl)
+Counts  assistant rows' message.usage: input_tokens, output_tokens,
+        cache_read_input_tokens, cache_creation_input_tokens.
+        Claude Code writes the same API response on several rows (one per
+        content block, rewrites), so rows are de-duplicated on
+        message.id + requestId, keeping the max of each field.
+Writes  ~/.local/state/claude-tokens/<hostname>.json  (atomic)
+        {host, device, generated, window_days, days:[{date, input, output,
+         cache_read, cache_creation, total, sessions,
+         models:{model:{input, output, cache_read, cache_creation, total}}}]}
+        for the last 30 local days, oldest first, every day present.
+Push    on the laptop only: the file goes to desktop:~/.local/state/claude-tokens/
+        (ssh alias `desktop`); desktop offline -> one log line, exit 0.
+
+Incremental: a sqlite cache (~/.local/state/claude-tokens/.cache-<host>.sqlite)
+remembers each file's inode + byte offset and only reads appended bytes; a
+shrunk/replaced file is re-read from 0 (its keys are max-merged, never added,
+so re-reading cannot double-count). Files untouched for > window+1 days are
+skipped. `--rebuild` drops the cache.
+
+Env: CLAUDE_TOKENS_PROJECTS, CLAUDE_TOKENS_STATE, CLAUDE_TOKENS_DEVICE
+(laptop|desktop), CLAUDE_TOKENS_PUSH_HOST (default desktop; "" disables).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+WINDOW_DAYS = 30
+HOME = Path.home()
+PROJECTS = Path(os.environ.get("CLAUDE_TOKENS_PROJECTS", HOME / ".claude" / "projects"))
+STATE = Path(os.environ.get("CLAUDE_TOKENS_STATE", HOME / ".local" / "state" / "claude-tokens"))
+PUSH_HOST = os.environ.get("CLAUDE_TOKENS_PUSH_HOST", "desktop")
+FIELDS = ("input", "output", "cache_read", "cache_creation")
+USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+
+
+def log(msg: str) -> None:
+    print(f"claude-tokens-export: {msg}", file=sys.stderr, flush=True)
+
+
+def detect_device() -> str:
+    """Same rule as local-bootstrapping lb_detect_device's fallback."""
+    forced = os.environ.get("CLAUDE_TOKENS_DEVICE")
+    if forced:
+        return forced
+    host = socket.gethostname()
+    if "desktop" in host:
+        return "desktop"
+    if any(Path(f"/sys/class/power_supply/{b}").exists() for b in ("BAT0", "BAT1")):
+        return "laptop"
+    return "desktop"
+
+
+def open_cache(path: Path) -> sqlite3.Connection:
+    con = sqlite3.connect(path)
+    con.executescript("""
+        CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, inode INTEGER, offset INTEGER);
+        CREATE TABLE IF NOT EXISTS msgs (key TEXT PRIMARY KEY, day TEXT, sid TEXT, model TEXT,
+            i INTEGER, o INTEGER, cr INTEGER, cc INTEGER);
+        CREATE INDEX IF NOT EXISTS msgs_day ON msgs(day);
+    """)
+    return con
+
+
+def parse_line(line: bytes, since: date):
+    """-> (key, day, sid, model, i, o, cr, cc) or None."""
+    if b'"assistant"' not in line or b'"usage"' not in line:
+        return None
+    try:
+        d = json.loads(line)
+    except ValueError:
+        return None
+    if d.get("type") != "assistant":
+        return None
+    msg = d.get("message") or {}
+    usage = msg.get("usage") or {}
+    vals = [int(usage.get(k) or 0) for k in USAGE_KEYS]
+    if not any(vals):
+        return None
+    ts = d.get("timestamp")
+    if not ts:
+        return None
+    try:
+        day = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().date()
+    except ValueError:
+        return None
+    if day < since:
+        return None
+    mid, rid = msg.get("id"), d.get("requestId")
+    key = f"{mid}|{rid}" if (mid or rid) else f"uuid|{d.get('uuid')}"
+    return (key, day.isoformat(), d.get("sessionId") or "?", msg.get("model") or "unknown", *vals)
+
+
+UPSERT = """INSERT INTO msgs(key, day, sid, model, i, o, cr, cc) VALUES (?,?,?,?,?,?,?,?)
+    ON CONFLICT(key) DO UPDATE SET i=max(i, excluded.i), o=max(o, excluded.o),
+        cr=max(cr, excluded.cr), cc=max(cc, excluded.cc)"""
+
+
+def scan(con: sqlite3.Connection, root: Path, since: date) -> dict:
+    cutoff = time.time() - (WINDOW_DAYS + 1) * 86400
+    known = {p: (ino, off) for p, ino, off in con.execute("SELECT path, inode, offset FROM files")}
+    stats = {"files": 0, "read_bytes": 0, "rows": 0}
+    for f in root.rglob("*.jsonl"):
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        if st.st_mtime < cutoff:
+            continue
+        p = str(f)
+        ino, off = known.get(p, (None, 0))
+        if ino != st.st_ino or st.st_size < off:
+            off = 0
+        if st.st_size == off:
+            continue
+        pos, rows, n = off, [], 0
+        with open(f, "rb") as fh:  # streamed: memory stays flat on GB-sized transcripts
+            fh.seek(off)
+            for ln in fh:
+                if not ln.endswith(b"\n"):
+                    break  # partial last line: read it next run
+                pos += len(ln)
+                r = parse_line(ln, since)
+                if r:
+                    rows.append(r)
+                if len(rows) >= 5000:
+                    con.executemany(UPSERT, rows)
+                    n += len(rows)
+                    rows = []
+        if pos == off:
+            continue
+        con.executemany(UPSERT, rows)
+        n += len(rows)
+        con.execute("INSERT OR REPLACE INTO files(path, inode, offset) VALUES (?,?,?)", (p, st.st_ino, pos))
+        stats["files"] += 1
+        stats["read_bytes"] += pos - off
+        stats["rows"] += n
+    con.execute("DELETE FROM msgs WHERE day < ?", (since.isoformat(),))
+    con.commit()
+    return stats
+
+
+def summarise(con: sqlite3.Connection, since: date, today: date) -> list[dict]:
+    days = {}
+    d = since
+    while d <= today:
+        days[d.isoformat()] = {"date": d.isoformat(), **{k: 0 for k in FIELDS}, "total": 0,
+                               "sessions": 0, "models": {}}
+        d += timedelta(days=1)
+    for day, model, i, o, cr, cc in con.execute(
+            "SELECT day, model, SUM(i), SUM(o), SUM(cr), SUM(cc) FROM msgs WHERE day >= ? GROUP BY day, model",
+            (since.isoformat(),)):
+        rec = days.get(day)
+        if rec is None:
+            continue
+        m = rec["models"].setdefault(model, {k: 0 for k in FIELDS} | {"total": 0})
+        for k, v in zip(FIELDS, (i, o, cr, cc)):
+            rec[k] += v
+            m[k] += v
+        rec["total"] += i + o + cr + cc
+        m["total"] += i + o + cr + cc
+    for day, n in con.execute("SELECT day, COUNT(DISTINCT sid) FROM msgs WHERE day >= ? GROUP BY day",
+                              (since.isoformat(),)):
+        if day in days:
+            days[day]["sessions"] = n
+    return list(days.values())
+
+
+def write_atomic(path: Path, doc: dict) -> None:
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(doc, indent=1) + "\n")
+    os.replace(tmp, path)
+
+
+def push(path: Path, host: str) -> bool:
+    """One ssh call: mkdir + atomic replace on the far side."""
+    remote = ("mkdir -p ~/.local/state/claude-tokens && "
+              f"cat > ~/.local/state/claude-tokens/.{path.name}.tmp && "
+              f"mv ~/.local/state/claude-tokens/.{path.name}.tmp ~/.local/state/claude-tokens/{path.name}")
+    try:
+        with open(path, "rb") as fh:
+            r = subprocess.run(["ssh", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, remote],
+                               stdin=fh, capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"push to {host} skipped: {e!r}")
+        return False
+    if r.returncode != 0:
+        log(f"push to {host} skipped (offline?): rc={r.returncode} {r.stderr.decode(errors='replace').strip()[:200]}")
+        return False
+    log(f"pushed {path.name} to {host}")
+    return True
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--rebuild", action="store_true", help="drop the incremental cache first")
+    ap.add_argument("--no-push", action="store_true")
+    ap.add_argument("--print", action="store_true", help="print today's line")
+    a = ap.parse_args(argv)
+    host = socket.gethostname()
+    device = detect_device()
+    STATE.mkdir(parents=True, exist_ok=True)
+    cache = STATE / f".cache-{host}.sqlite"
+    if a.rebuild and cache.exists():
+        cache.unlink()
+    today = datetime.now().astimezone().date()
+    since = today - timedelta(days=WINDOW_DAYS - 1)
+    t0 = time.time()
+    con = open_cache(cache)
+    try:
+        stats = scan(con, PROJECTS, since)
+        days = summarise(con, since, today)
+    finally:
+        con.close()
+    out = STATE / f"{host}.json"
+    write_atomic(out, {"host": host, "device": device,
+                       "generated": datetime.now().astimezone().isoformat(timespec="seconds"),
+                       "window_days": WINDOW_DAYS, "source": "~/.claude/projects/**/*.jsonl",
+                       "dedupe": "message.id + requestId, max per field", "days": days})
+    t = days[-1]
+    log(f"{out} written in {time.time() - t0:.1f}s (read {stats['files']} files, "
+        f"{stats['read_bytes'] / 1e6:.1f} MB, {stats['rows']} rows); today {t['total']:,} tokens, "
+        f"{t['sessions']} sessions")
+    if a.print:
+        print(json.dumps(t))
+    if device == "laptop" and PUSH_HOST and not a.no_push:
+        push(out, PUSH_HOST)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

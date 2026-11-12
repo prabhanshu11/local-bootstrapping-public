@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Normal Screen
+Comment=Reset screen to normal orientation
+Exec=bash -c '~/.local/bin/screen-flip normal'
+Icon=video-display
+Type=Application
+Terminal=false

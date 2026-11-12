@@ -1,0 +1,232 @@
+#!/bin/bash
+# power-loss-monitor - Detect power loss vs clean shutdown at boot
+#
+# Uses 3 independent signals to determine if the previous shutdown was clean:
+#   1. Journal corruption (journald reports corrupted files)
+#   2. wtmp crash records (last -x shows "crash" status)
+#   3. Previous boot journal (missing shutdown target messages)
+#
+# Usage:
+#   power-loss-monitor detect    # Run detection (called by systemd at boot)
+#   power-loss-monitor status    # Show last boot result
+#   power-loss-monitor history   # Show recent history
+
+set -euo pipefail
+
+STATE_DIR="$HOME/.local/state/power-monitor"
+HISTORY_FILE="$STATE_DIR/history.log"
+LAST_RESULT_FILE="$STATE_DIR/last-result"
+
+mkdir -p "$STATE_DIR"
+
+# --- Signal checks ---
+
+check_journal_corruption() {
+    # systemd-journald logs "corrupted or uncleanly shut down" in current boot
+    # when the previous journal wasn't properly closed
+    # NOTE: `set -o pipefail` + `grep -q` = false negatives/positives: grep -q exits at
+    # the first match, the writer gets SIGPIPE, and the pipeline "fails". Use grep -c.
+    if [[ $(journalctl -b --no-pager -q 2>/dev/null | grep -ci "corrupted or uncleanly shut down") -gt 0 ]]; then
+        echo "UNCLEAN"
+    else
+        echo "CLEAN"
+    fi
+}
+
+check_wtmp() {
+    # Look ONLY at the previous boot's own "system boot" line. `last -x` marks it
+    # "... - crash" when that boot never wrote a shutdown record. The old check
+    # grepped "crash" anywhere in the first 20 lines, so every real power cut
+    # kept tainting the next several clean reboots (2026-09-11: three clean
+    # reboots reported POWER_LOSS).
+    local prev_boot_line
+    prev_boot_line=$(last -x 2>/dev/null | awk '/system boot/ {n++; if (n == 2) {print; exit}}')
+    if [[ -z "$prev_boot_line" ]]; then
+        echo "UNKNOWN"
+    elif echo "$prev_boot_line" | grep -qE "crash|still running"; then
+        # "crash" = wtmp's own marker; "still running" on a boot that is NOT the
+        # current one = it never wrote a shutdown record either (the 2026-09-14
+        # power pull looked exactly like this: tty1 said crash, the boot line
+        # said still running).
+        echo "UNCLEAN"
+    else
+        echo "CLEAN"
+    fi
+}
+
+check_previous_boot_journal() {
+    # If previous boot's journal lacks orderly shutdown messages, it was unclean
+    local prev_journal
+    prev_journal=$(journalctl -b -1 --no-pager -q 2>/dev/null || echo "")
+    if [[ -z "$prev_journal" ]]; then
+        # No previous boot journal at all — could be first boot or journal lost
+        echo "UNKNOWN"
+        return
+    fi
+    # grep -c, not -q (see check_journal_corruption): with 8k lines the -q version
+    # SIGPIPEd echo and reported UNCLEAN on every clean reboot (2026-09-11).
+    # Only systemd's own lines count: apps log "Shutting down" on every restart
+    # (the tracker's uvicorn did, which made the 2026-09-14 power pull look clean).
+    if [[ $(echo "$prev_journal" | grep -cE "systemd\[[0-9]+\]: (Reached target .*Shutdown|Stopping Flush Journal|Shutting down\.)") -gt 0 ]]; then
+        echo "CLEAN"
+    else
+        echo "UNCLEAN"
+    fi
+}
+
+# --- Determination ---
+# Verdict = 2+ UNCLEAN signals (decided 2026-09-11 after clean reboots kept
+# reading as POWER_LOSS with a single stale signal).
+#
+# The signals have different reliability:
+#   - journal_sig: highest confidence (journald's own corruption detection)
+#   - wtmp_sig: high confidence (kernel-level session tracking)
+#   - prev_boot_sig: medium confidence (can be UNKNOWN if no previous journal)
+#
+# Also distinguishes REBOOT from CLEAN_SHUTDOWN when all signals are clean.
+
+determine_event() {
+    local journal_sig wtmp_sig prev_boot_sig
+    journal_sig=$(check_journal_corruption)
+    wtmp_sig=$(check_wtmp)
+    prev_boot_sig=$(check_previous_boot_journal)
+
+    local signals="journal=$journal_sig wtmp=$wtmp_sig prev_boot=$prev_boot_sig"
+
+    local unclean_count=0
+    [[ "$journal_sig" == "UNCLEAN" ]] && ((unclean_count++))
+    [[ "$wtmp_sig" == "UNCLEAN" ]] && ((unclean_count++))
+    [[ "$prev_boot_sig" == "UNCLEAN" ]] && ((unclean_count++))
+
+    # 2 of 3: a real power cut trips all three (journald corruption + wtmp crash
+    # + no shutdown messages); a clean reboot trips at most one flaky signal
+    # (prev_boot has misfired once, 2026-09-11 23:37, on a boot whose early
+    # timestamps were skewed by the RTC-in-localtime delta).
+    if [[ $unclean_count -ge 2 ]]; then
+        echo "POWER_LOSS $signals"
+    else
+        # All clean — distinguish reboot vs shutdown
+        # journald is gone before reboot.target is reached; what does land in the
+        # journal is plymouth-reboot.service ("Show Plymouth Reboot Screen") and the
+        # "(reboot.target" destructive-transaction notices.
+        if [[ $(journalctl -b -1 --no-pager -q 2>/dev/null | grep -ciE "Plymouth Reboot Screen|reboot\.target|received.*reboot") -gt 0 ]]; then
+            echo "REBOOT $signals"
+        else
+            echo "CLEAN_SHUTDOWN $signals"
+        fi
+    fi
+}
+
+# --- Gap analysis ---
+
+compute_gap() {
+    local now
+    now=$(date +%s)
+
+    if [[ -f "$HISTORY_FILE" ]] && [[ -s "$HISTORY_FILE" ]]; then
+        local last_line last_timestamp last_epoch
+        last_line=$(tail -1 "$HISTORY_FILE")
+        last_timestamp=$(echo "$last_line" | awk '{print $1 "T" $2}')
+        last_epoch=$(date -d "$last_timestamp" +%s 2>/dev/null || echo "0")
+        if [[ "$last_epoch" -gt 0 ]]; then
+            local gap_seconds=$((now - last_epoch))
+            local gap_hours=$((gap_seconds / 3600))
+            local gap_mins=$(( (gap_seconds % 3600) / 60 ))
+            echo "${gap_hours}h${gap_mins}m"
+            return
+        fi
+    fi
+    echo "first-boot"
+}
+
+# --- Commands ---
+
+do_detect() {
+    local boot_id
+    boot_id=$(cat /proc/sys/kernel/random/boot_id | tr -d '-')
+
+    # Skip if already ran for this boot
+    if [[ -f "$LAST_RESULT_FILE" ]]; then
+        local saved_boot
+        saved_boot=$(head -1 "$LAST_RESULT_FILE" 2>/dev/null || echo "")
+        if [[ "$saved_boot" == "$boot_id" ]]; then
+            return 0
+        fi
+    fi
+
+    local result gap timestamp event_type
+    result=$(determine_event)
+    gap=$(compute_gap)
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    event_type="${result%% *}"
+
+    # Log to history
+    echo "$timestamp $event_type $boot_id gap=$gap $result" >> "$HISTORY_FILE"
+
+    # Save last result for waybar (5 lines: boot_id, event_type, timestamp, gap, full_result)
+    cat > "$LAST_RESULT_FILE" <<EOF
+$boot_id
+$event_type
+$timestamp
+$gap
+$result
+EOF
+
+    # Desktop notification on power loss
+    if [[ "$event_type" == "POWER_LOSS" ]]; then
+        notify-send -u critical \
+            "⚡ Power Loss Detected" \
+            "System recovered from unclean shutdown.\nOffline gap: $gap\nSignals: ${result#POWER_LOSS }" \
+            2>/dev/null || true
+    fi
+
+    echo "[$timestamp] $event_type (gap=$gap)"
+}
+
+do_status() {
+    if [[ ! -f "$LAST_RESULT_FILE" ]]; then
+        echo "No detection data yet. Run: power-loss-monitor detect"
+        return
+    fi
+    local boot_id event_type timestamp gap signals
+    { read -r boot_id; read -r event_type; read -r timestamp; read -r gap; read -r signals; } < "$LAST_RESULT_FILE"
+    echo "Last boot: $event_type"
+    echo "Time:      $timestamp"
+    echo "Gap:       $gap"
+    echo "Signals:   $signals"
+    echo "Boot ID:   $boot_id"
+}
+
+do_history() {
+    if [[ ! -f "$HISTORY_FILE" ]] || [[ ! -s "$HISTORY_FILE" ]]; then
+        echo "No history yet."
+        return
+    fi
+    local total power_losses
+    total=$(wc -l < "$HISTORY_FILE")
+    power_losses=$(grep -c "POWER_LOSS" "$HISTORY_FILE" 2>/dev/null || echo "0")
+    echo "=== Power Loss Monitor History ==="
+    echo "Total boots: $total | Power losses: $power_losses"
+    echo ""
+    tail -20 "$HISTORY_FILE" | while IFS= read -r line; do
+        if echo "$line" | grep -q "POWER_LOSS"; then
+            echo "  ⚡ $line"
+        elif echo "$line" | grep -q "REBOOT"; then
+            echo "  ↻  $line"
+        else
+            echo "  ✓  $line"
+        fi
+    done
+}
+
+# --- Main ---
+
+case "${1:-detect}" in
+    detect)  do_detect ;;
+    status)  do_status ;;
+    history) do_history ;;
+    *)
+        echo "Usage: power-loss-monitor {detect|status|history}" >&2
+        exit 1
+        ;;
+esac

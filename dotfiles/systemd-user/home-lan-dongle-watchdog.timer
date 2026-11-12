@@ -1,0 +1,10 @@
+[Unit]
+Description=Home-LAN dongle watchdog every 15 s
+
+[Timer]
+OnCalendar=*:*:0/15
+AccuracySec=1s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

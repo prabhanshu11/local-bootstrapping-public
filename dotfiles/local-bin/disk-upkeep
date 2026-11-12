@@ -1,0 +1,90 @@
+#!/bin/bash
+# disk-upkeep: desktop root SSD upkeep that ACTS instead of only alarming (desktop-space-permanent-1101, 2026-11-01).
+# His words 2026-11-01 ~20:25 IST: "please fix my desktop space situation.. its always falling low, beacues of silly
+# reasons. even thoug I have ample storage in ext. and networked drives."
+#   disk-upkeep pressure   (disk-pressure.timer, hourly) root free < 50 GB -> lane-reaper --run (idle 3 d; < 30 GB: idle 1 d)
+#                          + uv cache prune; then ONE Telegram line naming what was done (never a question), at most every
+#                          6 h unless free fell another 10 GB. Chunk space (unallocated) is the root btrfs-autobalance.timer's.
+#   disk-upkeep uv-prune   (uv-cache-prune.timer, weekly) `uv cache prune`, never `clean`; past long-lived lock holders
+#                          only with the envs in use copied aside and restored (see uv_prune).
+#   disk-upkeep status     one line: free, unallocated, last reaper / balance / prune results.
+# Deletes nothing that is data: lane clones are MOVED (verified, symlinked back); only uv's unused cache entries go.
+set -uo pipefail
+STATE=$HOME/.local/state/disk-upkeep; mkdir -p "$STATE"; LOG=$STATE/upkeep.log
+TG=$HOME/Programs/star-trek-camera/scripts/ops/tg_plain.py
+UV=$(command -v uv || echo "$HOME/.local/bin/uv")
+REAPER=$(command -v lane-reaper || echo "$HOME/.local/bin/lane-reaper")
+LOW_GB=${DISK_UPKEEP_LOW_GB:-50}; VERY_LOW_GB=${DISK_UPKEEP_VERY_LOW_GB:-30}
+avail(){ df -B1G --output=avail / | tail -1 | tr -d ' '; }
+unalloc(){ btrfs filesystem usage -b / 2>/dev/null | awk '/Device unallocated:/{printf "%.1f", $3/1073741824; exit}'; }
+log(){ echo "$(date -Is) $*" | tee -a "$LOG"; }
+# uv's cache lock is held for ever by long-lived `uv run` services (calendar_api, the tracker), so a plain prune never
+# gets it (11-01: 300 s timeout, 10.9 GB untouched; 09-18 the same). `prune --force` would also wipe environments-v2,
+# INCLUDING ephemeral `uv run --with` envs that live processes use (tested 11-01 with uv 0.11.16: the env of a running
+# process vanished). So: plain prune first; if the lock is busy and every holder is >= 5 min old (no uv build in
+# flight; retried every 10 min for 90 min), reflink-copy the envs in use aside, prune --force, and put any that vanished back at once.
+UVC=${UV_CACHE_DIR:-$HOME/.cache/uv}
+uv_holders(){ for p in $(pgrep -u "$(id -u)" -x uv); do ls -l /proc/$p/fd 2>/dev/null | grep -q "$UVC/.lock" && echo "$p"; done; }
+envs_in_use(){  # cache entries ($UVC/<bucket>/<id>) my processes run from: PATH / VIRTUAL_ENV in environ, mapped files;
+  # plus environments-v2 links that point at one of them (uv 0.11: `--with` envs live in archive-v0, linked from there)
+  local s
+  s=$({ for p in $(pgrep -u "$(id -u)"); do
+          tr '\0:' '\n\n' 2>/dev/null < /proc/$p/environ; grep -o "$UVC/[^ ]*" /proc/$p/maps 2>/dev/null
+        done; } 2>/dev/null | grep -oE "^(VIRTUAL_ENV=|PATH=)?$UVC/[a-z0-9-]+/[^/]+" | sed -E 's/^(VIRTUAL_ENV|PATH)=//' | sort -u)
+  echo "$s"
+  for l in "$UVC"/environments-v2/*; do [ -e "$l" ] || continue
+    echo "$s" | grep -qxF "$(readlink -f "$l")" && echo "$l"; done
+  true; }
+uv_prune(){  # prints "uv cache A -> B GB" or the reason it did not run
+  local b a out rc h young hold e d t try kept=0 back=0
+  b=$(du -sm "$UVC" 2>/dev/null | cut -f1)
+  out=$(UV_LOCK_TIMEOUT=120 timeout 300 ionice -c3 nice -n10 "$UV" cache prune 2>&1); rc=$?
+  if [ "$rc" != 0 ]; then
+    # a holder younger than 5 min may still be building its env: wait for it (every 10 min, at most 9 tries)
+    for try in 1 2 3 4 5 6 7 8 9; do
+      young=""; for h in $(uv_holders); do [ "$(ps -o etimes= -p "$h" | tr -d ' ')" -lt "${DISK_UPKEEP_UV_YOUNG_S:-300}" ] && young="$young $h"; done
+      [ -z "$young" ] && break
+      [ "$try" = 9 ] && { echo "uv cache prune skipped: uv jobs younger than 5 min held the lock for 90 min (pid$young)"; return; }
+      sleep "${DISK_UPKEEP_UV_RETRY_S:-600}"
+    done
+    hold=$HOME/.cache/uv-env-hold; rm -rf "$hold"; mkdir -p "$hold"
+    for e in $(envs_in_use); do [ -e "$e" ] || continue; d=$hold/${e#$UVC/}; mkdir -p "$(dirname "$d")"
+      cp -a --reflink=auto "$e" "$d" && kept=$((kept+1)); done
+    out=$(ionice -c3 nice -n10 "$UV" cache prune --force 2>&1); rc=$?
+    for e in "$hold"/*/*; do [ -e "$e" ] || [ -L "$e" ] || continue; t=$UVC/${e#$hold/}
+      if [ ! -e "$t" ] && [ ! -L "$t" ]; then mkdir -p "$(dirname "$t")" && mv "$e" "$t" && back=$((back+1)); fi; done
+    rm -rf "$hold"
+    out="$out (forced past long-lived lock holders; $kept in-use envs kept, $back restored)"
+  fi
+  a=$(du -sm "$UVC" 2>/dev/null | cut -f1)
+  if [ "$rc" = 0 ]; then awk -v b="${b:-0}" -v a="${a:-0}" -v o="$(echo "$out" | tail -1 | grep -o '(forced.*')" 'BEGIN{printf "uv cache %.1f -> %.1f GB %s", b/1024, a/1024, o}'
+  else echo "uv cache prune failed (exit $rc: $(echo "$out" | tail -1 | cut -c1-80))"; fi; }
+send(){ [ -f "$TG" ] && timeout 90 /usr/bin/python3 "$TG" -m "$1" >/dev/null 2>&1 || log "telegram send failed"; }
+
+case "${1:-status}" in
+  uv-prune)
+    log "uv-prune: $(uv_prune); root free $(avail) GB" ;;
+  pressure)
+    f0=$(avail)
+    if [ "$f0" -ge "$LOW_GB" ]; then echo "ok: root free $f0 GB (acts under $LOW_GB), unallocated $(unalloc) GiB"; exit 0; fi
+    idle=3; [ "$f0" -lt "$VERY_LOW_GB" ] && idle=1
+    r=$("$REAPER" --run --idle-days "$idle" 2>&1 | tail -1)
+    p=$(uv_prune)
+    f1=$(avail)
+    log "pressure: free $f0 -> $f1 GB | $r | $p"
+    # one message per 6 h, sooner only if free fell another 10 GB since the last one
+    last_t=0; last_f=999; [ -f "$STATE/last-msg" ] && read -r last_t last_f < "$STATE/last-msg"
+    now=$(date +%s)
+    if [ $((now - last_t)) -ge 21600 ] || [ "$f1" -le $((last_f - 10)) ]; then
+      moved=$(echo "$r" | sed -n 's/.*: moved \([0-9]*\) lane dirs (\([0-9.]*\) GB.*/\1 idle lane clones (\2 GB)/p')
+      bal=$(cut -c1-160 /var/lib/btrfs-autobalance/last.txt 2>/dev/null)
+      send "Desktop disk low (free ${f0} GB, under ${LOW_GB}). Done: moved ${moved:-0 idle lane clones} to the Pi / external archive (symlinked back), ${p}. Free now ${f1} GB, unallocated $(unalloc) GiB.${bal:+ Last balance: ${bal#btrfs-autobalance }}"
+      echo "$now $f1" > "$STATE/last-msg"
+    fi ;;
+  status)
+    echo "root free $(avail) GB, unallocated $(unalloc) GiB"
+    echo "reaper:  $(cat "$HOME/logs/lane-reaper/last-run.txt" 2>/dev/null || echo never)"
+    echo "balance: $(cat /var/lib/btrfs-autobalance/last.txt 2>/dev/null || echo never)"
+    echo "upkeep:  $(tail -1 "$LOG" 2>/dev/null || echo never)" ;;
+  *) sed -n 2,12p "$0"; exit 2 ;;
+esac

@@ -1,0 +1,13 @@
+[Unit]
+Description=Rotate desktop wallpaper
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+KillMode=none
+ExecStart=%h/.local/bin/wallpaper-rotate
+Environment=WAYLAND_DISPLAY=wayland-1
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+
+[Install]
+WantedBy=default.target

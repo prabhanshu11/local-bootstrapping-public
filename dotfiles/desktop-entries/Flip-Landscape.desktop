@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Flip Landscape
+Comment=Rotate screen 180 degrees
+Exec=bash -c '~/.local/bin/screen-flip flipped'
+Icon=video-display
+Type=Application
+Terminal=false

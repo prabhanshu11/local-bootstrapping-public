@@ -1,0 +1,14 @@
+# Belt-and-braces for resume= / resume_offset= on the kernel cmdline (2026-10-06).
+# See docs/issues/laptop-hibernate-setup-2026-10-06.md
+[Unit]
+Description=Point hibernation resume at /swap/swapfile
+RequiresMountsFor=/swap
+After=swap.target
+ConditionPathExists=/swap/swapfile
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hibernate-resume-config /swap/swapfile /dev/mapper/root
+
+[Install]
+WantedBy=multi-user.target

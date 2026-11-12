@@ -1,0 +1,752 @@
+{
+  "reload_style_on_change": true,
+  "layer": "top",
+  "position": "top",
+  "spacing": 0,
+  // No "height" key: the bar height is CSS min-height in style.css (26 px, or
+  // 33 px in touch mode). The include below is owned by ~/.local/bin/touch-mode;
+  // a missing file just means normal mode. Keys it sets (name, tray icon-size)
+  // must NOT also appear here: on a clash waybar keeps THIS file's value.
+  "include": ["~/.config/waybar/touch-mode.jsonc"],
+  "modules-left": ["custom/omarchy", "group/ws", "custom/touch-mode", "custom/mouse-mode", "custom/windows", "custom/mpv-history"],
+  "modules-center": [
+    "cpu",
+    "memory",
+    "custom/thermal-alarm",
+    "custom/power-loss",
+    "custom/clock",
+    "custom/update",
+    "custom/lb-drift",
+    "custom/screenrecording-indicator"
+  ],
+  "modules-right": [
+    "custom/monitor",
+    "custom/moonlight",
+    "custom/sep",
+    "custom/telegram",
+    "custom/datalake",
+    "custom/hyprwhspr",
+    "custom/read-aloud",
+    "custom/keystroke",
+    "custom/clipboard",
+    "custom/sep#2",
+    "hyprland/language",
+    "tray",
+    "bluetooth",
+    "network",
+    "pulseaudio",
+    "custom/kbd-backlight",
+    "backlight",
+    "custom/power-profile",
+    "custom/battery"
+  ],
+  // Workspaces in two instances so CSS can tell them apart (waybar gives the
+  // buttons no per-number class): 1-10 = main (#workspaces), 11-20 =
+  // secondary (#workspaces.secondary, drawn as 1-0, the other screen's set).
+  // The group (#ws in style.css) carries the min-width that puts TOCH one
+  // inch from "1".
+  "group/ws": {
+    "orientation": "horizontal",
+    "modules": ["hyprland/workspaces", "hyprland/workspaces#secondary"]
+  },
+  "hyprland/workspaces#secondary": {
+    "on-click": "activate",
+    "format": "{icon}",
+    "ignore-workspaces": ["^([1-9]|10)$"],
+    "format-icons": {
+      "default": "",
+      "11": "1",
+      "12": "2",
+      "13": "3",
+      "14": "4",
+      "15": "5",
+      "16": "6",
+      "17": "7",
+      "18": "8",
+      "19": "9",
+      "20": "0"
+    }
+  },
+  "hyprland/workspaces": {
+    "on-click": "activate",
+    "ignore-workspaces": ["^(1[1-9]|20)$"],
+    "format": "{icon}",
+    "format-icons": {
+      "default": "",
+      "1": "1",
+      "2": "2",
+      "3": "3",
+      "4": "4",
+      "5": "5",
+      "6": "6",
+      "7": "7",
+      "8": "8",
+      "9": "9",
+      "10": "0",
+      "11": "1",
+      "12": "2",
+      "13": "3",
+      "14": "4",
+      "15": "5",
+      "16": "6",
+      "17": "7",
+      "18": "8",
+      "19": "9",
+      "20": "0"
+    },
+    "persistent-workspaces": {
+      "1": [],
+      "2": [],
+      "3": [],
+      "4": [],
+      "5": []
+    }
+  },
+  "hyprland/language": {
+    "on-click": "~/.local/bin/bar-touch click hyprland/language",
+    "on-click-right": "hyprctl switchxkblayout all next",
+    "format": "{}",
+    "format-en": "US",
+    "format-en-dvorak": "DV",
+    "tooltip-format": "Keyboard: {long}",
+    // The three bar gestures (docs/touch-bar.md): hover = this tooltip, tap or click =
+    // the on-screen keyboard rises from the bottom (again = hides it), long press =
+    // card: what it is, the live state, Switch layout. Waybar ignores the "touch" key.
+    "touch": {
+      "title": "Keyboard",
+      "about": "The active keyboard layout, and the on-screen keyboard. Its keycaps follow the layout; its layout key switches every keyboard between the layouts configured in Hyprland (US QWERTY, DV Dvorak).",
+      "popup": "keyboard",
+      "popup-label": "Show / hide the on-screen keyboard",
+      "right-chip": "⇄ US / DV",
+      "right-label": "Switch layout (US ⇄ DV, every keyboard)",
+      "state": "hyprctl devices -j | jq -r '.keyboards[] | select(.main) | \"Layout: \" + .active_keymap + \"  (\" + .layout + \" \" + .variant + \")\"'; hyprctl layers -j | jq -e '[.[].levels[][] | select(.namespace == \"bar-touch-keyboard\")] | length > 0' >/dev/null 2>&1 && echo 'On-screen keyboard: shown' || echo 'On-screen keyboard: hidden'"
+    }
+  },
+  "custom/omarchy": {
+    "format": "<span font='omarchy'>\ue900</span>",
+    "on-click": "~/.local/bin/bar-touch click custom/omarchy",
+    "on-click-right": "xdg-terminal-exec",
+    "tooltip-format": "Omarchy Menu\n\nSuper + Alt + Space",
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Omarchy menu",
+      "about": "Apps, settings, system and power menu (Super + Alt + Space).",
+      "click": "omarchy-menu",
+      "click-label": "Open the Omarchy menu",
+      "right-chip": "Terminal",
+      "right-label": "Open a terminal"
+    }
+  },
+  // Touch mode toggle, shown as the letters TO/CH in a 2x2 block that light up
+  // while it is on: taller bar + big icons. Sits one inch to the RIGHT of
+  // workspace "1" (the workspaces themselves stay put). The inch comes from
+  // #ws (the workspaces group) min-width in style.css, so a tap in the gap hits nothing.
+  "custom/touch-mode": {
+    "format": "{}",
+    "exec": "~/.local/bin/touch-mode status",
+    "return-type": "json",
+    "interval": "once",
+    "on-click": "~/.local/bin/bar-touch click custom/touch-mode",
+    "tooltip": true,
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Touch mode (TOCH)",
+      "about": "Taller top bar with big icons for fingers. The TOCH letters are lit while it is on.",
+      "click": "~/.local/bin/touch-mode toggle",
+      "click-label": "Switch touch mode"
+    }
+  },
+  // Mouse mode (the hand): the daemon grabs the touchscreen and turns touches
+  // into pointer input. Signal 12 refreshes the icon when the mode changes.
+  "custom/mouse-mode": {
+    "format": "{}",
+    "exec": "~/.local/bin/bar-touch mouse-status",
+    "return-type": "json",
+    "interval": "once",
+    "signal": 12,
+    "on-click": "~/.local/bin/bar-touch click custom/mouse-mode",
+    "tooltip": true,
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Mouse mode",
+      "about": "The touchscreen acts as a mouse: tap = left click where you touch (the arrow jumps there), long press = right click, drag = drag, two fingers swiped up = all open windows. The hand is lit while it is on.",
+      "click": "~/.local/bin/bar-touch mouse toggle",
+      "click-label": "Switch mouse mode"
+    }
+  },
+  // Open windows (touch twin of Alt+Tab and Super+W, 2026-09-30): opens the
+  // bar-touch overview in any mode: tiles in Alt+Tab (MRU) order, tap = switch,
+  // tile ✕ = close. Two fingers swiped up opens the same view in mouse mode.
+  "custom/windows": {
+    "format": "󰕰",
+    "tooltip-format": "Open windows: tap to switch or close",
+    "on-click": "~/.local/bin/bar-touch click custom/windows",
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Open windows",
+      "toast": false,
+      "about": "Every open window as a big tile, most recent first (Alt+Tab order). Tap one to switch to it, its ✕ to close it (like Super+W).",
+      "click": "~/.local/bin/bar-touch overview",
+      "click-label": "Show open windows"
+    }
+  },
+  "custom/update": {
+    "format": "",
+    "exec": "omarchy-update-available",
+    "on-click": "~/.local/bin/bar-touch click custom/update",
+    "tooltip-format": "Omarchy update available",
+    "signal": 7,
+    "interval": 21600,
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Omarchy update",
+      "about": "Shown when an Omarchy update is available.",
+      "click": "omarchy-launch-floating-terminal-with-presentation omarchy-update",
+      "click-label": "Install the update"
+    }
+  },
+  // local-bootstrapping drift the 10-minute self-heal could not fix. Hidden
+  // while in sync (and during the grace period); the icon appears when a Claude
+  // agent is due/opened. Tap = reopen that agent (docs/issues/desktop-drift-2026-09-30.md).
+  "custom/lb-drift": {
+    "exec": "~/.local/bin/lb-drift waybar",
+    "return-type": "json",
+    "interval": 60,
+    "signal": 13,
+    "tooltip": true,
+    "on-click": "~/.local/bin/bar-touch click custom/lb-drift",
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Unsynced changes (local-bootstrapping)",
+      "about": "Shown when this machine differs from the repo and the automatic self-heal could not fix it. A Claude agent opens to fix and commit it.",
+      "click": "~/.local/bin/lb-drift open",
+      "click-label": "Open the drift agent",
+      "state": "~/.local/bin/lb-drift status"
+    }
+  },
+  "custom/sep": {
+    "format": "|",
+    "tooltip": false
+  },
+  "custom/sep#2": {
+    "format": "|",
+    "tooltip": false
+  },
+  "cpu": {
+    "interval": 3,
+    "format": "󰍛 {avg_frequency:.1f}G",
+    "tooltip-format": "CPU: {usage}%\n{avg_frequency:.2f} GHz",
+    "on-click": "~/.local/bin/bar-touch click cpu",
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "CPU",
+      "about": "Average CPU clock speed, updated every 3 s.",
+      "click": "omarchy-launch-or-focus-tui btop",
+      "click-label": "Open btop (process monitor)",
+      "state": "awk '{printf \"Load %s %s %s\\n\", $1, $2, $3}' /proc/loadavg; awk '/MHz/{s+=$4; n++} END{printf \"Average clock %.2f GHz\\n\", s/n/1000}' /proc/cpuinfo"
+    }
+  },
+  "memory": {
+    "on-click": "~/.local/bin/bar-touch click memory",
+    "interval": 5,
+    "format": "󰘚 {used:.1f}G",
+    "tooltip-format": "RAM: {used:.1f}G / {total:.1f}G ({percentage}%)\nSwap: {swapUsed:.1f}G / {swapTotal:.1f}G",
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Memory",
+      "about": "RAM in use. The card also shows swap.",
+      "state": "free -h | awk '/^Mem:/{print \"RAM \"$3\" used of \"$2} /^Swap:/{print \"Swap \"$3\" used of \"$2}'"
+    }
+  },
+  "custom/thermal-alarm": {
+    "format": "{}",
+    "exec": "curl -sf http://localhost:8790/waybar || ~/.local/bin/thermal-alarm",
+    "interval": 3,
+    "return-type": "json",
+    "exec-on-event": true,
+    "on-click": "~/.local/bin/bar-touch click custom/thermal-alarm",
+    "tooltip": true,
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Temperature",
+      "about": "CPU package temperature. Red means it is running hot; the dashboard has the history.",
+      "click": "xdg-open http://localhost:8790",
+      "click-label": "Open the thermal dashboard"
+    }
+  },
+  "custom/power-loss": {
+    "on-click": "~/.local/bin/bar-touch click custom/power-loss",
+    "format": "{}",
+    "exec": "~/.local/bin/power-loss-waybar",
+    "interval": "once",
+    "return-type": "json",
+    "exec-on-event": false,
+    "signal": 9,
+    "tooltip": true,
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Last shutdown",
+      "about": "How the previous boot ended: red = power loss, blue = reboot, green = clean. Empty until a boot has been classified."
+    }
+  },
+  // Custom, not waybar's built-in clock: the tooltip marks "DST on/off" beside
+  // New York, which the built-in {tz_list} cannot (docs/touch-bar.md). The
+  // script loops itself (no "interval"): one JSON line per second.
+  "custom/clock": {
+    "exec": "~/.local/bin/waybar-clock run",
+    "return-type": "json",
+    "restart-interval": 2,
+    "tooltip": true,
+    "on-click": "~/.local/bin/bar-touch click custom/clock",
+    "on-click-right": "omarchy-launch-floating-terminal-with-presentation omarchy-tz-select",
+    "on-click-middle": "~/.local/bin/waybar-clock shift 0",
+    "on-scroll-up": "~/.local/bin/waybar-clock shift 1",
+    "on-scroll-down": "~/.local/bin/waybar-clock shift -1",
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Clock",
+      "toast": false,
+      "big-state": true,
+      "about": "Tap switches between the time and the full date. Right-click picks a time zone. Scroll pages the calendar.",
+      "click": "~/.local/bin/waybar-clock toggle",
+      "click-label": "Time / full date",
+      "right-chip": "Time zone",
+      "right-label": "Choose the time zone",
+      "middle-label": "Calendar back to this month",
+      "scroll-up-label": "Calendar: next month",
+      "scroll-down-label": "Calendar: previous month",
+      "state": "~/.local/bin/waybar-clock card"
+    }
+  },
+  "network": {
+    "format-icons": ["󰤯", "󰤟", "󰤢", "󰤥", "󰤨"],
+    "format": "{icon}",
+    "format-wifi": "{icon}",
+    "format-ethernet": "󰀂",
+    "format-disconnected": "󰤮",
+    "tooltip-format-wifi": "{essid} ({frequency} GHz)\n⇣{bandwidthDownBytes}  ⇡{bandwidthUpBytes}",
+    "tooltip-format-ethernet": "⇣{bandwidthDownBytes}  ⇡{bandwidthUpBytes}",
+    "tooltip-format-disconnected": "Disconnected",
+    "interval": 3,
+    "spacing": 1,
+    "on-click": "~/.local/bin/bar-touch click network",
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Network",
+      "about": "Wi-Fi and wired connections. A tap or click opens a network list: tap to join (new secured networks ask for the password there).",
+      "popup": "wifi",
+      "state": "iw dev | awk '$1==\"Interface\"{i=$2} $1==\"ssid\"{sub(/^[ \\t]*ssid /, \"\"); print i\": \"$0}'; ip -br -4 addr | awk '$1!=\"lo\" && $2==\"UP\"{print $1\" \"$3}'"
+    }
+  },
+  // custom, not waybar's built-in battery (2026-09-30): battery-info measures
+  // the real net flow (the EC reads 0 W while a weak charger lets it drain),
+  // turns the icon amber when plugged in but draining, and writes the tooltip.
+  "custom/battery": {
+    "exec": "~/.local/bin/battery-info waybar",
+    "return-type": "json",
+    "interval": 5,
+    "tooltip": true,
+    "on-click": "~/.local/bin/bar-touch click custom/battery",
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Battery",
+      "about": "Charge, charging or drain rate, time left, charger, health, history, and the power profile. A tap or click opens the battery panel; its last button is the power menu.",
+      "popup": "battery",
+      "state": "~/.local/bin/battery-info text"
+    }
+  },
+  "bluetooth": {
+    "format": "󰂯",
+    "format-disabled": "󰂲",
+    "format-connected": "󰂱",
+    "format-no-controller": "",
+    "tooltip-format": "Devices connected: {num_connections}",
+    "on-click": "~/.local/bin/bar-touch click bluetooth",
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Bluetooth",
+      "about": "Bluetooth radio and paired devices. A tap or click opens a device list: tap to connect / disconnect, Scan to pair a new device.",
+      "popup": "bluetooth",
+      "state": "bluetoothctl show | awk -F': ' '/Powered/{print \"Powered: \"$2}'; bluetoothctl devices Connected | cut -d' ' -f3- | sed 's/^/Connected: /'"
+    }
+  },
+  "pulseaudio": {
+    "format": "{icon}",
+    "on-click": "~/.local/bin/bar-touch click pulseaudio",
+    "on-click-right": "pamixer -t",
+    "tooltip": true,
+    "tooltip-format": "Volume: {volume}%",
+    // Scroll drives the CURRENT default sink via swayosd (same path as the
+    // XF86Audio volume keys), instead of waybar's built-in scroll which can
+    // latch onto the sink that was default at startup and keep hitting it
+    // (e.g. sof-hda-dsp Speaker) after the default switches to Bluetooth.
+    "on-scroll-up": "swayosd-client --output-volume raise",
+    "on-scroll-down": "swayosd-client --output-volume lower",
+    "scroll-step": 5,
+    "format-muted": "\ueee8",
+    "format-icons": {
+      "default": ["\uf026", "\uf027", "\uf028"]
+    },
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Volume",
+      "about": "Output volume of the current audio device. A tap or click opens a volume slider and the output devices.",
+      "popup": "volume",
+      "right-chip": "Mute / unmute",
+      "right-label": "Mute or unmute",
+      "scroll-up-label": "Volume up",
+      "scroll-down-label": "Volume down",
+      "state": "echo \"Volume: $(pamixer --get-volume-human)\"; pactl get-default-sink 2>/dev/null | sed 's/^/Output: /'"
+    }
+  },
+  // Keyboard backlight. The EC switches the light off on its own inactivity
+  // timer without telling the kernel, so "keep-on" arms a watchdog that
+  // re-issues the ACPI set-level call. See ~/.local/bin/kbd-backlight.
+  // Emits empty text on machines with no tpacpi LED (the desktop), which
+  // makes waybar hide the module entirely.
+  "custom/kbd-backlight": {
+    "format": "{}",
+    "exec": "~/.local/bin/kbd-backlight status",
+    "return-type": "json",
+    "exec-on-event": true,
+    // Signal-driven: the script pkill -RTMIN+11's waybar after every change it
+    // makes or adopts, so clicks and Fn+Space are reflected instantly. The slow
+    // interval is only a backstop for presses that happen while nothing is
+    // running to send the signal.
+    "signal": 11,
+    "interval": 10,
+    "on-click": "~/.local/bin/bar-touch click custom/kbd-backlight",
+    "on-click-right": "~/.local/bin/kbd-backlight cycle",
+    "on-scroll-up": "~/.local/bin/kbd-backlight up",
+    "on-scroll-down": "~/.local/bin/kbd-backlight down",
+    "tooltip": true,
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Keyboard backlight",
+      "about": "Colour shows the level; the green pin means keep-on holds it against the auto-off timer.",
+      "click": "~/.local/bin/kbd-backlight keep toggle",
+      "click-label": "Keep the backlight on (toggle)",
+      "right-chip": "Cycle level",
+      "right-label": "Cycle the brightness level",
+      "scroll-up-label": "Brighter",
+      "scroll-down-label": "Dimmer"
+    }
+  },
+  "backlight": {
+    "format": "{icon}",
+    "format-icons": ["󰍵", "󰍵", "󰍶", "󰍶", "󰍷", "󰍷", "󰍸", "󰍹", "󰍹"],
+    "tooltip-format": "Brightness: {percent}%",
+    "on-click": "~/.local/bin/bar-touch click backlight",
+    "on-click-right": "~/.local/bin/brightness-popup toggle-minmax",
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Screen brightness",
+      "about": "Laptop screen brightness.",
+      "click": "~/.local/bin/brightness-popup",
+      "click-label": "Open the brightness slider",
+      "right-chip": "Min ⇄ max",
+      "right-label": "Jump between minimum and maximum",
+      "state": "brightnessctl -m | awk -F, '{print \"Brightness: \"$4}'"
+    }
+  },
+  "custom/power-profile": {
+    "format": "{}",
+    // RAM-resident (2026-11-01): power-profile-daemon holds the state and sends
+    // signal 10 the moment a tap lands; `state` answers from RAM (falls back to
+    // `power-profile-monitor status` when the daemon is down). Not a streaming
+    // `watch` exec: waybar 0.15 lost it after a SIGUSR2 reload (twice, 11-01).
+    // docs/issues/power-button-ram-resident-risk-analysis.md, REPORT-power-button.md
+    "exec": "~/.local/bin/power-profile-daemon state",
+    "interval": 30,
+    "return-type": "json",
+    "exec-on-event": false,
+    // bar-touch-click = `bar-touch click` without recompiling bar-touch per tap (~60 ms)
+    "on-click": "~/.local/bin/bar-touch-click custom/power-profile",
+    "tooltip": true,
+    // The daemon (every change) and the clamp watchdog redraw through this.
+    "signal": 10,
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Power profile",
+      // A tap only switches; the icon is the feedback. Details live in the long-press card.
+      "toast": false,
+      "about": "Tap cycles performance (red) → balanced (blue) → power saver (green). Peach means the CPU is clamped. Dimmed with … = switching.",
+      "click": "~/.local/bin/power-profile-daemon toggle",
+      // bar-touch sends this line straight to the daemon's socket (no shell, no
+      // Python start-up); "click" runs only when the socket is down.
+      "click-socket": "power-profile.sock toggle",
+      "click-label": "Switch the power profile",
+      // The card reads the same one-shot JSON as the exec.
+      "state": "~/.local/bin/power-profile-daemon state",
+      "state-json": true
+    }
+  },
+  "custom/screenrecording-indicator": {
+    "on-click": "~/.local/bin/bar-touch click custom/screenrecording-indicator",
+    "exec": "$OMARCHY_PATH/default/waybar/indicators/screen-recording.sh",
+    "signal": 8,
+    "return-type": "json",
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Screen recording",
+      "about": "Shows while a screen recording is running.",
+      "click": "omarchy-cmd-screenrecord",
+      "click-label": "Start or stop screen recording"
+    }
+  },
+  "custom/hyprwhspr": {
+    "format": "{}",
+    "exec": "~/.local/bin/hyprwhspr-tray.sh status",
+    "interval": 1,
+    "return-type": "json",
+    "exec-on-event": true,
+    "on-click": "~/.local/bin/bar-touch click custom/hyprwhspr",
+    "on-click-right": "~/.local/bin/hyprwhspr-tray.sh restart",
+    "tooltip": true,
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Voice typing (hyprwhspr)",
+      "about": "Speech to text into the window you were using. Super + ` does the same as the big button. Pick the microphone below.",
+      "tap-card": true,
+      "toast": false,
+      "pass-target-window": true,
+      // Lists the microphones; tapping one makes it the default source, which is
+      // what voice typing records from (see docs/touch-bar.md).
+      "mic-picker": true,
+      "click": "~/.local/bin/hyprwhspr-toggle",
+      "click-label": "Start or stop recording",
+      "click-labels": {
+        "recording": "■  Stop recording and type",
+        "default": "●  Start recording"
+      },
+      "status-labels": {
+        "recording": "Recording — speak now, then press Stop.",
+        "ready": "Ready.",
+        "stopped": "The voice typing service is stopped: tap ↻ Restart (top) first.",
+        "error": "Voice typing has a problem (details below). Try ↻ Restart (top).",
+        "default": ""
+      },
+      "right-chip": "↻ Restart",
+      "right-label": "Restart voice typing",
+      // 2026-11-03: the "Source:" button names where speech is transcribed (Deepgram online, or
+      // this laptop's own GPU/CPU Whisper), highlighted while local; a tap switches in place
+      // (bar-touch "state-cmd"). Retry: the newest recording whose transcript failed
+      // (local source -> local Whisper; else Deepgram, then local Whisper; result -> clipboard).
+      "actions": [
+        {"cmd": "~/.local/bin/voice-stt-provider toggle-offline",
+         "state-cmd": "~/.local/bin/voice-stt-provider label"},
+        {"label": "↻  Retry last failed recording (to clipboard)", "cmd": "~/.local/bin/voice-retranscribe --last --copy --notify"}
+      ],
+      // Opens the voice-labels web app (omarchy-voice-typing/stt/webapp, user unit voice-labels).
+      "links": [
+        {"label": "Fix wrong words / words to concentrate on", "url": "http://127.0.0.1:8771/"}
+      ]
+    }
+  },
+  // icon-size lives in ~/.config/waybar/touch-mode.jsonc (14 normal, 22 touch)
+  "tray": {
+    "spacing": 10
+  },
+  "custom/clipboard": {
+    "format": "{}",
+    "exec": "~/.local/bin/system-health clipboard",
+    "interval": 30,
+    "return-type": "json",
+    "exec-on-event": true,
+    "on-click": "~/.local/bin/bar-touch click custom/clipboard",
+    "on-click-right": "omarchy-launch-walker -m clipboard",
+    "tooltip": true,
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Clipboard",
+      "about": "Clipboard health check and history.",
+      "click": "~/.local/bin/system-health clipboard fix",
+      "click-label": "Repair the clipboard",
+      "right-chip": "History",
+      "right-label": "Open the clipboard history"
+    }
+  },
+  "custom/monitor": {
+    "format": "{}",
+    "exec": "~/.local/bin/monitor-chooser-status status",
+    "interval": 5,
+    "return-type": "json",
+    "exec-on-event": true,
+    "on-click": "~/.local/bin/bar-touch click custom/monitor",
+    "on-click-right": "~/.local/bin/monitor-chooser-status mirror-toggle",
+    "on-click-middle": "~/.local/bin/monitor-chooser-status toggle-side",
+    "on-scroll-up": "~/.local/bin/monitor-chooser-status external-left",
+    "on-scroll-down": "~/.local/bin/monitor-chooser-status external-right",
+    "tooltip": true,
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Displays",
+      "about": "Monitor layout: laptop only, extended or mirrored.",
+      "click": "~/.local/bin/monitor-chooser-status click",
+      "click-label": "Open the monitor chooser",
+      "right-chip": "Mirror",
+      "right-label": "Mirror on / off",
+      "middle-label": "Swap which side the external screen is on",
+      "scroll-up-label": "External screen to the left",
+      "scroll-down-label": "External screen to the right"
+    }
+  },
+  "custom/moonlight": {
+    // VDI (docs/vdi.md): the desktop's headless display (Sunshine) streamed to this laptop's panel
+    // (Moonlight). One module for both ends since 2026-11-01 ("club moonlight and sunshine icons"):
+    // the icon is a photo of the Moon (icons/moon-*.png, drawn by style.css as a background image;
+    // the text is only the state badge). Classes: off (no desktop), ready, connected, hidden, error
+    // (also when the desktop reports Sunshine's capture failing). Tap = the VDI menu (his 11-01
+    // round 2: never a toggle; works from either screen's bar), middle = hide/show, right = close.
+    "format": "{}",
+    "exec": "~/.local/bin/moonlight-toggle status --waybar",
+    "interval": 15,
+    "return-type": "json",
+    "exec-on-event": true,
+    "on-click": "~/.local/bin/bar-touch click custom/moonlight",
+    "on-click-right": "~/.local/bin/moonlight-toggle kill",
+    "on-click-middle": "~/.local/bin/moonlight-toggle show",
+    "on-scroll-up": "~/.local/bin/moonlight-toggle release",
+    "on-scroll-down": "~/.local/bin/moonlight-toggle fullscreen",
+    "tooltip": true,
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    // Like the other icons (his 11-05: "both the menu's are redundant"): tap = the VDI menu with every control;
+    // long press = the standard card (what it is, live state, the right/middle/scroll actions), no action list.
+    "touch": {
+      "title": "VDI (the desktop on this laptop)",
+      "about": "The desktop's headless screen (Linux) and its Windows VM on this laptop. Tap: the VDI menu (connect, Linux | Windows, Windows in its own window, turn off, intro screen with machines and RAM/CPU). Fullscreen: the VDI tab at the top edge drops the control bar. Keys: Super+Ctrl+D, Super+Ctrl+Esc release, Super+Ctrl+X fullscreen (stream or Windows window), Ctrl+Esc close.",
+      "click": "~/.local/bin/vdi menu",
+      "click-label": "VDI menu (show/hide, intro screen, release, fullscreen, Linux | Windows, RDP, route, min fps, close)",
+      "middle-label": "Hide / show the stream (stays connected)",
+      "scroll-up-label": "Release keyboard + mouse to the laptop",
+      "scroll-down-label": "Fullscreen ⇄ window",
+      "right-chip": "Close VDI",
+      "right-label": "Close the VDI",
+      "state": "~/.local/bin/vdi card"
+    }
+  },
+  // mpv watch history (2026-10-03, docs/mpv-history.md). Hover = recent video
+  // filenames and their lengths, nothing else. Tap / click = the bar-touch panel:
+  // thumbnails (tap one = muted 20x preview in place), progress, Resume, Folder.
+  // The mpv script (dotfiles/mpv/scripts/mpv-history.lua) sends signal 15 after
+  // every play, so the tooltip is fresh at once.
+  "custom/mpv-history": {
+    "format": "{}",
+    "exec": "~/.local/bin/mpv-history waybar",
+    "interval": 300,
+    "return-type": "json",
+    "exec-on-event": true,
+    "signal": 15,
+    "on-click": "~/.local/bin/bar-touch click custom/mpv-history",
+    "on-click-right": "~/.local/bin/mpv-history open last",
+    "on-click-middle": "~/.local/bin/mpv-history folder last",
+    "tooltip": true,
+    // Same three gestures as every other module (docs/touch-bar.md): hover = the brief
+    // tooltip (filenames + lengths), tap or click = the panel, long press = this card
+    // with the full state and one button per action. Waybar ignores the "touch" key.
+    "touch": {
+      "title": "mpv history",
+      "about": "Videos you watched in mpv, newest first. Only files mpv itself played are listed; nothing is guessed.",
+      "popup": "mpv-history",
+      "popup-label": "Open the panel: thumbnails (tap = 20x preview), Resume, Folder",
+      "state": "~/.local/bin/mpv-history card",
+      "right-chip": "▶ Resume last",
+      "right-label": "Resume the last video in mpv",
+      "middle-label": "Open the last video's folder in Thunar"
+    }
+  },
+  "custom/datalake": {
+    "format": "{}",
+    "exec": "~/.local/bin/datalake-health",
+    "interval": 60,
+    "return-type": "json",
+    "exec-on-event": true,
+    "on-click": "~/.local/bin/bar-touch click custom/datalake",
+    "tooltip": true,
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Datalake",
+      "about": "Synced Claude and ChatGPT conversation store and its web server.",
+      "click": "xdg-open http://localhost:5050",
+      "click-label": "Open the datalake web UI"
+    }
+  },
+  // Keystroke logger health + raw log viewer (keystroke-bar). The keyboard
+  // icon turns RED when the logger is BLIND (a keyboard grab is defeating
+  // passive capture) — a silent capture failure is never silent again.
+  // Tap opens the recent RAW (unredacted) entries in a floating terminal; that
+  // asks for a fingerprint because the raw log can contain passwords.
+  "custom/read-aloud": {
+    // Read aloud (repo ~/Programs/star-trek-computer): highlight text, tap the icon, the Computer reads it
+    // (star-trek-camera say service, strek-say :8111); tap again while it reads = stop. His 2026-11-01:
+    // "The copy thing is clashing with my regular work" -> "highlight, and then I press the icon".
+    // Speak-every-copy mode still exists, off: `strek-read-aloud on|off`. Script: ~/.local/bin/strek-read-aloud.
+    "format": "{}",
+    "exec": "~/.local/bin/strek-read-aloud status",
+    "interval": 5,
+    "return-type": "json",
+    "exec-on-event": true,
+    "signal": 6,
+    "on-click": "~/.local/bin/bar-touch click custom/read-aloud",
+    "on-click-right": "~/.local/bin/strek-read-aloud stop",
+    "tooltip": true,
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Read aloud",
+      "about": "Highlight any text, then tap this icon: the Computer reads it. Tap again while it reads to stop. Copying (Ctrl+C) never speaks. Passwords and single long tokens are never read.",
+      "click": "~/.local/bin/strek-read-aloud selection",
+      "click-label": "Read the highlighted text (or stop)",
+      "click-labels": {
+        "on": "■  Stop reading",
+        "down": "▶  Read the highlighted text (voice is down)",
+        "default": "▶  Read the highlighted text"
+      },
+      "status-labels": {
+        "on": "Reading the highlighted text.",
+        "down": "The Computer's voice is not answering (strek-say).",
+        "off": "Ready: highlight text, then tap.",
+        "default": ""
+      },
+      "right-chip": "■ Stop",
+      "right-label": "Stop the current read",
+      "state": "~/.local/bin/strek-read-aloud card"
+    }
+  },
+  "custom/keystroke": {
+    "format": "{}",
+    "exec": "~/.local/bin/keystroke-bar status",
+    "interval": 30,
+    "return-type": "json",
+    "exec-on-event": true,
+    "signal": 14,
+    "on-click": "~/.local/bin/bar-touch click custom/keystroke",
+    "tooltip": true,
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Keystroke log",
+      "about": "Records what you type so a message a crash ate can be recovered. Red means it is BLIND: a keyboard grab (interception-tools / hyprwhspr voice typing) is stopping capture and nothing is being saved. A tap opens the recent raw, unredacted entries — it asks for your fingerprint because the raw log can hold passwords.",
+      "click": "~/.local/bin/keystroke-bar view",
+      "click-label": "View recent entries (raw)",
+      "state": "~/.local/bin/keystroke-bar card"
+    }
+  },
+  "custom/telegram": {
+    "format": "{}",
+    "exec": "~/.local/bin/telegram-bot-health",
+    "interval": 30,
+    "return-type": "json",
+    "exec-on-event": true,
+    "on-click": "~/.local/bin/bar-touch click custom/telegram",
+    "on-click-right": "notify-send 'Telegram Bot' \"$(~/.local/bin/telegram-bot-health | jq -r .tooltip)\"",
+    "tooltip": true,
+    // Touch card + tap popup (see ~/.local/bin/bar-touch); waybar ignores this key.
+    "touch": {
+      "title": "Telegram bot",
+      "about": "Health of the Telegram watcher bot.",
+      "click": "systemctl --user restart telegram-watcher",
+      "click-label": "Restart the Telegram watcher",
+      "right-chip": "Status",
+      "right-label": "Show the bot status"
+    }
+  }
+}

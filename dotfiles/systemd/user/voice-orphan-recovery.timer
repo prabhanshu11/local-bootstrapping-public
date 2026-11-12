@@ -1,0 +1,14 @@
+[Unit]
+Description=Run voice orphan recovery every 15 minutes
+Documentation=https://github.com/prabhanshu11/omarchy-voice-typing
+
+[Timer]
+# Start 2 minutes after boot (give time for gateway to start)
+OnBootSec=2min
+# Run every 15 minutes after that (reduced from 5min to avoid excessive scanning)
+OnUnitActiveSec=15min
+# Don't wake system from sleep just for this
+WakeSystem=false
+
+[Install]
+WantedBy=timers.target

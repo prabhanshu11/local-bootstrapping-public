@@ -1,0 +1,11 @@
+[Unit]
+Description=SwayOSD health check — repair a server that lost its D-Bus name
+Documentation=https://github.com/ErikReider/SwayOSD
+After=graphical-session.target
+# Complements swayosd-server.service: that unit restarts the process when it
+# DIES; this one restarts it when it stays alive but stops answering on
+# org.erikreider.swayosd-server (see the script header for the full story).
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/swayosd-health

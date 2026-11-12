@@ -1,0 +1,5 @@
+# Desktop SATA disks (root ADATA SU650 SSD + WD/Seagate HDDs): use BFQ, the only scheduler that honours
+# ionice classes, so background jobs marked idle (sha256sum archive verify, training readers) yield to
+# interactive saves. mq-deadline ignored ionice. 2026-11-01, docs/issues/btrfs-commit-stall/README.md.
+# NVMe (laptop) untouched: KERNEL match is sd[a-z] only.
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="sd[a-z]", ATTR{queue/scheduler}="bfq"

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# internet-guard — standing guard (user timer, every 2 min), his order 2026-09-24:
+# "not make this device go off the internet at any cost".
+# 1. If the built-in Wi-Fi radio (wlan0) is rfkill soft-blocked ("Powered off" in iwctl/impala) while internet
+#    is down, unblock it, log and notify. 2026-10-04 00:30 a WLAN-only soft block (no keystroke, no sudo, no
+#    repo script — most likely impala's Toggle Power or the Fn Wi-Fi key) took the laptop off the internet for
+#    12 h; systemd-rfkill had saved the block so it would even have survived a reboot.
+#    Deliberate Wi-Fi off: `touch "$XDG_RUNTIME_DIR/wifi-off.hold"` (cleared on reboot) and the guard leaves it.
+# 2. If internet via wlan0 fails AND the USB dongle holds a default route or DNS, take the dongle off the air
+#    (net-revert-dongle.sh) and log it. Otherwise only log failures (not the dongle's fault).
+set -u
+NET="$HOME/Programs/local-bootstrapping/scripts/net"; LOG="$HOME/logs/internet-guard.log"; mkdir -p "$(dirname "$LOG")"
+DONGLE_MAC="${DONGLE_MAC:-02:00:00:00:00:04}"
+WLAN_IF="${WLAN_IF:-wlan0}"
+WIFI_HOLD="${XDG_RUNTIME_DIR:-/tmp}/wifi-off.hold"
+strip() { sed 's/\x1b\[[0-9;]*m//g'; }
+CHK="$(bash "$NET/net-state-check.sh")" && exit 0
+
+# --- 1. built-in radio soft-blocked? ---------------------------------------------------------------
+SOFT="$(cat /sys/class/net/"$WLAN_IF"/phy80211/rfkill*/soft 2>/dev/null | head -1)"
+if [[ "$SOFT" == "1" ]]; then
+  if [[ -f "$WIFI_HOLD" ]]; then
+    echo "$(date '+%F %T') $CHK — $WLAN_IF radio soft-blocked, wifi-off.hold present: leaving it off" >> "$LOG"
+  else
+    rfkill unblock wifi
+    sleep 8
+    AFTER="$(iwctl station "$WLAN_IF" show 2>/dev/null | strip | awk '/Connected network/{ $1=$2=""; sub(/^ +/,""); sub(/ +$/,""); print }')"
+    echo "$(date '+%F %T') $CHK — $WLAN_IF radio was soft-blocked (rfkill): UNBLOCKED, now on '${AFTER:-nothing yet}'" >> "$LOG"
+    notify-send -u normal "internet-guard" "Wi-Fi radio was switched off (rfkill). Turned it back on — now on ${AFTER:-nothing yet}. To keep it off: touch \$XDG_RUNTIME_DIR/wifi-off.hold" 2>/dev/null
+    exit 0
+  fi
+fi
+
+# --- 2. dongle stealing the default route / DNS? ---------------------------------------------------
+IF="$(iwctl device list 2>/dev/null | strip | awk -v m="$DONGLE_MAC" '$2==m{print $1; exit}')"
+GUILTY=""
+if [[ -n "$IF" ]]; then
+  ip route show default | grep -q "dev $IF" && GUILTY+="default-route "
+  resolvectl dns "$IF" 2>/dev/null | grep -qE ':\s*\S' && GUILTY+="dns "
+  ip route show default | grep -q . || GUILTY+="(no-default-at-all) "
+fi
+if [[ -n "$GUILTY" ]]; then
+  echo "$(date '+%F %T') $CHK — dongle $IF has: $GUILTY→ reverting" >> "$LOG"
+  bash "$NET/net-revert-dongle.sh" "internet-guard: $GUILTY"
+else
+  echo "$(date '+%F %T') $CHK — dongle ${IF:-absent} clean, not its fault (hotspot/mobile data?)" >> "$LOG"
+fi

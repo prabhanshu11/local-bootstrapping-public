@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""
+laptop-state-restore — print what was open at the last laptop-state-snapshot,
+as a plan he (or an agent) can follow after a crash or a dead battery: the
+windows per workspace, and a ready `cd <cwd> && claude --resume <id>` line for
+every Claude Code session. The running sessions come FIRST (2026-10-03: a
+`| head -12` cut them off behind the window list and they looked missing).
+A process with no ~/.claude/sessions/<pid>.json id (remote-control) gets the
+newest transcript of its project written since it started, marked as a match.
+
+Usage
+  laptop-state-restore --print              # latest snapshot
+  laptop-state-restore --print FILE         # a given snapshot (history/<ts>.json)
+  laptop-state-restore --list               # the snapshots kept
+It prints only; it never opens or closes anything.
+"""
+
+import glob
+import json
+import os
+import re
+import shlex
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+DIR = os.environ.get("LAPTOP_STATE_DIR") or os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "laptop-state")
+
+
+def ago(ts, now):
+    s = int(now - ts)
+    if s < 120:
+        return f"{s} s ago"
+    if s < 7200:
+        return f"{s // 60} min ago"
+    return f"{s // 3600} h {s % 3600 // 60:02d} min ago"
+
+
+def clock(ts):
+    return time.strftime("%a %d %b %H:%M", time.localtime(ts)) if ts else "?"
+
+
+def resume_line(cwd, sid):
+    return f"cd {shlex.quote(cwd or HOME)} && claude --resume {sid}"
+
+
+def project_of(cwd):
+    return re.sub(r"[^A-Za-z0-9]", "-", cwd or "")
+
+
+def session_of(p, recent, claimed):
+    """(session id, how) for a running process: its sessions/<pid>.json id, else the snapshot's
+    transcript match, else the newest recent transcript of its project written since it started."""
+    if p.get("sessionId"):
+        return p["sessionId"], "id"
+    g = p.get("transcript_guess") or {}
+    if g.get("sessionId"):
+        return g["sessionId"], "transcript"
+    for r in sorted(recent, key=lambda r: r.get("mtime") or 0, reverse=True):
+        same = (r.get("project") == project_of(p.get("cwd"))) or (r.get("cwd") and r.get("cwd") == p.get("cwd"))
+        if same and (r.get("mtime") or 0) >= (p.get("started") or 0) and r["sessionId"] not in claimed:
+            return r["sessionId"], "transcript"
+    return None, None
+
+
+def claude_section(s):
+    """Running sessions first: each with pid, cwd and a resume line (the part of a restore that matters)."""
+    running = s.get("claude_running") or []
+    recent_l = s.get("claude_recent") or []
+    recent = {r["sessionId"]: r for r in recent_l}
+    out = [f"Claude Code sessions running at the snapshot ({len(running)}):"]
+    if not running:
+        out.append("  (none)")
+    claimed = {p["sessionId"] for p in running if p.get("sessionId")}
+    seen = set()
+    for p in sorted(running, key=lambda p: p.get("started") or 0, reverse=True):
+        sid, how = session_of(p, recent_l, claimed)
+        what = p.get("kind") or (p.get("args") or "claude").split(" ")[0] or "claude"
+        head = f"  pid {p['pid']} in {p.get('cwd') or '?'} ({what}, started {clock(p.get('started'))})"
+        r = recent.get(sid, {}) if sid else {}
+        if r.get("last_user"):
+            head += f' — "{r["last_user"]}"'
+        if not sid:
+            out.append(head + ": session id unknown, no transcript written since it started")
+            continue
+        claimed.add(sid)
+        seen.add(sid)
+        out.append(head)
+        out.append(f"    {resume_line(p.get('cwd'), sid)}"
+                   + ("  # matched by transcript (newest in its project since the process started)"
+                      if how == "transcript" else ""))
+    return out, seen
+
+
+def plan(s, now=None):
+    now = now or time.time()
+    out = [f"Snapshot {clock(s['ts'])} ({ago(s['ts'], now)}) on {s.get('host', '?')}"
+           + (f", battery {s['battery']['percent']}% {s['battery'].get('status') or ''}".rstrip()
+              if s.get("battery") else "")]
+    out.append("")
+    claude, seen = claude_section(s)
+    out += claude
+    clients = s.get("clients") or []
+    mons = {m.get("id"): m.get("name") for m in (s.get("monitors") or [])}
+    wsmon = {w.get("id"): w.get("monitor") for w in (s.get("workspaces") or [])}
+    by_ws = {}
+    for c in clients:
+        ws = (c.get("workspace") or {})
+        by_ws.setdefault((ws.get("id", 0), ws.get("name", "?")), []).append(c)
+    out.append("")
+    out.append(f"Windows ({len(clients)}):" if clients else "Windows: none recorded (hyprctl gave nothing)")
+    for (wid, wname), cs in sorted(by_ws.items(), key=lambda kv: (kv[0][0] < 0, kv[0][0])):
+        mon = wsmon.get(wid) or mons.get(cs[0].get("monitor")) or "?"
+        out.append(f"  Workspace {wname} ({mon}):")
+        for c in cs:
+            title = " ".join((c.get("title") or "").split())[:90]
+            out.append(f"    - {c.get('class') or c.get('initialClass') or '?'} — {title}")
+    rest = [r for r in (s.get("claude_recent") or []) if r["sessionId"] not in seen]
+    if rest:
+        out.append("")
+        out.append("Other recent Claude Code sessions (not running at the snapshot):")
+        for r in rest:
+            msg = f' — "{r["last_user"]}"' if r.get("last_user") else ""
+            out.append(f"  {resume_line(r.get('cwd'), r['sessionId'])}  # {clock(r.get('mtime'))}{msg}")
+    if s.get("tmux"):
+        out.append("")
+        out.append("tmux:")
+        for t in s["tmux"]:
+            out.append(f"  tmux attach -t {shlex.quote(t['name'])}  # {t['windows']} window(s), {t.get('path')}")
+    return "\n".join(out)
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if argv[0] == "--list":
+        for p in sorted(glob.glob(os.path.join(DIR, "history", "*.json"))):
+            print(p)
+        return 0
+    if argv[0] == "--print":
+        path = argv[1] if len(argv) > 1 else os.path.join(DIR, "latest.json")
+        try:
+            s = json.load(open(path))
+        except (OSError, ValueError) as e:
+            print(f"laptop-state-restore: cannot read {path}: {e}", file=sys.stderr)
+            return 1
+        print(plan(s))
+        return 0
+    print(f"laptop-state-restore: unknown argument {argv[0]}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,13 @@
+[Unit]
+Description=Moonlight readiness check timer
+
+[Timer]
+# OnActiveSec, not OnBootSec: in a USER manager OnBootSec counts from system boot; a
+# session that starts later never gets the first run and the timer sits "elapsed"
+# forever (stuck 2026-10-06 -> 2026-11-09; see local-bootstrapping-sync.timer).
+OnActiveSec=3min
+OnUnitActiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

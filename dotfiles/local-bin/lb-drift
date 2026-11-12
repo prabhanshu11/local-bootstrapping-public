@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""lb-drift — escalate local-bootstrapping drift the self-heal could not fix.
+
+His rule (2026-09-30): "the desktop should not drift, thats the philosophy of
+local bootstrapping, and if the conventional scripts part of the repo [...]
+fails, after some some a claude agent should pop up and be shown the unsynced
+changes notification, and it can figure out and commit."
+
+Flow: sync-from-master.sh (every 10 min) runs the self-heal
+(install.sh --reconcile), collects what it could NOT fix into a report
+("kind<TAB>key<TAB>detail" lines) and calls `lb-drift record REPORT`.
+When the same drift (fingerprint = its sorted kind+key lines) has survived
+the grace period, this opens — on THIS machine's screen — a notification and
+a ghostty window running `claude` in ~/Programs/local-bootstrapping with the
+drift report as its first prompt.
+
+  grace       >= 3 consecutive runs AND >= 30 min; 2 h when the only drift is
+              uncommitted work / a non-master branch (a live session's WIP
+              changes its fingerprint as it edits, which restarts the clock)
+  rate limit  one agent per fingerprint per day; never while one is open
+
+Commands:
+  record REPORT            called by the sync each run (quiet unless escalating)
+  escalate [--test] [--dry-run]
+                           open the agent now (--test: forced fake drift whose
+                           prompt tells the agent to do nothing; --dry-run:
+                           print the prompt and the command, open nothing)
+  open                     touch/click path: focus the open agent, else resume
+                           or start one for the current drift, else say "in sync"
+  status                   human-readable state (bar-touch card)
+  waybar                   JSON for the custom/lb-drift bar module
+  agent-run FP [--resume]  runs inside the terminal (internal)
+  notify-wait FP           the notification with an "Open agent" action (internal)
+
+State: ~/.local/state/local-bootstrapping/ (LB_DRIFT_STATE_DIR overrides;
+LB_DRIFT_NOW=<epoch> fakes the clock for tests).
+"""
+import datetime as dt
+import hashlib
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import uuid
+
+HOME = os.path.expanduser("~")
+REPO = os.environ.get("LB_REPO", os.path.join(HOME, "Programs", "local-bootstrapping"))
+STATE_DIR = os.environ.get("LB_DRIFT_STATE_DIR",
+                           os.path.join(HOME, ".local", "state", "local-bootstrapping"))
+DRIFT = os.path.join(STATE_DIR, "drift.json")
+ESCALATIONS = os.path.join(STATE_DIR, "escalations.json")
+AGENT = os.path.join(STATE_DIR, "agent.json")
+REPORT_MD = os.path.join(STATE_DIR, "drift-report.md")
+SYNC_LOG = os.path.join(HOME, ".local", "share", "local-bootstrapping-sync.log")
+SELF = os.path.join(REPO, "dotfiles", "local-bin", "lb-drift")
+
+GRACE_S = 30 * 60
+WIP_GRACE_S = 2 * 60 * 60
+MIN_RUNS = 3
+WIP_KINDS = {"git-uncommitted", "git-branch"}
+WAYBAR_SIGNAL = 13
+AGENT_CLASS = "local-bootstrapping.drift-agent"
+ICON = "\U000f04e7"  # nf-md-sync_alert
+
+
+def now():
+    return float(os.environ.get("LB_DRIFT_NOW") or time.time())
+
+
+def iso(t):
+    return dt.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def today():
+    return dt.datetime.fromtimestamp(now()).strftime("%Y-%m-%d")
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
+def device():
+    try:
+        with open(os.path.join(REPO, "device-role.conf")) as f:
+            for line in f:
+                if line.startswith("DEVICE_NAME="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return "laptop" if os.path.isdir("/sys/class/power_supply/BAT0") else "desktop"
+
+
+def parse_report(path):
+    items = []
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            parts = line.split("\t", 2) + ["", ""]
+            items.append({"kind": parts[0], "key": parts[1], "detail": parts[2]})
+    # de-duplicate (kind, key)
+    seen, out = set(), []
+    for it in items:
+        k = (it["kind"], it["key"])
+        if k not in seen:
+            seen.add(k)
+            out.append(it)
+    return out
+
+
+def fingerprint(items):
+    lines = sorted(f'{i["kind"]}\t{i["key"]}' for i in items)
+    return hashlib.sha1("\n".join(lines).encode()).hexdigest()[:12]
+
+
+def grace_for(items):
+    return WIP_GRACE_S if items and all(i["kind"] in WIP_KINDS for i in items) else GRACE_S
+
+
+def log(msg):
+    print(f"lb-drift: {msg}", flush=True)
+
+
+def pid_alive(pid):
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            return b"claude" in f.read()
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def agent_open():
+    a = load(AGENT, {})
+    return a if a.get("pid") and pid_alive(a["pid"]) else None
+
+
+def hypr_env():
+    """The graphical session env, re-resolving a stale Hyprland signature."""
+    env = dict(os.environ)
+    # When lb-drift itself runs under a Claude agent's Bash, this marker would
+    # make the drift agent's claude stop saving its transcript (2026-10-01).
+    env.pop("CLAUDE_CODE_CHILD_SESSION", None)
+    rt = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    env["XDG_RUNTIME_DIR"] = rt
+    hdir = os.path.join(rt, "hypr")
+    sig = env.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    if not sig or not os.path.exists(os.path.join(hdir, sig, ".socket.sock")):
+        try:
+            cands = sorted(os.listdir(hdir), key=lambda d: os.path.getmtime(os.path.join(hdir, d)),
+                           reverse=True)
+        except OSError:
+            return None
+        cands = [c for c in cands if os.path.exists(os.path.join(hdir, c, ".socket.sock"))]
+        if not cands:
+            return None
+        env["HYPRLAND_INSTANCE_SIGNATURE"] = cands[0]
+    env.setdefault("WAYLAND_DISPLAY", "wayland-1")
+    return env
+
+
+def hypr_exec(cmd, env):
+    """Spawn via Hyprland so the process outlives the sync service's cgroup."""
+    r = subprocess.run(["hyprctl", "dispatch", "exec", cmd], env=env,
+                       capture_output=True, text=True, timeout=10)
+    return r.returncode == 0 and "ok" in (r.stdout or "").lower()
+
+
+def refresh_bar():
+    subprocess.run(["pkill", f"-RTMIN+{WAYBAR_SIGNAL}", "-x", "waybar"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def visible_state(st):
+    """none | pending | due | escalated | agent — what the bar shows."""
+    if not st.get("items"):
+        return "none"
+    if agent_open():
+        return "agent"
+    if st.get("escalated_at"):
+        return "escalated"
+    if st.get("runs", 0) >= MIN_RUNS and now() - st.get("first_seen", now()) >= st.get("grace_s", GRACE_S):
+        return "due"
+    return "pending"
+
+
+def write_report_md(st):
+    lines = [f"# local-bootstrapping drift on {st.get('device')} ({st.get('host')})", "",
+             f"- fingerprint `{st.get('fingerprint')}`",
+             f"- first seen {iso(st['first_seen'])}, last seen {iso(st['last_seen'])}, "
+             f"{st['runs']} consecutive sync run(s)",
+             f"- grace {st['grace_s'] // 60} min (and >= {MIN_RUNS} runs) before an agent opens", "",
+             "| kind | what | detail |", "|---|---|---|"]
+    for i in st["items"]:
+        lines.append(f"| {i['kind']} | `{i['key']}` | {i['detail'].replace('|', '/')} |")
+    lines += ["", f"Sync log: {SYNC_LOG}", "Journal: journalctl --user -u local-bootstrapping-sync"]
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(REPORT_MD, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def build_prompt(st, test=False):
+    if test:
+        return ("TEST of the local-bootstrapping drift escalation path (lb-drift escalate --test), "
+                "started with a forced fake drift report. Do not read files, run any tool, or change "
+                "anything. Reply with exactly this one line and stop: "
+                "lb-drift escalation test received")
+    items = "\n".join(f"- [{i['kind']}] {i['key']}" + (f" — {i['detail']}" if i["detail"] else "")
+                      for i in st["items"])
+    return f"""You were opened automatically by local-bootstrapping's drift escalation (lb-drift) on the {st['device']} ({st['host']}) at {iso(now())}.
+
+The 10-minute sync (scripts/sync-from-master.sh, which runs the self-heal `scripts/install.sh --reconcile` = scripts/lib/reconcile.sh) could not make this machine match the repo. This drift has persisted since {iso(st['first_seen'])} ({st['runs']} consecutive runs):
+
+{items}
+
+His rule (2026-09-30, verbatim): "the desktop should not drift, thats the philosophy of local bootstrapping, and if the conventional scripts part of the repo hic his supposed to ensure this fails, after some some a claude agent should pop up and be shown the unsynecd changes notification, and it can figure out and commit."
+
+Report: {REPORT_MD}
+State: {DRIFT}
+Sync log: {SYNC_LOG} (and journalctl --user -u local-bootstrapping-sync)
+Re-check any time: ~/Programs/local-bootstrapping/scripts/install.sh --reconcile --check
+
+The repo is {REPO} (your cwd is its parent, ~/Programs).
+
+What to do:
+1. Read ~/Programs/local-bootstrapping/CLAUDE.md (binding) and docs/issues/desktop-drift-2026-09-30.md, then git status and git log --oneline -20.
+2. For each item decide where the truth is. A local change worth keeping goes INTO the repo (dotfiles/, or machine-specific/<device>/ for a file only this machine should have, or a drift-exceptions.conf line with the reason when it is a deliberate difference). If the repo is right, fix the machine through the repo's scripts.
+3. Uncommitted changes in the repo may be another live Claude session's work in progress. Check before committing them (file mtimes, find-conversations / get-messages-from-current). If it is live WIP, do not commit it: say so and stop.
+4. Never raw sudo. Items marked sudo-needed: use sudo-with-notify (beep first) only if he is at this machine; otherwise list the exact command for him.
+5. On the desktop never disturb the star-trek-camera tracker's python processes.
+6. scripts/validate-configs.sh must pass. Commit with a message that explains the drift, rebase on origin/master, push (never --no-verify). Then run `systemctl --user start local-bootstrapping-sync.service` and confirm `~/.local/bin/lb-drift status` says in sync.
+7. Finish with a short summary: what drifted, what you changed, commit hashes, anything that needs his decision.
+"""
+
+
+def cmd_record(argv):
+    if not argv:
+        sys.exit("usage: lb-drift record REPORT")
+    items = parse_report(argv[0])
+    st = load(DRIFT, {})
+    before = visible_state(st) if st else "none"
+    t = now()
+    if not items:
+        was = st.get("fingerprint")
+        st = {"host": socket.gethostname(), "device": device(), "items": [],
+              "fingerprint": None, "last_run": t}
+        save(DRIFT, st)
+        if was:
+            log(f"drift {was} resolved")
+        if before != "none":
+            refresh_bar()
+        return 0
+    fp = fingerprint(items)
+    if st.get("fingerprint") == fp:
+        st["runs"] = st.get("runs", 0) + 1
+    else:
+        if st.get("fingerprint"):
+            log(f"drift changed {st['fingerprint']} -> {fp}; grace restarts")
+        st = {"fingerprint": fp, "first_seen": t, "runs": 1, "escalated_at": None,
+              "session_id": None}
+    st.update({"host": socket.gethostname(), "device": device(), "items": items,
+               "last_seen": t, "last_run": t, "grace_s": grace_for(items)})
+    save(DRIFT, st)
+    write_report_md(st)
+    age = t - st["first_seen"]
+    log(f"{len(items)} unresolved item(s), fingerprint {fp}, run {st['runs']}, "
+        f"age {int(age // 60)} min (grace {st['grace_s'] // 60} min)")
+    if st["runs"] >= MIN_RUNS and age >= st["grace_s"]:
+        esc = load(ESCALATIONS, {})
+        if esc.get(fp) == today():
+            log("already escalated today for this fingerprint")
+        elif agent_open():
+            log("an agent is already open — not opening another")
+        else:
+            escalate(st, dry_run=os.environ.get("LB_DRIFT_DRY_RUN") == "1")
+    if visible_state(load(DRIFT, st)) != before:
+        refresh_bar()
+    return 0
+
+
+def escalate(st, test=False, dry_run=False, resume=False):
+    fp = st["fingerprint"]
+    prompt = build_prompt(st, test=test)
+    pfile = os.path.join(STATE_DIR, f"prompt-{fp}.txt")
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(pfile, "w") as f:
+        f.write(prompt)
+    if not resume or not st.get("session_id"):
+        st["session_id"] = str(uuid.uuid4())
+    run = f"{SELF} agent-run {fp}" + (" --resume" if resume else "") + (" --test" if test else "")
+    # On the desktop, HDMI-A-1 workspace 1 is the Star Trek wall: the agent
+    # terminal starts on workspace 2 without stealing focus (his words
+    # 2026-10-01: "those terminals should start in desktops 2, 3 etc"). The
+    # notification still fires; mako's do-not-disturb hides it there and the
+    # wall's comms strip shows it (docs/wall-guard.md).
+    rule = "[workspace 2 silent] " if device() == "desktop" else ""
+    term = (f"{rule}ghostty --gtk-single-instance=false --class={AGENT_CLASS} "
+            f"--title=lb-drift-agent -e {run}")
+    note = f"{SELF} notify-wait {fp}" + (" --test" if test else "")
+    if dry_run:
+        print(f"[dry-run] would run: hyprctl dispatch exec '{note}'")
+        print(f"[dry-run] would run: hyprctl dispatch exec '{term}'")
+        print(f"[dry-run] prompt file: {pfile}\n----- prompt -----\n{prompt}\n------------------")
+        return True
+    env = hypr_env()
+    if env is None:
+        log("no Hyprland session to open the agent in — will retry next run")
+        return False
+    if not test:
+        # the prompt file + state must exist before the terminal reads them
+        save(DRIFT, st)
+    else:
+        save(os.path.join(STATE_DIR, "test-drift.json"), st)
+    hypr_exec(note, env)
+    ok = hypr_exec(term, env)
+    if not ok:
+        log("hyprctl dispatch exec failed — will retry next run")
+        return False
+    log(f"opened a Claude agent for drift {fp}" + (" (TEST)" if test else ""))
+    if not test:
+        st["escalated_at"] = now()
+        save(DRIFT, st)
+        esc = load(ESCALATIONS, {})
+        cutoff = (dt.datetime.fromtimestamp(now()) - dt.timedelta(days=14)).strftime("%Y-%m-%d")
+        esc = {k: v for k, v in esc.items() if v >= cutoff}
+        esc[fp] = today()
+        save(ESCALATIONS, esc)
+        os.makedirs(os.path.dirname(SYNC_LOG), exist_ok=True)
+        with open(SYNC_LOG, "a") as f:
+            f.write(f"[{iso(now())}] lb-drift: opened a Claude agent for drift {fp}\n")
+    return True
+
+
+def cmd_escalate(argv):
+    test = "--test" in argv
+    dry = "--dry-run" in argv
+    if test:
+        t = now()
+        items = [{"kind": "test", "key": "forced-fake-drift",
+                  "detail": "lb-drift escalate --test (nothing is really drifted)"}]
+        st = {"fingerprint": "test-" + fingerprint(items), "first_seen": t, "last_seen": t,
+              "runs": MIN_RUNS, "grace_s": GRACE_S, "items": items,
+              "host": socket.gethostname(), "device": device(), "session_id": None}
+    else:
+        st = load(DRIFT, {})
+        if not st.get("items"):
+            print("lb-drift: no drift recorded — nothing to escalate")
+            return 0
+    return 0 if escalate(st, test=test, dry_run=dry) else 1
+
+
+def focus_agent(a, env):
+    """Focus the terminal window that hosts the agent (walk up from claude's pid)."""
+    try:
+        clients = json.loads(subprocess.run(["hyprctl", "clients", "-j"], env=env,
+                                            capture_output=True, text=True, timeout=5).stdout)
+    except (ValueError, subprocess.SubprocessError, OSError):
+        return False
+    pids = {c.get("pid") for c in clients}
+    pid = int(a["pid"])
+    for _ in range(8):
+        if pid in pids:
+            subprocess.run(["hyprctl", "dispatch", "focuswindow", f"pid:{pid}"], env=env,
+                           capture_output=True, timeout=5)
+            return True
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+        if pid <= 1:
+            return False
+    return False
+
+
+def notify(summary, body, urgency="normal"):
+    subprocess.run(["notify-send", "-u", urgency, "-a", "local-bootstrapping", summary, body],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_open(argv):
+    env = hypr_env() or dict(os.environ)
+    a = agent_open()
+    if a:
+        if focus_agent(a, env):
+            return 0
+    st = load(DRIFT, {})
+    if not st.get("items"):
+        notify("local-bootstrapping is in sync", "No unresolved drift on this machine.")
+        return 0
+    # His tap is consent: no grace, no daily limit. Resume this drift's session
+    # when one was started, so the agent keeps its context.
+    resume = bool(st.get("session_id") and st.get("escalated_at"))
+    escalate(st, resume=resume)
+    refresh_bar()
+    return 0
+
+
+def cmd_agent_run(argv):
+    fp = argv[0]
+    resume = "--resume" in argv
+    test = "--test" in argv
+    st = load(os.path.join(STATE_DIR, "test-drift.json") if test else DRIFT, {})
+    pfile = os.path.join(STATE_DIR, f"prompt-{fp}.txt")
+    claude = shutil.which("claude") or os.path.join(HOME, ".local", "bin", "claude")
+    # cwd = ~/Programs: the folder Claude Code already trusts on both machines
+    # (a fresh cwd shows the keyboard-only trust dialog) and whose CLAUDE.md
+    # holds the house rules; the prompt names the repo path.
+    os.chdir(os.path.dirname(REPO))
+    sid = st.get("session_id") or str(uuid.uuid4())
+    if resume:
+        args = [claude, "--resume", sid]
+    else:
+        with open(pfile) as f:
+            prompt = f.read()
+        args = [claude, "--session-id", sid, "-n", f"lb-drift {st.get('device', '')} {fp}", prompt]
+    print(f"lb-drift: Claude agent for drift {fp} (report {REPORT_MD})\n", flush=True)
+    p = subprocess.Popen(args)
+    save(AGENT, {"pid": p.pid, "fingerprint": fp, "session_id": sid, "started": now(),
+                 "test": test})
+    rc = p.wait()
+    try:
+        os.remove(AGENT)
+    except OSError:
+        pass
+    refresh_bar()
+    print(f"\nlb-drift: agent exited ({rc}). This window closes in 10 s; "
+          f"tap the sync icon on the bar to reopen it.", flush=True)
+    time.sleep(10)
+    return rc
+
+
+def cmd_notify_wait(argv):
+    fp = argv[0] if argv else ""
+    test = "--test" in argv
+    st = load(DRIFT, {}) if not test else {"items": [{"kind": "test", "key": "forced-fake-drift"}]}
+    n = len(st.get("items", []))
+    body = (f"{n} item(s) the sync could not fix. A Claude agent opened to fix and commit them. "
+            f"Tap the sync icon on the bar to reopen it.")
+    summary = ("TEST: " if test else "") + f"local-bootstrapping drift on {device()}"
+    try:
+        # mako: a click invokes "default"; a touch only dismisses (mako's
+        # on-touch), which is why the bar icon is the touch path.
+        r = subprocess.run(["notify-send", "-u", "normal" if test else "critical",
+                            "-a", "local-bootstrapping", "-A", "default=Open agent",
+                            summary, body], capture_output=True, text=True, timeout=6 * 3600)
+    except (subprocess.SubprocessError, OSError):
+        return 0
+    if r.stdout.strip() == "default" and not test:
+        return cmd_open([])
+    return 0
+
+
+def summary_lines(st):
+    vs = visible_state(st)
+    if vs == "none":
+        last = st.get("last_run")
+        return ["In sync with the repo." + (f" Last check {iso(last)}." if last else "")]
+    out = []
+    head = {"pending": "Drift found; the sync keeps trying (grace period).",
+            "due": "Drift persisted past the grace period; an agent opens on the next run.",
+            "escalated": "Drift persisted; a Claude agent was opened for it.",
+            "agent": "A Claude agent is working on this drift now."}[vs]
+    out.append(head)
+    out.append(f"Since {iso(st['first_seen'])}, {st['runs']} run(s), fingerprint {st['fingerprint']}.")
+    for i in st["items"][:8]:
+        out.append(f"• [{i['kind']}] {i['key']}")
+    if len(st["items"]) > 8:
+        out.append(f"• … and {len(st['items']) - 8} more")
+    out.append(f"Report: {REPORT_MD}")
+    return out
+
+
+def cmd_status(argv):
+    print("\n".join(summary_lines(load(DRIFT, {}))))
+    return 0
+
+
+def cmd_waybar(argv):
+    st = load(DRIFT, {})
+    vs = visible_state(st)
+    if vs in ("none", "pending"):
+        # hidden: pending drift is still inside its grace period
+        print(json.dumps({"text": "", "class": vs, "tooltip": ""}))
+        return 0
+    tip = "local-bootstrapping drift\n" + "\n".join(summary_lines(st)) + "\nTap: open the agent"
+    print(json.dumps({"text": ICON, "class": vs, "tooltip": tip}))
+    return 0
+
+
+COMMANDS = {"record": cmd_record, "escalate": cmd_escalate, "open": cmd_open,
+            "status": cmd_status, "waybar": cmd_waybar, "agent-run": cmd_agent_run,
+            "notify-wait": cmd_notify_wait}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        print(__doc__)
+        return 2
+    return COMMANDS[sys.argv[1]](sys.argv[2:]) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

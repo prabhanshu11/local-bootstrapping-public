@@ -1,0 +1,11 @@
+[Unit]
+Description=One-off review, Sunday 2026-11-08 11:00 IST (a week after the 11-01 btrfs quota fix)
+
+[Timer]
+OnCalendar=2026-11-08 11:00:00 Asia/Kolkata
+# Laptop off or asleep at 11:00 -> runs at the next boot/resume. The script
+# itself refuses to run twice (done marker), so this fires once.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

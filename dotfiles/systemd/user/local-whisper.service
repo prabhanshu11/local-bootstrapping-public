@@ -1,0 +1,37 @@
+[Unit]
+Description=Local Whisper Transcription Server (offline fallback)
+Documentation=file://%h/Programs/omarchy-voice-typing/local-whisper/BENCHMARKS.md
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/Programs/omarchy-voice-typing/local-whisper/.venv/bin/python \
+    %h/Programs/omarchy-voice-typing/local-whisper/server.py
+# Hybrid (2026-11-03, his choice): recordings under 25 s -> base on the CPU (~1 s for a 10 s
+# clip; as fast as on the MX330, and it leaves the GPU free); 25 s and longer -> distil-large-v3
+# on the MX330 GPU, whole, after Stop (~21 s per 30 s window, more accurate). distil runs in a
+# child process loaded only while the popup's Source is Local (stt-provider "offline"), so
+# while the source is Deepgram the GPU holds nothing. If distil is not ready, base takes the
+# long ones too. The desktop overrides all of this in its drop-in.
+Environment=WHISPER_MODEL=base
+Environment=WHISPER_DEVICE=cpu
+Environment=WHISPER_COMPUTE=int8
+Environment=WHISPER_CPU_THREADS=4
+Environment=WHISPER_LONG_MODEL=distil-large-v3
+Environment=WHISPER_LONG_DEVICE=cuda
+Environment=WHISPER_LONG_COMPUTE=int8_float32
+Environment=WHISPER_LONG_AFTER_S=25
+Environment=WHISPER_LONG_WHEN=offline
+Environment=WHISPER_PORT=8767
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=10
+WorkingDirectory=%h/Programs/omarchy-voice-typing/local-whisper
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=local-whisper
+
+[Install]
+WantedBy=default.target

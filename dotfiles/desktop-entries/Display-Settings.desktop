@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Display Settings
+Exec=nwg-displays
+Icon=preferences-desktop-display
+Type=Application
+Terminal=false

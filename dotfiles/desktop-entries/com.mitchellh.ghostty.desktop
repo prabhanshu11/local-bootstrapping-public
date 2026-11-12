@@ -1,0 +1,29 @@
+# Local override of /usr/share/applications/com.mitchellh.ghostty.desktop (same ID, so it wins).
+# Only Exec/TryExec differ: they go through dotfiles/local-bin/ghostty-launch (hung-instance fallback).
+# Re-diff against the system file after a Ghostty upgrade.
+[Desktop Entry]
+Version=1.0
+Name=Ghostty
+Type=Application
+Comment=A terminal emulator
+TryExec=/home/prabhanshu/.local/bin/ghostty-launch
+Exec=/home/prabhanshu/.local/bin/ghostty-launch
+Icon=com.mitchellh.ghostty
+Categories=System;TerminalEmulator;
+Keywords=terminal;tty;pty;
+StartupNotify=true
+StartupWMClass=com.mitchellh.ghostty
+Terminal=false
+Actions=new-window;
+X-GNOME-UsesNotifications=true
+X-TerminalArgExec=-e
+X-TerminalArgTitle=--title=
+X-TerminalArgAppId=--class=
+X-TerminalArgDir=--working-directory=
+X-TerminalArgHold=--wait-after-command
+DBusActivatable=true
+X-KDE-Shortcuts=Ctrl+Alt+T
+
+[Desktop Action new-window]
+Name=New Window
+Exec=/home/prabhanshu/.local/bin/ghostty-launch

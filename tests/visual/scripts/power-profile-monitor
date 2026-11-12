@@ -1,0 +1,613 @@
+#!/bin/bash
+# power-profile-monitor - Auto-switch power profiles + waybar indicator
+#
+# Usage:
+#   power-profile-monitor status   # JSON output for waybar
+#   power-profile-monitor switch   # Set profile based on AC/battery state
+#   power-profile-monitor toggle   # Manually cycle through profiles
+#   power-profile-monitor watchdog # Log CPU clamp telemetry, heal a stuck clamp
+#
+# The watchdog exists because the CPU intermittently gets pinned to ~0.4-0.9 GHz
+# while the widget still reads BAL/PRF — everything goes janky until the profile
+# is manually cycled. Nothing here writes frequency caps; the suspicion is the
+# ThinkPad EC/firmware clamping HWP, and any profile change makes PPD rewrite
+# platform_profile, which appears to release it. See
+# docs/issues/cpu-clamp-watchdog.md.
+
+set -euo pipefail
+
+# Override file: when user manually toggles, skip auto-switch until next AC change
+OVERRIDE_FILE="/tmp/power-profile-override"
+
+# --- watchdog knobs (env overrides exist only to exercise branches by hand) ---
+LOG_FILE="${PPM_LOG_FILE:-$HOME/logs/power-profile-watchdog.log}"
+STATE_DIR="${PPM_STATE_DIR:-$HOME/.local/state/power-profile-watchdog}"
+NO_HEAL_FLAG="${PPM_NO_HEAL_FLAG:-$HOME/.config/power-profile-monitor/no-heal}"
+CLAMPED_FLAG="/tmp/power-profile-clamped"
+# highest_perf reads 49 (≈4.9 GHz) when healthy; the reported glitch band is 4-9.
+# 20 sits far from both. guaranteed_perf is 8 even when healthy — never trigger on it.
+CLAMP_THRESHOLD="${PPM_CLAMP_THRESHOLD:-20}"
+CLAMP_MAX_FREQ_KHZ="${PPM_CLAMP_MAX_FREQ:-2000000}"
+# Third signal: every core stuck below 1.2 GHz while the CPU is genuinely busy.
+# The reported glitch band is 0.4-0.9 GHz; a healthy loaded machine here sits at
+# 1.8 GHz or above.
+CLAMP_CUR_KHZ="${PPM_CLAMP_CUR_KHZ:-1200000}"
+# Busy% from /proc/stat, NOT loadavg. loadavg counts uninterruptible I/O waits,
+# so heavy disk work would otherwise look like CPU demand while the CPU is
+# correctly idling at 400 MHz — a false clamp.
+CLAMP_MIN_BUSY="${PPM_CLAMP_MIN_BUSY:-40}"
+# On a confirmed clamp, watch this long WITHOUT intervening before healing.
+# Without it a 6s heal proves nothing: we cannot tell a real stall from a blip,
+# and we never learn whether it would have cleared on its own.
+OBSERVE_SECONDS="${PPM_OBSERVE_SECONDS:-30}"
+MAX_HEALS_PER_HOUR="${PPM_MAX_HEALS_PER_HOUR:-4}"
+LOG_MAX_BYTES="${PPM_LOG_MAX_BYTES:-5242880}"
+CPUFREQ_DIR="/sys/devices/system/cpu/cpu0/cpufreq"
+CPPC_DIR="/sys/devices/system/cpu/cpu0/acpi_cppc"
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    printf '%s' "$s"
+}
+
+emit_json() {
+    local text="$1" class="$2" tooltip="$3"
+    tooltip=$(json_escape "$tooltip")
+    printf '{"text":"%s","class":"%s","tooltip":"%s"}\n' "$text" "$class" "$tooltip"
+}
+
+get_ac_status() {
+    local ac_file="/sys/class/power_supply/AC/online"
+    if [[ -f "$ac_file" ]]; then
+        cat "$ac_file"
+    else
+        echo "0"
+    fi
+}
+
+get_battery_pct() {
+    local bat_file="/sys/class/power_supply/BAT0/capacity"
+    if [[ -f "$bat_file" ]]; then
+        cat "$bat_file"
+    else
+        echo "100"
+    fi
+}
+
+get_current_profile() {
+    # Use busctl directly (powerprofilesctl is a Python script that breaks on Python upgrades)
+    local raw
+    raw=$(busctl get-property net.hadess.PowerProfiles /net/hadess/PowerProfiles net.hadess.PowerProfiles ActiveProfile 2>/dev/null) || { echo "unknown"; return; }
+    # Output is like: s "power-saver"
+    echo "$raw" | sed 's/^s "\(.*\)"$/\1/'
+}
+
+set_profile() {
+    busctl set-property net.hadess.PowerProfiles /net/hadess/PowerProfiles net.hadess.PowerProfiles ActiveProfile s "$1"
+}
+
+# ============================================================================
+# Telemetry helpers (watchdog)
+# ============================================================================
+
+# Every sysfs path below is optional on some machines; never let a missing file
+# kill the run under `set -e`.
+safe_read() {
+    if [[ -r "$1" ]]; then
+        cat "$1" 2>/dev/null || echo "NA"
+    else
+        echo "NA"
+    fi
+}
+
+# Highest sustained ratio the platform currently allows. This is the clamp
+# signal: it drops when the EC/firmware pins the CPU low.
+get_highest_perf() {
+    safe_read "$CPPC_DIR/highest_perf"
+}
+
+# Fastest core right now. Purely context for reading the log — a low value at
+# idle is normal, so this must never gate detection.
+get_max_cur_khz() {
+    local max=0 v f
+    for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq; do
+        [[ -r "$f" ]] || continue
+        v=$(cat "$f" 2>/dev/null) || continue
+        [[ "$v" =~ ^[0-9]+$ ]] || continue
+        if (( v > max )); then max="$v"; fi
+    done
+    echo "$max"
+}
+
+# Real CPU utilisation over 1s, iowait counted as IDLE (it is — the CPU is not
+# working during it). This is the honest answer to "was the machine actually
+# asking for speed?", which loadavg cannot give.
+# Measured once per sample into a global, deliberately NOT inside a command
+# substitution: a subshell assignment would be discarded, and the detector and
+# the logged row would then each report a different 1s window, which makes the
+# log self-contradictory exactly where it matters most.
+BUSY_PCT="NA"
+measure_busy() {
+    local a b
+    a=$(grep -m1 '^cpu ' /proc/stat 2>/dev/null) || { BUSY_PCT=0; return 0; }
+    sleep 1
+    b=$(grep -m1 '^cpu ' /proc/stat 2>/dev/null) || { BUSY_PCT=0; return 0; }
+    BUSY_PCT=$(awk -v A="$a" -v B="$b" 'BEGIN {
+        na = split(A, x, " "); nb = split(B, y, " ")
+        ta = 0; for (i = 2; i <= na; i++) ta += x[i]
+        tb = 0; for (i = 2; i <= nb; i++) tb += y[i]
+        ia = x[5] + x[6]; ib = y[5] + y[6]   # idle + iowait: neither is work
+        dt = tb - ta; di = ib - ia
+        if (dt <= 0) { print 0; exit }
+        printf "%d", (dt - di) * 100 / dt
+    }')
+}
+
+get_busy_pct() { echo "$BUSY_PCT"; }
+
+# RAPL package power limit in watts. A firmware/EC drop here would pin every
+# core at the floor while leaving every cpufreq knob reading "full speed" —
+# the leading hypothesis for what the 15:43 incident actually was.
+get_rapl_w() {
+    local v
+    v=$(safe_read "/sys/class/powercap/intel-rapl:0/constraint_${1}_power_limit_uw")
+    if [[ "$v" =~ ^[0-9]+$ ]]; then
+        echo $(( v / 1000000 ))
+    else
+        echo "NA"
+    fi
+}
+
+get_psys_w() {
+    local d v
+    for d in /sys/class/powercap/intel-rapl:*/; do
+        [[ -r "$d/name" ]] || continue
+        if [[ "$(cat "$d/name" 2>/dev/null)" == "psys" ]]; then
+            v=$(safe_read "${d}constraint_0_power_limit_uw")
+            if [[ "$v" =~ ^[0-9]+$ ]]; then echo $(( v / 1000000 )); return 0; fi
+        fi
+    done
+    echo "NA"
+}
+
+# USB-C power delivery. The EC clamping the CPU after a PD renegotiation is a
+# known ThinkPad behaviour, so record what the charger is offering.
+get_pd_state() {
+    local p online="0" cur="0"
+    for p in /sys/class/power_supply/ucsi*; do
+        [[ -d "$p" ]] || continue
+        if [[ "$(safe_read "$p/online")" == "1" ]]; then
+            online="1"
+            cur=$(safe_read "$p/current_max")
+            [[ "$cur" =~ ^[0-9]+$ ]] && cur=$(( cur / 1000 )) || cur="NA"
+            break
+        fi
+    done
+    echo "${online}|${cur}"
+}
+
+get_max_temp_c() {
+    local max=0 v f
+    for f in /sys/class/thermal/thermal_zone*/temp; do
+        [[ -r "$f" ]] || continue
+        v=$(cat "$f" 2>/dev/null) || continue
+        [[ "$v" =~ ^[0-9]+$ ]] || continue
+        if (( v > max )); then max="$v"; fi
+    done
+    echo $(( max / 1000 ))
+}
+
+# "state|source" — state is playing/paused/none (paused = tab open, audio corked),
+# source is youtube/hotstar/other. The clamp reportedly hits during browser video,
+# so every sample records what was on.
+get_video_state() {
+    local out state="none" src="none" cur_corked="" line
+    out=$(pactl list sink-inputs 2>/dev/null) || out=""
+    if [[ -z "$out" ]]; then
+        echo "none|none"
+        return
+    fi
+
+    while IFS= read -r line; do
+        case "$line" in
+            *"Corked: no"*)  cur_corked="no" ;;
+            *"Corked: yes"*) cur_corked="yes" ;;
+            *media.name*)
+                local this_src="other"
+                case "$line" in
+                    *YouTube*|*youtube*)                  this_src="youtube" ;;
+                    *Hotstar*|*hotstar*|*JioCinema*)      this_src="hotstar" ;;
+                esac
+                if [[ "$cur_corked" == "no" ]]; then
+                    state="playing"
+                    src="$this_src"
+                elif [[ "$state" != "playing" ]]; then
+                    state="paused"
+                    if [[ "$src" == "none" ]]; then src="$this_src"; fi
+                fi
+                ;;
+        esac
+    done <<< "$out"
+
+    echo "${state}|${src}"
+}
+
+CSV_HEADER="# ts,event,profile,platform_profile,highest_perf,guaranteed_perf,scaling_max_khz,max_cur_khz,busy_pct,loadavg,pl1_w,psys_w,pd_online,pd_cur_ma,lapmode,ac,pkg_throttle,max_temp_c,video,video_src"
+
+rotate_log() {
+    mkdir -p "$(dirname "$LOG_FILE")"
+    if [[ -f "$LOG_FILE" ]]; then
+        local size
+        size=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+        # Also rotate when the schema changed, so no single file mixes row
+        # shapes and every file can be parsed by its own header.
+        local head_line
+        head_line=$(head -1 "$LOG_FILE" 2>/dev/null || echo "")
+        if (( size > LOG_MAX_BYTES )) || [[ "$head_line" != "$CSV_HEADER" ]]; then
+            mv -f "$LOG_FILE" "${LOG_FILE}.1"
+        fi
+    fi
+    if [[ ! -f "$LOG_FILE" ]]; then
+        echo "$CSV_HEADER" >> "$LOG_FILE"
+    fi
+}
+
+# One CSV row. $1 is the event tag (SAMPLE / CLAMPED / HEAL-* / TOGGLE:old>new).
+log_csv() {
+    local event="$1" video pd
+    video=$(get_video_state)
+    pd=$(get_pd_state)
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$(date -Iseconds)" \
+        "$event" \
+        "$(get_current_profile)" \
+        "$(safe_read /sys/firmware/acpi/platform_profile)" \
+        "$(get_highest_perf)" \
+        "$(safe_read "$CPPC_DIR/guaranteed_perf")" \
+        "$(safe_read "$CPUFREQ_DIR/scaling_max_freq")" \
+        "$(get_max_cur_khz)" \
+        "$(get_busy_pct)" \
+        "$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo NA)" \
+        "$(get_rapl_w 0)" \
+        "$(get_psys_w)" \
+        "${pd%%|*}" \
+        "${pd##*|}" \
+        "$(safe_read /sys/bus/platform/devices/thinkpad_acpi/dytc_lapmode)" \
+        "$(get_ac_status)" \
+        "$(safe_read /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count)" \
+        "$(get_max_temp_c)" \
+        "${video%%|*}" \
+        "${video##*|}" \
+        >> "$LOG_FILE"
+}
+
+# Everything that might explain the clamp, dumped once per incident. Comment
+# lines so the CSV rows stay machine-readable.
+log_snapshot() {
+    local reason="$1" f
+    {
+        echo "# ===== SNAPSHOT ($reason) $(date -Iseconds) ====="
+        echo "# profile=$(get_current_profile) platform_profile=$(safe_read /sys/firmware/acpi/platform_profile)"
+        echo "# override_file=$( [[ -f "$OVERRIDE_FILE" ]] && cat "$OVERRIDE_FILE" || echo none )"
+        echo "# governor=$(safe_read "$CPUFREQ_DIR/scaling_governor") epp=$(safe_read "$CPUFREQ_DIR/energy_performance_preference")"
+        for f in highest_perf guaranteed_perf nominal_perf lowest_perf lowest_nonlinear_perf reference_perf; do
+            echo "# cppc.$f=$(safe_read "$CPPC_DIR/$f")"
+        done
+        for f in max_perf_pct min_perf_pct no_turbo status; do
+            echo "# pstate.$f=$(safe_read "/sys/devices/system/cpu/intel_pstate/$f")"
+        done
+        echo "# scaling_max_khz=$(safe_read "$CPUFREQ_DIR/scaling_max_freq") cpuinfo_max_khz=$(safe_read "$CPUFREQ_DIR/cpuinfo_max_freq")"
+        echo "# cur_khz_all=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | tr '\n' ' ')"
+        echo "# throttle core=$(safe_read /sys/devices/system/cpu/cpu0/thermal_throttle/core_throttle_count) pkg=$(safe_read /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count)"
+        echo "# temps_mC=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | tr '\n' ' ')"
+        echo "# lapmode=$(safe_read /sys/bus/platform/devices/thinkpad_acpi/dytc_lapmode) ac=$(get_ac_status) battery=$(get_battery_pct)"
+        echo "# ppd_degraded=$(busctl get-property net.hadess.PowerProfiles /net/hadess/PowerProfiles net.hadess.PowerProfiles PerformanceDegraded 2>/dev/null || echo NA)"
+        echo "# audio_streams:"
+        pactl list sink-inputs 2>/dev/null | grep -E "Corked:|media.name" | sed 's/^/#   /' || echo "#   none"
+        echo "# ===== END SNAPSHOT ====="
+    } >> "$LOG_FILE" 2>&1
+}
+
+signal_waybar() {
+    pkill -RTMIN+10 waybar 2>/dev/null || true
+}
+
+determine_profile() {
+    local ac battery
+    ac=$(get_ac_status)
+    battery=$(get_battery_pct)
+
+    if [[ "$ac" == "1" ]]; then
+        echo "performance"
+    elif [[ "$battery" -gt 50 ]]; then
+        echo "balanced"
+    else
+        echo "power-saver"
+    fi
+}
+
+# ============================================================================
+# Commands
+# ============================================================================
+
+do_switch() {
+    local target current
+    target=$(determine_profile)
+    current=$(get_current_profile)
+
+    # Clear override on AC change (udev triggers this)
+    if [[ "${POWER_SUPPLY_TRIGGER:-}" == "1" ]]; then
+        rm -f "$OVERRIDE_FILE"
+    fi
+
+    # Respect manual override
+    if [[ -f "$OVERRIDE_FILE" ]]; then
+        return 0
+    fi
+
+    if [[ "$target" != "$current" ]]; then
+        set_profile "$target"
+    fi
+}
+
+do_toggle() {
+    local current next
+    current=$(get_current_profile)
+
+    case "$current" in
+        performance) next="balanced" ;;
+        balanced)    next="power-saver" ;;
+        *)           next="performance" ;;
+    esac
+
+    set_profile "$next"
+    # Mark as manual override
+    echo "$next" > "$OVERRIDE_FILE"
+
+    # Record the click. Manual cycles are how the clamp gets fixed today, so
+    # these rows mark the incidents in the log.
+    rotate_log
+    log_csv "TOGGLE:${current}>${next}" || true
+
+    # The user's own fix also clears the clamp, so stop flagging it.
+    if [[ -f "$CLAMPED_FLAG" ]]; then
+        rm -f "$CLAMPED_FLAG"
+    fi
+}
+
+# ============================================================================
+# Watchdog
+# ============================================================================
+
+# Echoes why the CPU looks clamped, or nothing when it looks fine. Only
+# balanced/performance are judged — a low ceiling is the whole point of
+# power-saver.
+#
+# Three independent signals, because the clamp may or may not be visible in the
+# advertised caps. Measured on this machine 2026-08-01: every core sat at exactly
+# 1.80 GHz under load 5.2 while highest_perf still read 49 and scaling_max_freq
+# still read 4.9 GHz — i.e. the caps can lie. So actual frequency under real
+# demand is checked too, and that is the signal most likely to catch the
+# reported 0.4-0.9 GHz incidents.
+clamp_reason() {
+    local profile highest smax cur busy
+    profile=$(get_current_profile)
+    case "$profile" in
+        balanced|performance) ;;
+        *) return 0 ;;
+    esac
+
+    highest=$(get_highest_perf)
+    if [[ "$highest" =~ ^[0-9]+$ ]] && (( highest < CLAMP_THRESHOLD )); then
+        echo "cppc_highest=${highest}"
+        return 0
+    fi
+
+    smax=$(safe_read "$CPUFREQ_DIR/scaling_max_freq")
+    if [[ "$smax" =~ ^[0-9]+$ ]] && (( smax < CLAMP_MAX_FREQ_KHZ )); then
+        echo "scaling_max=${smax}"
+        return 0
+    fi
+
+    # Pinned low while the CPU is genuinely working. The busy gate is what keeps
+    # an idle desktop — or one merely blocked on disk — from looking clamped.
+    cur=$(get_max_cur_khz)
+    if (( cur > 0 && cur < CLAMP_CUR_KHZ )); then
+        busy=$(get_busy_pct)
+        [[ "$busy" =~ ^[0-9]+$ ]] || busy=0
+        if (( busy >= CLAMP_MIN_BUSY )); then
+            echo "pinned_low cur=${cur} busy=${busy}%"
+            return 0
+        fi
+    fi
+
+    return 0
+}
+
+is_clamped() {
+    local reason
+    reason=$(clamp_reason)
+    [[ -n "$reason" ]]
+}
+
+# Heals in the last hour, pruned in place.
+recent_heal_count() {
+    local heal_log="$STATE_DIR/heals" now cutoff kept=0 ts
+    now=$(date +%s)
+    cutoff=$(( now - 3600 ))
+    [[ -f "$heal_log" ]] || { echo 0; return; }
+
+    local tmp="${heal_log}.tmp"
+    : > "$tmp"
+    while IFS= read -r ts; do
+        [[ "$ts" =~ ^[0-9]+$ ]] || continue
+        if (( ts > cutoff )); then
+            echo "$ts" >> "$tmp"
+            kept=$(( kept + 1 ))
+        fi
+    done < "$heal_log"
+    mv -f "$tmp" "$heal_log"
+    echo "$kept"
+}
+
+# The manual fix, automated: PPD no-ops a same-value write, so bounce through a
+# different profile to force the platform_profile rewrite, then land back on
+# whatever the user had. The override file is deliberately untouched.
+do_heal() {
+    local orig bounce
+    orig=$(get_current_profile)
+    if [[ "$orig" == "power-saver" ]]; then
+        bounce="balanced"
+    else
+        bounce="power-saver"
+    fi
+
+    date +%s >> "$STATE_DIR/heals"
+
+    set_profile "$bounce" || true
+    sleep 1
+    set_profile "$orig" || true
+    sleep 3
+
+    local still
+    measure_busy
+    still=$(clamp_reason)
+    if [[ -n "$still" ]]; then
+        log_csv "HEAL-FAILED:${orig}[${still}]"
+        touch "$CLAMPED_FLAG"
+        signal_waybar
+    else
+        log_csv "HEAL-RECOVERED:${orig}"
+        if [[ -f "$CLAMPED_FLAG" ]]; then
+            rm -f "$CLAMPED_FLAG"
+            signal_waybar
+        fi
+    fi
+}
+
+do_watchdog() {
+    mkdir -p "$STATE_DIR"
+    rotate_log
+
+    local reason
+    measure_busy
+    reason=$(clamp_reason)
+    if [[ -z "$reason" ]]; then
+        log_csv "SAMPLE"
+        # Healthy again after a failed heal — clear the widget warning.
+        if [[ -f "$CLAMPED_FLAG" ]]; then
+            rm -f "$CLAMPED_FLAG"
+            signal_waybar
+        fi
+        return 0
+    fi
+
+    # Debounce: one low read during a profile transition is not an incident.
+    sleep 5
+    local reason2
+    measure_busy
+    reason2=$(clamp_reason)
+    if [[ -z "$reason2" ]]; then
+        log_csv "CLAMP-TRANSIENT[${reason}]"
+        return 0
+    fi
+
+    log_csv "CLAMPED[${reason2}]"
+    log_snapshot "clamp detected: $reason2"
+
+    # Hold and watch before touching anything. Two things this buys that an
+    # immediate heal cannot: proof the stall is sustained rather than a blip,
+    # and a control — if it clears by itself here, the heal was never the cause
+    # of any recovery we have credited it with.
+    local observe_end elapsed hold_reason
+    observe_end=$(( $(date +%s) + OBSERVE_SECONDS ))
+    while (( $(date +%s) < observe_end )); do
+        sleep 2
+        measure_busy
+        hold_reason=$(clamp_reason)
+        elapsed=$(( OBSERVE_SECONDS - (observe_end - $(date +%s)) ))
+        if [[ -z "$hold_reason" ]]; then
+            log_csv "SELF-RECOVERED-after-${elapsed}s"
+            return 0
+        fi
+        log_csv "CLAMP-HOLD-${elapsed}s[${hold_reason}]"
+    done
+
+    log_snapshot "still clamped after ${OBSERVE_SECONDS}s — healing now"
+
+    if [[ -f "$NO_HEAL_FLAG" ]]; then
+        log_csv "HEAL-DISABLED"
+        return 0
+    fi
+
+    local heals
+    heals=$(recent_heal_count)
+    if (( heals >= MAX_HEALS_PER_HOUR )); then
+        log_csv "HEAL-SUPPRESSED:${heals}in1h"
+        notify-send -u critical "CPU clamp" \
+            "Clamped again (${heals} heals in the last hour). Not healing; still logging." 2>/dev/null || true
+        return 0
+    fi
+
+    do_heal
+}
+
+do_status() {
+    local profile ac battery text class tooltip ac_label
+
+    profile=$(get_current_profile)
+    ac=$(get_ac_status)
+    battery=$(get_battery_pct)
+
+    if [[ "$ac" == "1" ]]; then
+        ac_label="Plugged In"
+    else
+        ac_label="On Battery"
+    fi
+
+    case "$profile" in
+        performance) text="PRF"; class="performance" ;;
+        balanced)    text="BAL"; class="balanced" ;;
+        power-saver) text="SAV"; class="power-saver" ;;
+        *)           text="???"; class="unknown" ;;
+    esac
+
+    local override_note=""
+    if [[ -f "$OVERRIDE_FILE" ]]; then
+        override_note="\nManual override active"
+    fi
+
+    # Watchdog found the CPU clamped and could not release it. Keep the PRF/BAL/SAV
+    # text (visual tests assert on it) and signal through colour instead.
+    local clamp_note=""
+    if [[ -f "$CLAMPED_FLAG" ]]; then
+        class="clamped"
+        clamp_note="\n⚠ CPU CLAMPED — auto-heal did not release it"
+    fi
+
+    tooltip="Power: ${profile^}\nAC: $ac_label\nBattery: ${battery}%${override_note}${clamp_note}\n\nLeft-click: Cycle profiles"
+
+    emit_json "$text" "$class" "$tooltip"
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+case "${1:-status}" in
+    status)   do_status ;;
+    switch)   do_switch ;;
+    toggle)   do_toggle ;;
+    watchdog) do_watchdog ;;
+    *)
+        echo "Usage: power-profile-monitor {status|switch|toggle|watchdog}"
+        exit 1
+        ;;
+esac

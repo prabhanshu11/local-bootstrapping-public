@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# ghostty-launch — what Super+Enter (xdg-terminal-exec) and the app launcher run
+# instead of /usr/bin/ghostty, via dotfiles/desktop-entries/com.mitchellh.ghostty.desktop.
+#
+# Normally every new window is a D-Bus hand-off to the one running Ghostty
+# process (fast, shared). On 2026-10-01 that process deadlocked its GTK main
+# loop: hand-offs never returned, no window could be opened or closed, and the
+# Claude agents that spawn terminals hung with them. This wrapper keeps the
+# hand-off as the default but bounds it: if a single-instance owner exists and
+# the hand-off does not come back within HANDOFF_TIMEOUT seconds (default 10), open a
+# standalone process instead and say so. A healthy hand-off takes ~0.1 s.
+#
+# `-e CMD` is passed straight through: Ghostty runs those as a standalone
+# process whose lifetime is the command's, so a timeout would kill the command.
+set -u
+# A terminal is an interactive TTY, never a headless child of the Claude agent
+# that opened it. If that agent's Bash env leaks in, every `claude` started in
+# the window inherits CLAUDE_CODE_CHILD_SESSION=1 and silently stops saving its
+# transcript ("Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION
+# marker", 2026-10-01: two --resume windows lost 50 min of history this way).
+unset CLAUDE_CODE_CHILD_SESSION
+HANDOFF_TIMEOUT="${GHOSTTY_HANDOFF_TIMEOUT:-10}"
+
+for arg in "$@"; do
+  [ "$arg" = "-e" ] && exec ghostty --gtk-single-instance=true "$@"
+done
+
+has_owner() {
+  [ "$(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus NameHasOwner s com.mitchellh.ghostty 2>/dev/null)" = "b true" ]
+}
+
+has_owner || exec ghostty --gtk-single-instance=true "$@"
+
+timeout "$HANDOFF_TIMEOUT" ghostty --gtk-single-instance=true "$@"
+rc=$?
+[ "$rc" -ne 124 ] && exit "$rc"
+
+owner=$(busctl --user --no-pager --no-legend list 2>/dev/null | awk '$1=="com.mitchellh.ghostty"{print $2}')
+notify-send -u critical -a ghostty-launch "Ghostty's main process (pid ${owner:-?}) is unresponsive" \
+  "It did not answer the new-window request within ${HANDOFF_TIMEOUT}s, so this terminal was opened as a separate process. Kill pid ${owner:-?} to recover its windows."
+exec ghostty --gtk-single-instance=false "$@"

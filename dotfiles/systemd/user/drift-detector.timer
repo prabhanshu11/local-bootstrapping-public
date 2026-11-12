@@ -1,0 +1,15 @@
+[Unit]
+Description=Run drift detector hourly
+Documentation=https://github.com/prabhanshu11/local-bootstrapping
+
+[Timer]
+# Run every hour
+OnCalendar=hourly
+# Also run 1 minute after boot
+OnBootSec=1min
+# Randomize slightly to avoid all machines checking at exact same time
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

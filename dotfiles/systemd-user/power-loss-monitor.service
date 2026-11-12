@@ -1,0 +1,12 @@
+[Unit]
+Description=Detect power loss vs clean shutdown at boot
+
+[Service]
+Type=oneshot
+# Give journald 5s to flush corruption warnings before we query
+ExecStartPre=/bin/sleep 5
+ExecStart=%h/.local/bin/power-loss-monitor detect
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target

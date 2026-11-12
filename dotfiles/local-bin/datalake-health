@@ -1,0 +1,50 @@
+#!/bin/bash
+# Datalake health check for waybar
+# Outputs JSON with stats from local database and server status
+
+LOCAL_DB="$HOME/Programs/datalake/datalake.db"
+
+# JSON escaping helper
+json_escape() {
+    python3 -c "import json, sys; print(json.dumps(sys.stdin.read()), end='')" <<< "$1"
+}
+
+# Emit JSON for waybar
+emit_json() {
+    local text="$1" class="$2" tooltip="$3"
+    tooltip=$(echo "$tooltip" | tr '\n' ' ')  # Flatten newlines for JSON
+    printf '{"text":"%s","class":"%s","tooltip":"%s"}\n' "$text" "$class" "$tooltip"
+}
+
+# Check if local web server is running
+if curl -s http://localhost:5050 >/dev/null 2>&1; then
+    server_status="Online"
+    class="ok"
+else
+    server_status="Offline"
+    class="error"
+fi
+
+# Get stats from local DB
+if [[ -f "$LOCAL_DB" ]]; then
+    stats=$(sqlite3 "$LOCAL_DB" "
+        SELECT
+            (SELECT COUNT(*) FROM claude_sessions) as sessions,
+            (SELECT COUNT(*) FROM claude_messages) as messages,
+            (SELECT COUNT(*) FROM chatgpt_conversations) as chatgpt
+    " 2>/dev/null)
+
+    if [[ -n "$stats" ]]; then
+        sessions=$(echo "$stats" | cut -d'|' -f1)
+        messages=$(echo "$stats" | cut -d'|' -f2)
+        chatgpt=$(echo "$stats" | cut -d'|' -f3)
+        db_size=$(du -h "$LOCAL_DB" 2>/dev/null | cut -f1)
+
+        tooltip="Claude: $sessions sessions, $messages msgs\nChatGPT: $chatgpt convos\nDB: $db_size\nServer: $server_status"
+        emit_json "🗄️" "$class" "$tooltip"
+    else
+        emit_json "🗄️" "warning" "Database query failed"
+    fi
+else
+    emit_json "🗄️" "warning" "No database found"
+fi

@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+"""
+battery-info — everything worth knowing about the laptop battery, in one place.
+
+The bar's battery icon (custom/battery), its hover tooltip and the battery
+panel that a tap opens (bar-touch) all read from here, so they never disagree.
+
+Why not waybar's built-in battery module (replaced 2026-09-30): it only knows
+power_now, and this ThinkPad's EC reports power_now = 0 whenever the status is
+"Not charging" — including when the laptop is plugged into a charger too weak
+to keep up and is quietly draining (how it died ON the charger on 2026-09-18).
+Here the real net flow comes from energy_now sampled over time, and the icon
+turns amber when a plugged-in laptop is losing charge.
+
+Sources
+  /sys/class/power_supply/BAT0          level, energy, health, cycles, limits
+  /sys/class/power_supply/ucsi-*, AC    charger: online, USB-C PD volts x amps
+  UPower GetHistory (D-Bus, ~10 ms)     charge history for the chart/sparkline
+  $XDG_RUNTIME_DIR/battery-info.samples our own energy_now samples (net rate)
+  battery-guard + its state file        suspend limits, AC-drain mode
+
+Usage
+  battery-info waybar          # JSON for custom/battery: icon, class, tooltip
+  battery-info json [SPAN_S]   # everything, for the bar-touch battery panel
+  battery-info text            # the tooltip as plain text, for a terminal
+"""
+
+import fcntl
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+BAT = os.environ.get("BATTERY_INFO_BAT", "/sys/class/power_supply/BAT0")   # env: tests
+PSU = "/sys/class/power_supply"
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+SAMPLES = os.path.join(RUNTIME, "battery-info.samples")
+GUARD_BIN = os.path.expanduser("~/.local/bin/battery-guard")
+GUARD_CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+                          "battery-guard.conf")
+GUARD_STATE = os.path.join(RUNTIME, "battery-guard.state")
+# 2026-10-06, his words: "since The battery is old and it falls immediately
+# after 4%. We need to assume that 4% is the new zero." Forecasts end there.
+EMPTY_PCT = 4
+SLEEP_LAST = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+                          "sleep-verified", "last.json")
+
+SAMPLE_EVERY = 20        # s between stored samples
+SAMPLE_KEEP = 6 * 3600   # s of samples kept
+RATE_WINDOW = 600        # s: the net rate is a fit over the last 10 minutes
+RATE_MIN_SPAN = 150      # s of samples needed before the fit is trusted
+STEADY_W = 0.4           # |net W| below this = holding steady
+
+# nf-md battery glyphs: level 10..100, and the same with a bolt while charging
+LEVEL = ["\U000f007a", "\U000f007b", "\U000f007c", "\U000f007d", "\U000f007e",
+         "\U000f007f", "\U000f0080", "\U000f0081", "\U000f0082", "\U000f0079"]
+CHARGING = ["\U000f089c", "\U000f0086", "\U000f0087", "\U000f0088", "\U000f089d",
+            "\U000f0089", "\U000f089e", "\U000f008a", "\U000f008b", "\U000f0085"]
+UNKNOWN = "\U000f0091"   # battery-unknown
+UPOWER_STATE = {1: "charging", 2: "discharging", 3: "empty", 4: "full", 5: "plugged", 6: "plugged"}
+
+
+# ─────────────────────────────── reading ───────────────────────────────
+
+def rd(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def num(path, scale=1.0, default=None):
+    v = rd(path)
+    try:
+        return float(v) / scale
+    except (TypeError, ValueError):
+        return default
+
+
+def milli(path):
+    """PD capability files read like "20000mV" / "3250mA" / "45000mW": the
+    number in base units (V, A, W), or None."""
+    m = re.match(r"\s*(\d+)", rd(path, "") or "")
+    return int(m.group(1)) / 1000 if m else None
+
+
+def battery():
+    b = {"present": rd(f"{BAT}/present") == "1"}
+    b["percent"] = num(f"{BAT}/capacity", default=0.0)
+    b["status"] = rd(f"{BAT}/status", "Unknown")
+    volts = num(f"{BAT}/voltage_now", 1e6)
+    b["volts"] = volts
+    # energy_* in µWh; some batteries only report charge_* in µAh
+    now, full, design = (num(f"{BAT}/energy_{k}", 1e6) for k in ("now", "full", "full_design"))
+    if now is None and volts:
+        vmin = num(f"{BAT}/voltage_min_design", 1e6) or volts
+        now, full, design = (None if (c := num(f"{BAT}/charge_{k}", 1e6)) is None else c * vmin
+                             for k in ("now", "full", "full_design"))
+    b["wh_now"], b["wh_full"], b["wh_design"] = now, full, design
+    b["power_w"] = num(f"{BAT}/power_now", 1e6, 0.0)
+    b["cycles"] = int(num(f"{BAT}/cycle_count", default=0) or 0)
+    b["health"] = round(100 * full / design, 1) if full and design else None
+    b["limit_start"] = num(f"{BAT}/charge_control_start_threshold")
+    b["limit_end"] = num(f"{BAT}/charge_control_end_threshold")
+    beh = rd(f"{BAT}/charge_behaviour", "")
+    m = re.search(r"\[([^\]]+)\]", beh or "")
+    b["behaviour"] = m.group(1) if m else ""
+    b["model"] = " ".join(x for x in (rd(f"{BAT}/manufacturer", ""), rd(f"{BAT}/model_name", "")) if x)
+    b["tech"] = rd(f"{BAT}/technology", "")
+    return b
+
+
+def charger():
+    """Mains adapter state, and for USB-C the charger's rating from the power
+    offers (PD source capabilities) it advertises.
+
+    Not the ucsi supply's voltage_now: on this ThinkPad it reads 5 V even while
+    a 65 W charger feeds the battery 27 W (seen 2026-09-30), so it cannot tell
+    a phone charger from a laptop one. The advertised offers can."""
+    c = {"online": False, "kind": None, "pd": None, "watts": None, "top": None, "volts": []}
+    try:
+        names = sorted(os.listdir(PSU))
+    except OSError:
+        names = []
+    for n in names:
+        typ = rd(f"{PSU}/{n}/type", "")
+        online = rd(f"{PSU}/{n}/online") == "1"
+        if typ == "Mains" and online:
+            c["online"] = True
+            c["kind"] = c["kind"] or "AC adapter"
+        elif typ == "USB" and online:
+            c["online"] = True
+            m = re.search(r"\[([^\]]+)\]", rd(f"{PSU}/{n}/usb_type", "") or "")
+            c.update(kind="USB-C", pd=m.group(1) if m else None)
+    if c["kind"] == "USB-C":
+        best, volts = None, set()
+        typec = "/sys/class/typec"
+        for port in sorted(os.listdir(typec)) if os.path.isdir(typec) else []:
+            if not port.endswith("-partner"):
+                continue
+            base = f"{typec}/{port}"
+            for pd in sorted(x for x in os.listdir(base) if re.fullmatch(r"pd\d+", x)):
+                caps = f"{base}/{pd}/source-capabilities"
+                for pdo in sorted(os.listdir(caps)) if os.path.isdir(caps) else []:
+                    f = f"{caps}/{pdo}"
+                    v = milli(f"{f}/voltage") or milli(f"{f}/maximum_voltage")
+                    i = milli(f"{f}/maximum_current")
+                    w = milli(f"{f}/maximum_power") or (v * i if v and i else None)
+                    if v:
+                        volts.add(round(v))
+                    if w and (best is None or w > best[0]):
+                        best = (w, v, i)
+        if best:
+            c["watts"] = round(best[0])
+            c["top"] = {"volts": best[1], "amps": best[2]}
+            c["volts"] = sorted(volts)
+    return c
+
+
+def charger_text(c):
+    """"USB-C PD, up to 65 W (20 V × 3.25 A)" / "AC adapter" / "not connected"."""
+    if not c["online"]:
+        return "not connected"
+    if c["watts"]:
+        t = c["top"] or {}
+        detail = f" ({t['volts']:.0f} V × {t['amps']:.2f} A)".replace(".00 A", " A") \
+            if t.get("volts") and t.get("amps") else ""
+        return f"{c['kind']} {c.get('pd') or ''}".strip() + f", up to {c['watts']} W{detail}"
+    return c["kind"] or "connected"
+
+
+def guard():
+    """battery-guard's limits (script defaults, then its conf) and live state.
+
+    "active" = its timer is running (2026-10-03: the file existing said nothing
+    about whether anything would actually suspend the laptop)."""
+    timer = "unknown"
+    try:
+        timer = subprocess.run(["systemctl", "--user", "is-active", "battery-guard.timer"],
+                               capture_output=True, text=True, timeout=2).stdout.strip() or "unknown"
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    g = {"warn": 30, "upper": 25, "lower": 12, "last_resort": "none", "last_resort_pct": 8,
+         "installed": os.path.exists(GUARD_BIN),
+         "timer": timer, "active": os.path.exists(GUARD_BIN) and timer == "active"}
+    for path in (GUARD_BIN, GUARD_CONF):          # the script's defaults, then his conf
+        for line in (rd(path, "") or "").splitlines():
+            m = re.match(r"^\s*(WARN|UPPER|LOWER|LAST_RESORT_PCT)=([\d.]+)", line)
+            if m:
+                v = float(m.group(2))
+                g[m.group(1).lower()] = int(v) if v.is_integer() else v   # "7%", not "7.0%"
+            m = re.match(r"^\s*LAST_RESORT=[\"']?(none|hibernate|poweroff)\b", line)
+            if m:
+                g["last_resort"] = m.group(1)
+    st = {}
+    for line in (rd(GUARD_STATE, "") or "").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            st[k] = v
+    g["ac_drain"] = st.get("ac_drain") == "1"
+    g["upper_done"] = st.get("upper_done") == "1" or st.get("ac_upper_done") == "1"
+    g["retry_pending"] = st.get("retry_pending") == "1"
+    return g
+
+
+def last_sleep():
+    """The last suspend sleep-verified ran: OK or FAILED, when, why."""
+    try:
+        r = json.load(open(SLEEP_LAST))
+    except (OSError, ValueError):
+        return None
+    at = time.strftime("%H:%M", time.localtime(r.get("ts", 0)))
+    if time.time() - r.get("ts", 0) > 20 * 3600:
+        at = time.strftime("%d %b %H:%M", time.localtime(r.get("ts", 0)))
+    reason = r.get("reason", "?")
+    if r.get("verdict") == "SLEPT":
+        fix = f", after {', '.join(r['remedy_applied'])}" if r.get("remedy_applied") else ""
+        text = f"OK {at} ({reason}{fix})"
+    elif r.get("verdict") == "HIBERNATED":
+        text = f"OK {at} — hibernated ({reason})"
+    elif r.get("verdict") == "REFUSED":
+        text = f"{at} ({reason}) — hibernate not configured, no resume="
+    elif r.get("cancelled") == "activity":
+        text = f"FAILED {at} ({reason}) — retry cancelled, you were back"
+    else:
+        b = (r.get("blockers") or [None])[0]
+        if b:
+            who = (b.get("comm") or (b.get("threads") or ["?"])[0]) + \
+                (" stuck in FUSE" if b.get("fuse_fn") or r.get("fuse") else " would not freeze")
+        else:
+            who = r.get("why") or "no blocker named"
+        text = f"FAILED {at} ({reason}) — {who}; laptop stayed ON"
+    return {"ok": r.get("verdict") in ("SLEPT", "HIBERNATED"), "text": text, "ts": r.get("ts"), "reason": reason}
+
+
+def profile():
+    # busctl, not powerprofilesctl: same answer in 10 ms instead of 450 ms
+    try:
+        out = subprocess.run(["busctl", "--system", "get-property", "net.hadess.PowerProfiles",
+                              "/net/hadess/PowerProfiles", "net.hadess.PowerProfiles", "ActiveProfile"],
+                             capture_output=True, text=True, timeout=2).stdout
+        m = re.search(r'"([^"]+)"', out)
+        if m:
+            return m.group(1)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return rd("/sys/firmware/acpi/platform_profile")
+
+
+def upower_history(kind, span, points=400):
+    """[(ts, value, state)] oldest first, from UPower's in-memory history."""
+    try:
+        out = subprocess.run(
+            ["busctl", "--system", "--json=short", "call", "org.freedesktop.UPower",
+             "/org/freedesktop/UPower/devices/battery_BAT0", "org.freedesktop.UPower.Device",
+             "GetHistory", "suu", kind, str(int(span)), str(points)],
+            capture_output=True, text=True, timeout=2).stdout
+        rows = json.loads(out)["data"][0]
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, IndexError):
+        return []
+    return sorted((int(t), float(v), UPOWER_STATE.get(int(s), "unknown")) for t, v, s in rows)
+
+
+# ───────────────────────────── net rate ──────────────────────────────
+
+def record_and_rate(b, ac_online):
+    """Store an energy_now sample (at most every SAMPLE_EVERY s) and return the
+    net flow in W fitted over the last RATE_WINDOW s, or None. The fit restarts
+    at a plug/unplug and after a gap (suspend), so it never mixes regimes."""
+    if b["wh_now"] is None:
+        return None, 0
+    now = time.time()
+    rows = []
+    try:
+        fd = os.open(SAMPLES, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return None, 0
+    with os.fdopen(fd, "r+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        for line in f:
+            p = line.split()
+            if len(p) == 3:
+                try:
+                    rows.append((float(p[0]), float(p[1]), p[2]))
+                except ValueError:
+                    pass
+        rows = [r for r in rows if now - SAMPLE_KEEP <= r[0] <= now + 5]
+        ac = "ac" if ac_online else "bat"
+        if not rows or now - rows[-1][0] >= SAMPLE_EVERY or rows[-1][2] != ac:
+            rows.append((now, b["wh_now"], ac))
+            f.seek(0)
+            f.truncate()
+            f.write("".join(f"{t:.0f} {e:.4f} {a}\n" for t, e, a in rows))
+    # the current regime: same AC state, no gap > 3 sample periods, inside the window
+    seg = [rows[-1]]
+    for r in reversed(rows[:-1]):
+        if r[2] != rows[-1][2] or seg[-1][0] - r[0] > 3 * SAMPLE_EVERY + 30 or now - r[0] > RATE_WINDOW:
+            break
+        seg.append(r)
+    seg.reverse()
+    span = seg[-1][0] - seg[0][0]
+    if span < RATE_MIN_SPAN or len(seg) < 4:
+        # Just started (boot, plug change): battery-guard keeps a per-minute
+        # energy history of the current AC state; fit that instead.
+        seg = guard_history(now)
+        span = seg[-1][0] - seg[0][0] if seg else 0
+        if span < RATE_MIN_SPAN or len(seg) < 4:
+            return None, span
+    return fit(seg), span
+
+
+def guard_history(now):
+    """[(ts, Wh, _)] from battery-guard's state "hist=ts:µWh ..." (last RATE_WINDOW s)."""
+    m = re.search(r"^hist=(.*)$", rd(GUARD_STATE, "") or "", re.M)
+    rows = []
+    for item in (m.group(1).replace("\\", "").split() if m else []):
+        try:
+            t, e = item.split(":")
+            if now - int(t) <= RATE_WINDOW:
+                rows.append((float(t), float(e) / 1e6, ""))
+        except ValueError:
+            pass
+    return rows
+
+
+def fit(seg):
+    """Least-squares slope of energy over time, in W."""
+    n = len(seg)
+    mt = sum(t for t, _, _ in seg) / n
+    me = sum(e for _, e, _ in seg) / n
+    var = sum((t - mt) ** 2 for t, _, _ in seg)
+    if var <= 0:
+        return None
+    return sum((t - mt) * (e - me) for t, e, _ in seg) / var * 3600   # Wh/s -> W
+
+
+# ───────────────────────────── the picture ───────────────────────────
+
+def dur(hours):
+    if hours is None or hours < 0 or hours > 99:
+        return None
+    m = int(round(hours * 60))
+    if m < 1:
+        return "under a minute"
+    return f"{m // 60} h {m % 60:02d} min" if m >= 60 else f"{m} min"
+
+
+def clock(ts):
+    return time.strftime("%H:%M", time.localtime(ts))
+
+
+def since_run(hist, states):
+    """(start ts, start %) of the newest unbroken run of history rows in states."""
+    start = None
+    for t, v, s in reversed(hist):
+        if s not in states:
+            break
+        start = (t, v)
+    return start
+
+
+def collect(span=6 * 3600):
+    b, c, g = battery(), charger(), guard()
+    net, net_span = record_and_rate(b, c["online"])
+    if net_span and net is None:
+        net_span = 0
+    pct = b["percent"]
+    full = b["wh_full"] or 0
+    d = {"battery": b, "charger": c, "guard": g, "profile": profile(), "time": time.time(),
+         "last_sleep": last_sleep(),
+         "net_w": None if net is None else round(net, 2), "net_span_s": int(net_span)}
+
+    # Best net flow we have: the fit, else the EC's power_now with the status' sign.
+    flow = net
+    if flow is None:
+        if b["status"] == "Discharging":
+            flow = -b["power_w"]
+        elif b["status"] == "Charging":
+            flow = b["power_w"]
+        elif not c["online"]:
+            flow = -b["power_w"] if b["power_w"] else None
+    d["flow_w"] = None if flow is None else round(flow, 2)
+    d["pct_per_h"] = round(100 * flow / full, 1) if flow is not None and full else None
+
+    # What is going on, in words.
+    limit = b["limit_end"] if b["limit_end"] and b["limit_end"] < 100 else None
+    draining = flow is not None and flow < -STEADY_W
+    gaining = flow is not None and flow > STEADY_W
+    if not b["present"]:
+        state, head, why = "absent", "No battery found", ""
+    elif not c["online"]:
+        state, head, why = "discharging", "On battery", ""
+    elif (b["status"] == "Charging" and not (draining and net is not None and b["power_w"] < 20)) \
+            or (gaining and b["status"] != "Full"):
+        # A weak charger makes the firmware flip Charging <-> Not charging every
+        # few minutes; the measured 10-min flow wins over the momentary status,
+        # unless the firmware reports real charging power (a new, strong charger
+        # before the fit catches up).
+        state, head, why = "charging", "Charging", ""
+    elif draining or g["ac_drain"]:
+        state, head = "ac-drain", "Plugged in, but draining"
+        if c["watts"] and c["watts"] < 45:
+            why = (f"The charger offers at most {c['watts']} W, less than the laptop is using. "
+                   f"Charging needs a 45 W+ USB-C PD charger.")
+        elif c["watts"]:
+            why = (f"The charger offers up to {c['watts']} W, yet the laptop is getting less than it uses: "
+                   f"a cable or contract that limits power, or a very heavy load.")
+        else:
+            why = "The charger is not keeping up with what the laptop is using."
+        if b["status"] == "Charging":
+            why += " It charges in short bursts, but loses more in between."
+    elif b["status"] == "Full" or pct >= 99:
+        state, head, why = "full", "Full, on the charger", ""
+    elif limit and pct >= limit - 1:
+        state, head, why = "held", f"Held at {pct:.0f}% by the charge limit", \
+            f"Charging stops at {limit:.0f}% to spare the battery."
+    else:
+        state, head = "plugged", "Plugged in, not charging"
+        if c["watts"] and c["watts"] < 45:
+            why = f"The charger offers at most {c['watts']} W: enough to run the laptop, not to charge it."
+        elif b["behaviour"] and b["behaviour"] != "auto":
+            why = f"Charging is set to '{b['behaviour']}' in the firmware."
+        else:
+            why = "The firmware has paused charging; it usually resumes by itself."
+    # keep numbers and their units together when the text wraps ("20 V", "45 W+")
+    why = re.sub(r"(\d) (V|A|W|Wh|%|h|min)\b", "\\1\u00a0\\2", why)
+    d.update(state=state, headline=head, why=why)
+
+    # The firmware says it is charging hard but the fit is still from before the
+    # new charger: show the firmware's power until the fit catches up.
+    if state == "charging" and (flow is None or flow <= STEADY_W) and b["power_w"] > STEADY_W:
+        flow = b["power_w"]
+        d["flow_w"], d["net_w"] = round(flow, 2), None
+        d["pct_per_h"] = round(100 * flow / full, 1) if full else None
+    draining = state in ("discharging", "ac-drain") and flow is not None and flow < -STEADY_W
+    gaining = state == "charging" and flow is not None and flow > STEADY_W
+
+    # Estimates.
+    est = []
+    if draining and full:
+        ph = -100 * flow / full                                   # % per hour lost
+        stops = []
+        if g["active"]:
+            if not g["upper_done"] and pct > g["upper"]:
+                stops.append((g["upper"], f"battery-guard suspends at {g['upper']}%", f"Suspend at {g['upper']}%"))
+            if pct > g["lower"]:
+                stops.append((g["lower"], f"then at {g['lower']}%" if stops else
+                              f"battery-guard suspends at {g['lower']}%",
+                              f"Suspend again at {g['lower']}%" if stops else f"Suspend at {g['lower']}%"))
+            if g["last_resort"] != "none" and pct > g["last_resort_pct"]:
+                lr, op = g["last_resort_pct"], g["last_resort"]
+                stops.append((lr, f"last resort: {op} at {lr}%", f"{op.capitalize()} at {lr}% (last resort)"))
+        stops.append((EMPTY_PCT, f"empty ({EMPTY_PCT}%, the new zero)", f"Empty ({EMPTY_PCT}%)"))
+        for level, text, short in stops:
+            h = (pct - level) / ph
+            if dur(h):
+                est.append({"what": text, "short": short, "hours": round(h, 2),
+                            "at": clock(time.time() + h * 3600), "level": level})
+    elif gaining and full and b["wh_now"] is not None:
+        target = limit or 100
+        h = max(0.0, (full * target / 100 - b["wh_now"]) / flow)
+        if target == 100 and pct >= 80:
+            h *= 1.35        # the last 20% charges slower (constant-voltage phase)
+        if dur(h):
+            est.append({"what": f"full ({target:.0f}%)", "short": f"Full ({target:.0f}%)", "hours": round(h, 2),
+                        "at": clock(time.time() + h * 3600), "level": target})
+    d["estimates"] = est
+
+    # History (UPower) and how long the current situation has lasted.
+    hist = upower_history("charge", max(span, 6 * 3600) + 4 * 3600)
+    start = time.time() - span
+    before = [h for h in hist if h[0] < start]
+    d["history"] = before[-1:] + [h for h in hist if h[0] >= start]   # + the level at the window's start
+    # "since" needs full resolution: a long query comes back downsampled and
+    # merged points lose their state, so read the last 12 h separately.
+    recent = hist if span <= 6 * 3600 else upower_history("charge", 12 * 3600, 2000)
+    # While charging: since when it charges (a charger swap is not an unplug in
+    # UPower's history, so "plugged in since" would date from the old charger).
+    runs = {"discharging": ({"discharging"}, "on battery"), "charging": ({"charging", "full"}, "charging")}
+    states, what = runs.get(d["state"], ({"charging", "plugged", "full"}, "plugged in"))
+    run = since_run(recent, states)
+    d["since"] = {"what": what, "ts": run[0], "at": clock(run[0]), "pct": run[1],
+                  "hours": round((time.time() - run[0]) / 3600, 2)} if run else None
+    return d
+
+
+def icon(d):
+    b = d["battery"]
+    if not b["present"]:
+        return UNKNOWN
+    i = min(9, max(0, int((b["percent"] + 5) // 10) - 1)) if b["percent"] >= 5 else 0
+    return (CHARGING if d["state"] == "charging" else LEVEL)[i]
+
+
+def classes(d):
+    pct = d["battery"]["percent"]
+    cls = [d["state"]]
+    if d["state"] in ("full", "held"):
+        cls.append("plugged")          # the green the old built-in module used
+    if d["state"] in ("discharging", "ac-drain"):
+        if pct <= 10:
+            cls.append("critical")
+        elif pct <= 20:
+            cls.append("warning")
+    return cls
+
+
+def sparkline(hist, now, span=6 * 3600, n=24):
+    """Last `span` as n block characters (0-100%), '·' where nothing is known."""
+    blocks = "▁▂▃▄▅▆▇█"
+    out, j, last = [], 0, None
+    for k in range(n):
+        t_end = now - span + (k + 1) * span / n
+        while j < len(hist) and hist[j][0] <= t_end:
+            last = hist[j][1]
+            j += 1
+        out.append("·" if last is None else blocks[min(7, int(last / 100 * 8))])
+    return "".join(out)
+
+
+def watts(w):
+    return f"{w:+.1f} W".replace("-", "−")
+
+
+def tooltip(d, markup=True):
+    b, c, g = d["battery"], d["charger"], d["guard"]
+    e = html.escape if markup else (lambda s: s)
+    bold = (lambda s: f"<b>{e(s)}</b>") if markup else (lambda s: s)
+    rows = []
+
+    def row(k, v):
+        rows.append((k, v))
+
+    flow = d["flow_w"]
+    if flow is not None:
+        if abs(flow) <= STEADY_W:
+            rate = "steady (≈0 W)"
+        else:
+            rate = f"{'charging' if flow > 0 else 'draining'} {abs(flow):.1f} W"
+            if d["pct_per_h"] is not None:
+                rate += f" ({abs(d['pct_per_h']):.0f} %/h)"
+        row("Flow", rate + (", 10-min avg" if d["net_w"] is not None else ", now"))
+    for x in d["estimates"]:
+        what = x["short"][0].lower() + x["short"][1:]
+        row("Forecast" if x is d["estimates"][0] else "", f"{what} in {dur(x['hours'])}, ~{x['at']}")
+    if d["since"]:
+        what = d["since"]["what"]
+        row("Since", f"{what} {d['since']['at']} ({dur(d['since']['hours']) or 'just now'}), "
+                     f"from {d['since']['pct']:.0f}%")
+    if c["online"]:
+        row("Charger", charger_text(c))
+    if b["wh_now"] is not None and b["wh_full"]:
+        row("Energy", f"{b['wh_now']:.1f} of {b['wh_full']:.1f} Wh")
+    if b["health"]:
+        row("Health", f"{b['health']:.0f}% of new ({b['wh_design']:.1f} Wh), {b['cycles']} cycles")
+    if g["active"]:
+        row("Guard", f"suspends at {g['upper']}%, again at {g['lower']}% (guard timer active)")
+        if g["last_resort"] != "none":
+            row("", f"last resort: {g['last_resort']} at {g['last_resort_pct']}%")
+        if g["ac_drain"]:
+            row("", "AC-drain watch is on")
+        if g.get("retry_pending"):
+            row("", "last forced suspend FAILED, retrying")
+    elif g.get("installed"):
+        row("Guard", f"guard timer {g.get('timer')} — nothing will suspend at {g['upper']}%/{g['lower']}%")
+    if d.get("last_sleep"):
+        row("Last sleep", d["last_sleep"]["text"])
+    if d["profile"]:
+        row("Profile", d["profile"])
+    row("Last 6 h", sparkline(d["history"], d["time"]) + " (0–100%)")
+
+    width = max(len(k) for k, _ in rows) + 2
+    lines = [f"{bold('Battery ' + format(b['percent'], '.0f') + '%')}  ·  {e(d['headline'])}"]
+    if d["why"]:
+        lines.append(e(d["why"]))
+    lines.append("")
+    body = "\n".join(f"{k:<{width}}{v}" for k, v in rows)
+    lines.append(f"<tt>{e(body)}</tt>" if markup else body)
+    lines.append("")
+    lines.append(e("Click or tap for the battery panel"))
+    return "\n".join(lines)
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "text"
+    if mode == "json":
+        span = int(sys.argv[2]) if len(sys.argv) > 2 else 6 * 3600
+        d = collect(span)
+        d["icon"], d["classes"], d["charger_text"] = icon(d), classes(d), charger_text(d["charger"])
+        print(json.dumps(d))
+    elif mode == "waybar":
+        if not os.path.exists(BAT):
+            print(json.dumps({"text": "", "tooltip": ""}))   # no battery (desktop): module hidden
+            return
+        d = collect()
+        print(json.dumps({"text": icon(d), "class": classes(d), "percentage": int(d["battery"]["percent"]),
+                          "tooltip": tooltip(d)}))
+    elif mode == "text":
+        print(tooltip(collect(), markup=False))
+    else:
+        print(__doc__.split("Usage")[1], file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# home-lan-dongle-watchdog — keep the USB Wi-Fi dongle on the home SSID.
+# Runs as a USER timer every 15 s (no root: iwd's D-Bus policy allows group wheel).
+# Touches ONLY the interface whose MAC is $DONGLE_MAC — never wlan0.
+# Logs every state change to ~/logs/home-lan-dongle.log (drops are counted from it).
+set -u
+DONGLE_MAC="${DONGLE_MAC:-02:00:00:00:00:04}"
+SSID="${HOME_LAN_SSID:-home-wifi-5g}"
+LOG="$HOME/logs/home-lan-dongle.log"
+STATE="${XDG_RUNTIME_DIR:-/tmp}/home-lan-dongle.state"
+mkdir -p "$(dirname "$LOG")"
+NET="$HOME/Programs/local-bootstrapping/scripts/net"
+HOLD="${XDG_RUNTIME_DIR:-/tmp}/home-lan-dongle.hold"
+# A revert (safe-net-step / internet-guard) puts a 30-min hold: do not reconnect during it.
+if [[ -f "$HOLD" ]] && (( $(date +%s) - $(cat "$HOLD") < 1800 )); then exit 0; fi
+ts() { date '+%F %T'; }
+strip() { sed 's/\x1b\[[0-9;]*m//g'; }
+
+# The interface iwd manages for this MAC (after a USB re-enumeration a stale, DOWN
+# kernel netdev with the same MAC can linger next to iwd's one, e.g. wlan1 + wlan2).
+IF="$(/usr/bin/iwctl device list 2>/dev/null | strip | awk -v m="$DONGLE_MAC" '$2==m{print $1; exit}')"
+if [[ -z "$IF" ]]; then
+  [[ "$(cat "$STATE" 2>/dev/null)" != "absent" ]] && echo "$(ts) absent dongle not plugged in" >> "$LOG"
+  echo absent > "$STATE"; exit 0
+fi
+
+CUR="$(/usr/bin/iwctl station "$IF" show 2>/dev/null | strip | awk '/Connected network/{ $1=$2=""; sub(/^ +/,""); sub(/ +$/,""); print }')"
+if [[ "$CUR" == "$SSID" ]]; then
+  [[ "$(cat "$STATE" 2>/dev/null)" != "ok" ]] && echo "$(ts) ok $IF on $SSID $(ip -4 -br addr show "$IF" | awk '{print $3}')" >> "$LOG"
+  echo ok > "$STATE"; exit 0
+fi
+
+echo "$(ts) DROP $IF on '${CUR:-none}' -> connecting $SSID" >> "$LOG"
+echo drop > "$STATE"
+[[ -n "$CUR" ]] && /usr/bin/iwctl station "$IF" disconnect >/dev/null 2>&1
+/usr/bin/iwctl station "$IF" connect "$SSID" >> "$LOG" 2>&1 \
+  && echo "$(ts) reconnect-ok $IF" >> "$LOG" \
+  || echo "$(ts) reconnect-FAIL $IF rc=$?" >> "$LOG"
+# Internet must survive every reconnect: check (≤10 s), revert on failure.
+for i in 1 2 3 4 5; do sleep 2; CHK="$(bash "$NET/net-state-check.sh")" && break; done
+[[ "$CHK" == INTERNET\ OK* ]] || bash "$NET/net-revert-dongle.sh" "watchdog reconnect broke internet: $CHK"

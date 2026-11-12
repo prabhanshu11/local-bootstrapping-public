@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# thermal-screenshot-guard.sh — Monitor CPU temp, screenshot all workspaces before thermal shutdown
+#
+# Usage: thermal-screenshot-guard.sh [--warn-temp 75] [--crit-temp 85] [--poll 5]
+#   --warn-temp  Temperature (°C) to start frequent polling + first screenshot (default: 75)
+#   --crit-temp  Temperature (°C) for urgent screenshot + notification (default: 85)
+#   --poll       Normal polling interval in seconds (default: 10)
+#   --once       Take one screenshot set and exit (for manual/test use)
+
+set -euo pipefail
+
+WARN_TEMP=75
+CRIT_TEMP=92
+POLL_NORMAL=10
+POLL_HOT=3
+SCREENSHOT_DIR="$HOME/Programs/utilities/fan-control/thermal-screenshots"
+ONCE=false
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --warn-temp) WARN_TEMP="$2"; shift 2 ;;
+        --crit-temp) CRIT_TEMP="$2"; shift 2 ;;
+        --poll)      POLL_NORMAL="$2"; shift 2 ;;
+        --once)      ONCE=true; shift ;;
+        *) echo "Unknown arg: $1"; exit 1 ;;
+    esac
+done
+
+mkdir -p "$SCREENSHOT_DIR"
+
+# Find k10temp sensor dynamically (survives hwmon reordering across boots)
+find_k10temp() {
+    for hwmon in /sys/class/hwmon/hwmon*; do
+        if [[ "$(cat "$hwmon/name" 2>/dev/null)" == "k10temp" ]]; then
+            echo "$hwmon/temp1_input"
+            return 0
+        fi
+    done
+    echo "ERROR: k10temp sensor not found" >&2
+    return 1
+}
+
+SENSOR_PATH=$(find_k10temp)
+
+read_temp() {
+    local raw
+    raw=$(cat "$SENSOR_PATH" 2>/dev/null)
+    echo $(( raw / 1000 ))
+}
+
+# Screenshot all Hyprland workspaces
+screenshot_all_workspaces() {
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    local temp_c="$1"
+    local reason="$2"
+    local dir="$SCREENSHOT_DIR/${timestamp}_${temp_c}C_${reason}"
+    mkdir -p "$dir"
+
+    # Get current active workspace
+    local current_ws
+    current_ws=$(hyprctl activeworkspace -j 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null || echo "1")
+
+    # Get all workspaces with windows
+    local workspaces
+    workspaces=$(hyprctl workspaces -j 2>/dev/null | python3 -c "
+import sys, json
+ws = json.load(sys.stdin)
+for w in sorted(ws, key=lambda x: x['id']):
+    if w['id'] > 0:  # skip special workspaces
+        print(w['id'])
+" 2>/dev/null)
+
+    if [[ -z "$workspaces" ]]; then
+        workspaces="1"
+    fi
+
+    # Screenshot each workspace
+    for ws in $workspaces; do
+        hyprctl dispatch workspace "$ws" >/dev/null 2>&1
+        sleep 0.3  # brief settle time for compositor
+        grim "$dir/workspace_${ws}.png" 2>/dev/null
+    done
+
+    # Return to original workspace
+    hyprctl dispatch workspace "$current_ws" >/dev/null 2>&1
+
+    # Save metadata
+    cat > "$dir/metadata.txt" << EOF
+Timestamp: $(date -Iseconds)
+CPU Temp: ${temp_c}°C
+Reason: $reason
+Warn threshold: ${WARN_TEMP}°C
+Crit threshold: ${CRIT_TEMP}°C
+Sensor: $SENSOR_PATH
+Workspaces captured: $(echo "$workspaces" | tr '\n' ' ')
+Active workspace: $current_ws
+EOF
+
+    echo "$dir"
+}
+
+notify_user() {
+    local urgency="$1"
+    local title="$2"
+    local body="$3"
+
+    # Visual notification
+    notify-send -u "$urgency" "$title" "$body" 2>/dev/null || true
+
+    # Audio alert
+    if [[ "$urgency" == "critical" ]]; then
+        # Urgent: 3 beeps at 1.5kHz
+        for _ in 1 2 3; do
+            ffplay -nodisp -autoexit -f lavfi "sine=frequency=1500:duration=0.15" 2>/dev/null &
+            sleep 0.25
+        done
+    else
+        # Warning: 1 beep at 1kHz
+        ffplay -nodisp -autoexit -f lavfi "sine=frequency=1000:duration=0.2" 2>/dev/null &
+    fi
+}
+
+# Cleanup old screenshots (keep last 20 directories)
+cleanup_old() {
+    local count
+    count=$(find "$SCREENSHOT_DIR" -maxdepth 1 -type d ! -path "$SCREENSHOT_DIR" | wc -l)
+    if (( count > 20 )); then
+        find "$SCREENSHOT_DIR" -maxdepth 1 -type d ! -path "$SCREENSHOT_DIR" -printf '%T@ %p\n' | \
+            sort -n | head -n $(( count - 20 )) | cut -d' ' -f2- | xargs rm -rf
+    fi
+}
+
+# --- Main loop ---
+
+last_warn_screenshot=0
+last_crit_screenshot=0
+SCREENSHOT_COOLDOWN=60  # seconds between screenshot sets at same level
+
+log() {
+    echo "[$(date +%H:%M:%S)] $*"
+}
+
+if $ONCE; then
+    temp=$(read_temp)
+    log "Temperature: ${temp}°C — taking manual screenshot set"
+    dir=$(screenshot_all_workspaces "$temp" "manual")
+    log "Screenshots saved to: $dir"
+    exit 0
+fi
+
+log "Thermal Screenshot Guard started"
+log "  Sensor: $SENSOR_PATH"
+log "  Warn: ${WARN_TEMP}°C | Crit: ${CRIT_TEMP}°C"
+log "  Screenshots: $SCREENSHOT_DIR"
+log "  Normal poll: ${POLL_NORMAL}s | Hot poll: ${POLL_HOT}s"
+
+while true; do
+    temp=$(read_temp)
+    now=$(date +%s)
+
+    if (( temp >= CRIT_TEMP )); then
+        if (( now - last_crit_screenshot >= SCREENSHOT_COOLDOWN )); then
+            log "CRITICAL: ${temp}°C >= ${CRIT_TEMP}°C — capturing all workspaces"
+            dir=$(screenshot_all_workspaces "$temp" "CRITICAL")
+            notify_user "critical" "THERMAL CRITICAL: ${temp}°C" "Screenshots saved to $dir\nSystem may shut down soon!"
+            last_crit_screenshot=$now
+            cleanup_old
+        fi
+        sleep "$POLL_HOT"
+
+    elif (( temp >= WARN_TEMP )); then
+        if (( now - last_warn_screenshot >= SCREENSHOT_COOLDOWN )); then
+            log "WARNING: ${temp}°C >= ${WARN_TEMP}°C — capturing all workspaces"
+            dir=$(screenshot_all_workspaces "$temp" "warning")
+            notify_user "normal" "Thermal Warning: ${temp}°C" "Screenshots saved to $dir"
+            last_warn_screenshot=$now
+            cleanup_old
+        fi
+        sleep "$POLL_HOT"
+
+    else
+        sleep "$POLL_NORMAL"
+    fi
+done

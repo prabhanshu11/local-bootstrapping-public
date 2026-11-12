@@ -1,0 +1,2294 @@
+#!/usr/bin/env python3
+"""
+workspace-labels — one short label per Hyprland workspace, shown in a popup
+under the bar when he switches workspaces (2026-11-02).
+
+Docs: docs/workspace-labels/ (BRIEF.md = his words, SPEC.md = the card spec,
+REPORT.md = what works). His core ask: "the whole point of this is to take
+screenshots of workspaces which are not visible also, so that even if I never
+switch on them, their summary gets created."
+
+STAGE 1  capture: every window of every workspace (hidden ones too) is grabbed
+         with `grim -T <stableId>` (ext-image-copy-capture of a foreign
+         toplevel; Hyprland's `stableId` in `hyprctl clients -j` IS the
+         ext-foreign-toplevel identifier) and composited at its hyprctl
+         position into one workspace image. A window that does not answer in
+         CAPTURE_TIMEOUT (paused mpv) is drawn as a title card instead.
+STAGE 2  detectors: socket2 openwindow/closewindow/movewindow (resize is
+         ignored), terminal foreground program (/proc), window class set; an
+         activity signal (evdev timestamps only, never which key) per focused
+         window; 10-minute refresh of workspaces he is working on.
+STAGE 3  labeller: `claude -p --model sonnet` with a plain-English prompt and
+         the workspace image, one at a time, never two for the same workspace,
+         gated by the shared USD 200/week agent-loop ledger on the desktop.
+STAGE 4+ popup (GTK3 layer shell, top centre under the bar, no focus, clicks
+         pass through except on the popup itself, dismissed by the first input
+         after 400 ms): the plain label, the live agent card (SPEC.md) when
+         there is no label yet, and the old label over the running agent on a
+         relabel.
+         LOCK (his 2026-11-09, rules narrowed 2026-11-10): Super pressed ALONE
+         and held LOCK_HOLD_S (a hold in which any other key was pressed, e.g.
+         Super+N switching, never locks) or a tap on the popup LOCKS it: it
+         takes exclusive keyboard focus (layer-shell), so Esc reaches IT and
+         never a work window, and it stays until Esc / a tap /
+         `workspace-labels unlock`. The live card does NOT lock: it ignores
+         input for CARD_GRACE_S, then the first input hides it like the label.
+         AWAITING (his 2026-11-09): a desk whose windows are all idle (terminal
+         at its shell, browser with no page) gets the free title label and no
+         model call; it is watched every FAST_POLL s and on title events, and
+         relabels the moment work starts (a Claude prompt, a page).
+
+Commands:
+  workspace-labels capture [WS ...]   capture + composite (all workspaces if none)
+  workspace-labels prompt WS          print the English prompt for a workspace
+  workspace-labels label WS           run the labeller once (spends from the ledger)
+  workspace-labels daemon             the service (systemd user unit)
+  workspace-labels show WS            ask the running daemon to show the popup
+  workspace-labels lock | unlock      lock the shown popup (Esc/tap/unlock end it) / release it
+  workspace-labels status             labels + capture health as text
+"""
+import json
+import os
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import zlib
+from datetime import datetime, timezone
+
+APP = "workspace-labels"
+STATE = os.environ.get("WSL_STATE") or os.path.expanduser(f"~/.local/state/{APP}")   # WSL_STATE: tests
+CAPS = os.path.join(STATE, "captures")
+LABELS = os.path.join(STATE, "labels.json")
+HEALTH = os.path.join(STATE, "capture-health.json")
+HISTORY = os.path.join(STATE, "history.json")
+LOG = os.path.join(STATE, f"{APP}.log")
+CMD_SOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), f"{APP}.sock")
+HERE = os.path.dirname(os.path.realpath(__file__))
+WEB = os.path.join(os.path.dirname(HERE), APP)          # dotfiles/workspace-labels
+CAPTURE_TIMEOUT = 2.5
+# Measured 2026-11-02 (REPORT.md): a hidden window hands grim the frame it drew
+# LAST, and the capture request itself makes it draw a new one. A printing
+# terminal on hidden ws 9 captured at 06:41:00 showed 06:40:58 (the previous
+# capture); the first capture after mapping was blank. So every window is
+# captured twice, PRIME_GAP apart, and the second frame is kept.
+PRIME_GAP = 0.15
+THUMB_W = 1280                                          # composite width sent to Sonnet
+TERMINALS = {"com.mitchellh.ghostty", "kitty", "Alacritty", "alacritty", "foot", "org.wezfurlong.wezterm"}
+BROWSERS = ("google-chrome", "chromium", "firefox", "firefox-developer-edition", "brave-browser")
+# Privacy filter (SPEC §5): windows never captured and never named.
+PRIVATE_CLASS = re.compile(r"(keepass|bitwarden|1password|pass-wizard|pass-copy|pinentry|gcr-prompter|polkit)", re.I)
+# His 2026-11-06 answer on a terminal titled "... password recovery ...":
+# "describe them. claude agent is anyways security-aware". So a title that
+# merely MENTIONS passwords/2FA is described like any other (secret VALUES are
+# still scrubbed by scrub()); only password managers, prompts and private /
+# incognito browser windows stay private.
+PRIVATE_TITLE = re.compile(r"(incognito|private browsing|pass[- ]wizard|pass[- ]copy|\bpass (show|insert)\b|pinentry)", re.I)
+os.makedirs(CAPS, exist_ok=True)
+
+
+def log(msg):
+    line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def hypr_json(what):
+    try:
+        out = subprocess.run(["hyprctl", what, "-j"], capture_output=True, text=True, timeout=3).stdout
+        return json.loads(out)
+    except Exception as e:  # noqa: BLE001
+        log(f"hyprctl {what} failed: {e}")
+        return None
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def is_private(c):
+    return bool(PRIVATE_CLASS.search(c.get("class") or "") or PRIVATE_TITLE.search(c.get("title") or ""))
+
+
+# ── STAGE 1: capture every workspace, hidden ones included ─────────────────
+# On-screen displays and short-lived pop-ups: never a workspace "change", never
+# captured, never named to Sonnet (round 3: mic-osd alone caused 8 of 14 change
+# triggers on ws 3 in 34 min). Matched against the window class.
+TRANSIENT_CLASSES = re.compile(
+    r"^(mic-osd|swayosd.*|.*-osd|osd-.*|hyprwhspr.*|walker|wofi|rofi|fuzzel|mako|dunst|"
+    r"xdg-desktop-portal.*|org\.gnome\.polkit.*|polkit-.*|pinentry.*|gcr-prompter|"
+    r"hyprpolkitagent|nm-applet|blueberry.*|bar-touch.*|workspace-labels)$", re.I)
+YOUNG = 20          # s: a window must live this long before it counts as a change
+
+
+def workspace_clients(clients=None):
+    """{ws_id: [client, ...]} for normal workspaces (special ones and OSD /
+    pop-up classes in TRANSIENT_CLASSES skipped)."""
+    out = {}
+    for c in clients if clients is not None else (hypr_json("clients") or []):
+        ws = c.get("workspace", {}).get("id", -1)
+        if ws is None or ws < 1 or not c.get("mapped"):
+            continue
+        if TRANSIENT_CLASSES.match(c.get("class") or c.get("initialClass") or ""):
+            continue
+        out.setdefault(ws, []).append(c)
+    return out
+
+
+def desk_of(ws):
+    """His 2026-11-06: one label per DIGIT. Desktop N = workspace N + its
+    workspace-pair half N+10 (Super+N twice). Other ids stand alone."""
+    return ws - 10 if 11 <= ws <= 20 else ws
+
+
+def desk_halves(d):
+    return (d, d + 10) if 1 <= d <= 10 else (d,)
+
+
+def desk_clients(clients=None):
+    """{desk: [client, ...]} over both halves; each client keeps its real workspace."""
+    out = {}
+    for ws, cs in workspace_clients(clients).items():
+        out.setdefault(desk_of(ws), []).extend(cs)
+    return out
+
+
+def monitor_for(ws_id, monitors, workspaces):
+    mid = next((w.get("monitorID") for w in workspaces if w.get("id") == ws_id), None)
+    mon = next((m for m in monitors if m.get("id") == mid), None) or (monitors[0] if monitors else None)
+    return mon
+
+
+def grim_window(stable_id, out_path):
+    t0 = time.monotonic()
+    try:
+        r = subprocess.run(["grim", "-T", stable_id, out_path], capture_output=True, timeout=CAPTURE_TIMEOUT)
+        ok = r.returncode == 0 and os.path.getsize(out_path) > 0
+        err = "" if ok else (r.stderr.decode(errors="replace").strip()[:120] or f"rc={r.returncode}")
+    except subprocess.TimeoutExpired:
+        ok, err = False, f"timeout {CAPTURE_TIMEOUT}s (no frame: paused or not redrawing)"
+    except OSError as e:
+        ok, err = False, str(e)
+    return ok, err, int((time.monotonic() - t0) * 1000)
+
+
+def png_text_save(pixbuf, path, meta):
+    keys = [f"tEXt::{k}" for k in meta]
+    pixbuf.savev(path, "png", keys, [str(v) for v in meta.values()])
+
+
+def capture_workspace(ws_id, clients, mon, tmpdir):
+    """Composite one workspace. Returns (png_path, report dict)."""
+    import gi
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf
+    mw, mh = int(mon["width"] / mon.get("scale", 1)), int(mon["height"] / mon.get("scale", 1))
+    if mon.get("transform", 0) in (1, 3, 5, 7):
+        mw, mh = mh, mw
+    mx, my = mon.get("x", 0), mon.get("y", 0)
+    scale = THUMB_W / mw
+    W, H = THUMB_W, int(mh * scale)
+    canvas = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, W, H)
+    canvas.fill(0x11221Cff)
+    report = {"ws": ws_id, "created": now_iso(), "windows": []}
+    # Draw the least recently focused first so the focused window ends on top;
+    # tiled before floating.
+    order = sorted(clients, key=lambda c: (c.get("floating", False), -c.get("focusHistoryID", 0)))
+    # His 2026-11-06: on a fullscreen workspace "look at the windows in the
+    # background" too. Every window is captured on its own anyway (grim -T), so
+    # the composite becomes a mosaic: the fullscreen window first, then each
+    # window behind it in its own cell, none hidden.
+    mosaic = any(c.get("fullscreen") for c in clients) and len(clients) > 1
+    if mosaic:
+        import math
+        order = sorted(clients, key=lambda c: (not c.get("fullscreen"), c.get("focusHistoryID", 99)))
+        cols = math.ceil(math.sqrt(len(order)))
+        rows = math.ceil(len(order) / cols)
+        cell_w, cell_h = W // cols, H // rows
+        report["mosaic"] = True
+    # Prime pass (see PRIME_GAP): ask every capturable window for a fresh frame.
+    primed = {}
+    for c in order:
+        if c.get("stableId") and not is_private(c):
+            pp = os.path.join(tmpdir, f"prime-{c['stableId']}.png")
+            primed[c["stableId"]] = grim_window(c["stableId"], pp)
+    if any(r[0] for r in primed.values()):
+        time.sleep(PRIME_GAP)
+    for idx, c in enumerate(order):
+        sid = c.get("stableId") or ""
+        x, y = c["at"][0] - mx, c["at"][1] - my
+        w, h = c["size"]
+        item = {"stableId": sid, "class": c.get("class"), "x": x, "y": y, "w": w, "h": h}
+        if is_private(c):
+            item.update(ok=False, why="private (privacy filter, not captured)")
+            report["windows"].append(item)
+            continue
+        onscreen = x < mw and y < mh and x + w > 0 and y + h > 0
+        if not onscreen and not mosaic:
+            item.update(ok=False, why="off-screen position")
+            report["windows"].append(item)
+            continue
+        p = os.path.join(tmpdir, f"{sid}.png")
+        if sid in primed and not primed[sid][0]:
+            ok, err, ms = primed[sid]          # no frame on the prime: do not wait twice
+        else:
+            ok, err, ms = grim_window(sid, p)
+        item.update(ok=ok, ms=ms)
+        if not ok:
+            item["why"] = err
+            report["windows"].append(item)
+            continue
+        try:
+            src = GdkPixbuf.Pixbuf.new_from_file(p)
+            item["buffer"] = [src.get_width(), src.get_height()]
+            dw, dh = max(1, int(w * scale)), max(1, int(h * scale))
+            dx, dy = int(x * scale), int(y * scale)
+            if mosaic:                        # fit the window into its grid cell
+                cx, cy = (idx % cols) * cell_w, (idx // cols) * cell_h
+                f = min((cell_w - 8) / max(1, w), (cell_h - 8) / max(1, h))
+                dw, dh = max(1, int(w * f)), max(1, int(h * f))
+                dx, dy = cx + (cell_w - dw) // 2, cy + (cell_h - dh) // 2
+            # clip to canvas
+            cx0, cy0 = max(dx, 0), max(dy, 0)
+            cx1, cy1 = min(dx + dw, W), min(dy + dh, H)
+            if cx1 > cx0 and cy1 > cy0:
+                src.composite(canvas, cx0, cy0, cx1 - cx0, cy1 - cy0, dx, dy,
+                              dw / src.get_width(), dh / src.get_height(),
+                              GdkPixbuf.InterpType.BILINEAR, 255)
+            item["crc"] = zlib.crc32(src.get_pixels()) & 0xFFFFFFFF
+        except Exception as e:  # noqa: BLE001
+            item.update(ok=False, why=f"decode: {e}")
+        report["windows"].append(item)
+    out = os.path.join(CAPS, f"ws-{ws_id}.png")
+    meta = {
+        "source": f"hyprland workspace {ws_id}; windows " + ",".join(
+            f"{i['stableId']}={i['class']}" for i in report["windows"]),
+        "pipeline": "local-bootstrapping/dotfiles/local-bin/workspace-labels capture",
+        "created": report["created"],
+        "workspace": str(ws_id),
+    }
+    png_text_save(canvas, out + ".tmp", meta)
+    os.replace(out + ".tmp", out)
+    report["png"] = out
+    report["ok"] = sum(1 for i in report["windows"] if i.get("ok"))
+    report["failed"] = [f"{i['class']}: {i.get('why')}" for i in report["windows"] if not i.get("ok")]
+    return out, report
+
+
+HEALTH_LOCK = threading.Lock()
+
+
+def capture(ws_ids=None):
+    clients = hypr_json("clients") or []
+    monitors = hypr_json("monitors") or []
+    workspaces = hypr_json("workspaces") or []
+    by_ws = workspace_clients(clients)
+    visible = {m.get("activeWorkspace", {}).get("id") for m in monitors}
+    reports = {}
+    # All workspaces at once: grim -T in parallel is safe (17 windows in 0.5 s,
+    # all 17 frames OK, measured 2026-11-02).
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(ws):
+        t0 = time.monotonic()
+        _, r = capture_workspace(ws, by_ws[ws], monitor_for(ws, monitors, workspaces), tmp)
+        r["visible"] = ws in visible
+        r["ms"] = int((time.monotonic() - t0) * 1000)
+        return ws, r
+    with tempfile.TemporaryDirectory(prefix="wsl-") as tmp:
+        todo = [ws for ws in sorted(ws_ids or by_ws) if ws in by_ws]
+        with ThreadPoolExecutor(max_workers=max(1, min(8, len(todo)))) as pool:
+            for ws, r in pool.map(one, todo):
+                reports[ws] = r
+    with HEALTH_LOCK:
+        health = load_json(HEALTH, {})
+        for ws, r in reports.items():
+            health[str(ws)] = r
+        save_json(HEALTH, health)
+    return reports
+
+
+def capture_desks(desks):
+    """Capture each desktop: every half with windows (hidden halves too), the
+    halves stacked into one image (top = N, bottom = N+10) with provenance."""
+    import gi
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf
+    by_ws = workspace_clients()
+    halves = [h for d in desks for h in desk_halves(d) if by_ws.get(h)]
+    reps = capture(halves) if halves else {}
+    out = {}
+    for d in desks:
+        hs = [h for h in desk_halves(d) if h in reps]
+        if not hs:
+            continue
+        r = {"ws": d, "halves": hs, "created": now_iso(), "windows": [], "ok": 0, "failed": [],
+             "ms": max(reps[h]["ms"] for h in hs), "visible": any(reps[h]["visible"] for h in hs)}
+        for h in hs:
+            r["windows"] += reps[h]["windows"]; r["ok"] += reps[h]["ok"]; r["failed"] += reps[h]["failed"]
+        if len(hs) == 1:
+            r["png"] = reps[hs[0]]["png"]
+        else:
+            pbs = [GdkPixbuf.Pixbuf.new_from_file(reps[h]["png"]) for h in hs]
+            W = max(pb.get_width() for pb in pbs); H = sum(pb.get_height() for pb in pbs) + 8 * (len(pbs) - 1)
+            canvas = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, W, H)
+            canvas.fill(0x000000ff)
+            y = 0
+            for pb in pbs:
+                pb.copy_area(0, 0, pb.get_width(), pb.get_height(), canvas, 0, y)
+                y += pb.get_height() + 8
+            png = os.path.join(CAPS, f"desk-{d}.png")
+            png_text_save(canvas, png + ".tmp", {
+                "source": f"hyprland desktop {d} = workspaces {' + '.join(map(str, hs))} (stacked top to bottom); "
+                          + "; ".join(f"ws {h}: windows " + ",".join(f"{w['stableId']}={w['class']}" for w in reps[h]["windows"]) for h in hs),
+                "pipeline": "local-bootstrapping/dotfiles/local-bin/workspace-labels capture_desks",
+                "created": r["created"], "workspace": ",".join(map(str, hs))})
+            os.replace(png + ".tmp", png)
+            r["png"] = png
+        out[d] = r
+    return out
+
+
+def cmd_capture(args):
+    reps = capture([int(a) for a in args] or None)
+    for ws, r in reps.items():
+        tag = "visible" if r["visible"] else "hidden "
+        print(f"ws {ws} {tag} {r['ok']}/{len(r['windows'])} windows in {r['ms']} ms -> {r['png']}")
+        for f in r["failed"]:
+            print(f"     fallback to title: {f}")
+
+
+
+# ── STAGE 2: what is on a workspace (prompt facts + change signature) ──────
+SPINNER = "✳✻✶✽✢·◐◑◒◓⠂⠐⠈⠁⠄⠠⠀"
+SHORT = {"com.mitchellh.ghostty": "terminal", "google-chrome": "Chrome", "firefox": "Firefox",
+         "firefox-developer-edition": "Firefox Developer Edition", "mpv": "mpv", "kitty": "terminal",
+         "Alacritty": "terminal", "foot": "terminal", "org.gnome.Nautilus": "Files", "thunar": "Files"}
+
+
+def short_class(cls):
+    cls = cls or "?"
+    if cls in SHORT:
+        return SHORT[cls]
+    m = re.match(r"chrome-([^_]+)__", cls)
+    if m:
+        return f"{m.group(1)} web app"
+    return cls.split(".")[-1]
+
+
+def scrub(text):
+    """Privacy filter for text that leaves the laptop (SPEC §5)."""
+    t = text or ""
+    t = re.sub(r"(https?://[^\s?#]+)[?#]\S*", r"\1", t)                       # URL query strings
+    t = re.sub(r"\b(?:sk|ghp|gho|xox[abp]|AKIA|AIza)[-_A-Za-z0-9]{10,}", "[secret]", t)
+    t = re.sub(r"\b(?=[A-Za-z0-9+_-]*\d)(?=[A-Za-z0-9+_-]*[A-Za-z])[A-Za-z0-9+_-]{32,}={0,2}", "[secret]", t)  # token-like runs (paths kept)
+    t = re.sub(r"(?i)(password|passwd|token|secret|api[-_ ]?key)\s*[:=]\s*\S+", r"\1 [redacted]", t)
+    return t.strip()
+
+
+def proc_children(pid):
+    out = []
+    try:
+        for tid in os.listdir(f"/proc/{pid}/task"):
+            with open(f"/proc/{pid}/task/{tid}/children") as f:
+                out += [int(x) for x in f.read().split()]
+    except OSError:
+        pass
+    return out
+
+
+def terminal_fg(pid):
+    """(program, cwd) running in the foreground of a terminal whose process owns
+    exactly one window. None when unknown."""
+    for child in proc_children(pid):
+        try:
+            with open(f"/proc/{child}/stat") as f:
+                st = f.read()
+            tpgid = int(st[st.rindex(")") + 2:].split()[5])
+            fg = tpgid if tpgid > 0 else child
+            # a program started inside the shell's own process group (no job
+            # control, e.g. `claude` from a wrapper) leaves tpgid = the shell:
+            # walk down to the newest descendant
+            for _ in range(4):
+                kids = proc_children(fg)
+                if not kids:
+                    break
+                fg = kids[-1]
+            with open(f"/proc/{fg}/comm") as f:
+                comm = f.read().strip()
+            try:
+                cwd = os.readlink(f"/proc/{fg}/cwd")
+            except OSError:
+                cwd = ""
+            return comm, cwd.replace(os.path.expanduser("~"), "~")
+        except (OSError, ValueError, IndexError):
+            continue
+    return None
+
+
+CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
+_tail_cache = {}
+
+
+def _descendants(pid, depth=5):
+    out, frontier = [], [pid]
+    for _ in range(depth):
+        nxt = []
+        for p in frontier:
+            kids = proc_children(p)
+            out += kids; nxt += kids
+        frontier = nxt
+    return out
+
+
+def find_session_file(title, pid=None):
+    """The Claude Code transcript behind a terminal: by the session's ai-title
+    (the terminal title Claude sets), else by the `claude` process under a
+    single-window terminal (--resume id, then newest file in its cwd's folder)."""
+    import glob
+    cutoff = time.time() - 3 * 86400
+    files = [f for f in glob.glob(os.path.join(CLAUDE_PROJECTS, "*", "*.jsonl")) if os.path.getmtime(f) > cutoff]
+    if title:
+        needle = '"aiTitle":' + json.dumps(title, ensure_ascii=False)
+        try:
+            r = subprocess.run(["grep", "-l", "-F", needle, *files], capture_output=True, text=True, timeout=5)
+            hits = [h for h in r.stdout.splitlines() if h]
+            if hits:
+                return max(hits, key=os.path.getmtime)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if pid:
+        for d in _descendants(pid):
+            try:
+                with open(f"/proc/{d}/comm") as fh:
+                    if fh.read().strip() != "claude":
+                        continue
+                argv = open(f"/proc/{d}/cmdline").read().split("\0")
+                cwd = os.readlink(f"/proc/{d}/cwd")
+            except OSError:
+                continue
+            folder = os.path.join(CLAUDE_PROJECTS, re.sub(r"[^A-Za-z0-9]", "-", cwd))
+            if "--resume" in argv and argv.index("--resume") + 1 < len(argv):
+                f = os.path.join(folder, argv[argv.index("--resume") + 1] + ".jsonl")
+                if os.path.exists(f):
+                    return f
+            cands = [f for f in glob.glob(os.path.join(folder, "*.jsonl"))
+                     if os.path.getmtime(f) >= os.stat(f"/proc/{d}").st_mtime - 60]
+            if cands:
+                return max(cands, key=os.path.getmtime)
+    return None
+
+
+def session_recent_text(path, n=200):
+    """Last thing he wrote and the last thing Claude said in a transcript,
+    privacy-scrubbed, each at most n characters. Cached per (path, mtime)."""
+    try:
+        key = (path, os.path.getmtime(path))
+    except OSError:
+        return ""
+    if key in _tail_cache:
+        return _tail_cache[key]
+    with open(path, "rb") as fh:
+        fh.seek(0, 2); size = fh.tell(); fh.seek(max(0, size - 400_000))
+        lines = fh.read().decode(errors="replace").splitlines()
+    said = wrote = ""
+    for line in reversed(lines):
+        if said and wrote:
+            break
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        if m.get("isSidechain") or m.get("isMeta"):
+            continue
+        c = (m.get("message") or {}).get("content")
+        texts = [c] if isinstance(c, str) else [b.get("text", "") for b in c or [] if isinstance(b, dict) and b.get("type") == "text"]
+        t = " ".join(x for x in texts if x and not x.lstrip().startswith("<")).strip()
+        if not t:
+            continue
+        if m.get("type") == "assistant" and not said:
+            said = t
+        elif m.get("type") == "user" and not wrote:
+            wrote = t
+    # cc-stretch {{short|long}} markup -> the short form
+    clip = lambda x: scrub(" ".join(re.sub(r"\{\{([^|{}]*)\|[^{}]*\}\}", r"\1", x).split()))[:n]
+    out = ""
+    if wrote:
+        out += f"He last wrote: \"{clip(wrote)}\". "
+    if said:
+        out += f"Claude last said: \"{clip(said)}\"."
+    _tail_cache[key] = out.strip()
+    return _tail_cache[key]
+
+
+def facts(ws_clients, all_clients, sessions=True):
+    """One dict per window: what it is and what it is doing, privacy-filtered."""
+    pid_count = {}
+    for c in all_clients:
+        pid_count[c.get("pid")] = pid_count.get(c.get("pid"), 0) + 1
+    out = []
+    for c in sorted(ws_clients, key=lambda c: c.get("focusHistoryID", 99)):
+        f = {"class": c.get("class") or "?", "kind": short_class(c.get("class")), "address": c.get("address"),
+             "focus": c.get("focusHistoryID", 99), "private": is_private(c),
+             "ws": c.get("workspace", {}).get("id"), "fullscreen": bool(c.get("fullscreen")),
+             "title": "" if is_private(c) else scrub(c.get("title")), "fg": None, "cwd": ""}
+        if f["class"] in TERMINALS and pid_count.get(c.get("pid")) == 1:
+            r = terminal_fg(c.get("pid"))
+            if r:
+                f["fg"], f["cwd"] = r
+        f["claude"] = ""
+        if f["class"] in TERMINALS and not f["private"]:
+            topic = (c.get("title") or "").lstrip(SPINNER + " ").strip()
+            is_claude = (c.get("title") or "")[:1] in SPINNER or f["fg"] == "claude"
+            if is_claude and sessions:      # transcript lookup: labeller only, never on the GTK tick
+                sf = find_session_file(topic if topic and topic != "Ghostty" else None,
+                                       c.get("pid") if pid_count.get(c.get("pid")) == 1 else None)
+                if sf:
+                    f["claude"] = session_recent_text(sf)
+                    if GENERIC_SESSION.match(topic or "") or not topic or topic == "Ghostty":
+                        tp = session_topic(sf)
+                        if tp:
+                            _topic_cache[c.get("address")] = tp
+        out.append(f)
+    return out
+
+
+def activity_phrase(f):
+    p = _activity_phrase(f)
+    if f.get("half2"):
+        p += f" (second half, workspace {f['ws']})"
+    if f.get("fullscreen"):
+        p += " (fullscreen)"
+    return p
+
+
+def _activity_phrase(f):
+    if f["private"]:
+        return f"a private {f['kind']} window"
+    title = f["title"].lstrip(SPINNER + " ").strip()
+    if f["kind"] == "terminal":
+        if f["title"][:1] in SPINNER and title:
+            return f"a Claude Code session about \"{title}\" in a terminal"
+        if f["fg"] and f["fg"] not in ("bash", "zsh", "fish", "sh"):
+            where = f" in {f['cwd']}" if f["cwd"] else ""
+            return f"{f['fg']} running in a terminal{where}" + (f" (\"{title}\")" if title else "")
+        return f"a terminal at \"{title}\"" if title else "an idle terminal"
+    if title:
+        return f"{f['kind']} showing \"{title[:90]}\""
+    return f"a {f['kind']} window"
+
+
+# His 2026-11-06: "Lets make it comprehensive, so that word limit doesn't limit
+# the relevant info being provided." -> no word cap, one line per activity.
+# His 2026-11-09: "now consistently the text is too long. that should not
+# happen." -> a BUDGET instead of a cap on words: one bullet per WINDOW (or
+# Claude session), not per topic, so every window is still covered but a busy
+# session is one line, not a table of its sub-topics. clean_label() enforces
+# the budget (HEAD_WORDS / BULLETS / BULLET_WORDS) when the model overshoots.
+HEAD_WORDS = 8        # headline
+BULLETS = 5           # at most this many bullets (one per window / session)
+BULLET_WORDS = 14     # asked of the model; clean_label cuts at BULLET_WORDS + 8
+REPLY_INSTRUCTION = (f"Reply with a headline of at most {HEAD_WORDS} words naming the main activity, then one bullet ('- ') "
+                     f"per window or Claude session (one line each, never one per topic), at most {BULLETS} bullets, "
+                     f"each at most {BULLET_WORDS} words: the one most specific fact (project, topic, page, state). No filler.")
+
+
+def english_prompt(ws, fs, failed=()):
+    if len({f.get("ws") for f in fs}) > 1:          # both halves of the desktop have windows
+        for f in fs:
+            f["half2"] = f.get("ws") != ws
+    return _english_prompt(ws, fs, failed)
+
+
+def _english_prompt(ws, fs, failed=()):
+    if not fs:
+        return f"Workspace {ws} is empty.\n" + REPLY_INSTRUCTION
+    first = activity_phrase(fs[0]).rstrip(".")
+    line1 = first[0].upper() + first[1:]
+    if len(fs) > 1:
+        line1 += f", while {activity_phrase(fs[1])}"
+    lines = [line1 + "."]
+    rest = fs[2:5]
+    for f in rest:
+        p = activity_phrase(f)
+        lines.append(p[0].upper() + p[1:] + ".")
+    if len(fs) > 5:
+        lines.append(f"{len(fs) - 5} more windows are open.")
+    for f in [f for f in fs if f.get("claude")][:3]:
+        topic = f["title"].lstrip(SPINNER + " ").strip() or "a Claude session"
+        lines.append(f"Recent text in the Claude session \"{topic}\": {f['claude']}")
+    if failed:
+        lines.append("Not in the screenshot (named from their titles only): " + ", ".join(failed) + ".")
+    lines.append(REPLY_INSTRUCTION)
+    return "\n".join(lines)
+
+
+# A fresh terminal's title is its cwd ("~/Programs", "~"), the shell's name
+# ("bash": ghostty -e bash) or "Ghostty": all generic (2026-11-09 test: "bash"
+# was labelled by Sonnet as 'Idle empty terminal', a call for nothing).
+GENERIC_TITLE = re.compile(r"^(ghostty|mozilla firefox|firefox developer edition|google chrome|new tab|about:blank.*|"
+                           r"[\w.-]+@[\w.-]+:.*|web\.whatsapp\.com.*|bash|zsh|fish|sh|~(/\S*)?|/home/\S*)$", re.I)
+
+
+GENERIC_SESSION = re.compile(r"^(continue previous work|claude code|claude|new (session|conversation|chat)|untitled|"
+                             r"general (chat|question)s?|resum(e|ing).*|help)$", re.I)
+_topic_cache = {}                     # window address -> topic from its Claude transcript
+
+
+def session_topic(path, n=70):
+    """The session's own ask: its first real user message, scrubbed (free, no model)."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(600_000).decode(errors="replace").splitlines()
+    except OSError:
+        return ""
+    for line in head:
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        if m.get("type") == "ai-title" and m.get("aiTitle") and not GENERIC_SESSION.match(m["aiTitle"]):
+            return scrub(m["aiTitle"])[:n]
+        if m.get("type") != "user" or m.get("isMeta") or m.get("isSidechain"):
+            continue
+        c = (m.get("message") or {}).get("content")
+        texts = [c] if isinstance(c, str) else [b.get("text", "") for b in c or [] if isinstance(b, dict) and b.get("type") == "text"]
+        t = " ".join(x for x in texts if x and not x.lstrip().startswith("<")).strip()
+        # skip 'lets continue the work' style openers: too short to say anything
+        if t and len(t) >= 25 and not re.match(r"(?i)^(let'?s |please )?(continue|resume|go on|carry on)\b", t):
+            t = scrub(" ".join(t.split()))
+            return t if len(t) <= n else t[:n].rsplit(" ", 1)[0] + "…"
+    # nothing usable at the start: what Claude last said about it
+    last = session_recent_text(path, 70)
+    mm = re.search(r'Claude last said: "(.*?)"', last)
+    return mm.group(1) if mm else ""
+
+
+def window_topic(f):
+    """One line for one window, free: Claude session topic, page title, program."""
+    if f["private"]:
+        return "private window"
+    t = f["title"]
+    for _ in range(2):                # "… - YouTube - Google Chrome"
+        t = re.sub(r"\s+[-—–|]\s+(Google Chrome|Mozilla Firefox|Firefox Developer Edition|YouTube|mpv|Thunar)$", "", t)
+    t = t.lstrip(SPINNER + " ").strip()
+    if GENERIC_SESSION.match(t) and _topic_cache.get(f.get("address")):
+        return _topic_cache[f["address"]]
+    if t and not GENERIC_TITLE.match(t):
+        return t[:90]
+    if f["fg"] and f["fg"] not in ("bash", "zsh", "fish", "sh"):
+        return f"{f['fg']} in {f['cwd'] or '~'}"
+    if f["kind"] == "terminal":
+        return f"terminal in {f['cwd'] or '~'}" if f.get("cwd") else "idle terminal"
+    return f["kind"]
+
+
+def fallback_label(fs):
+    """Label without a model (gate closed, offline, or Sonnet failed): one line
+    per window, most recently focused first (his 2026-11-06: comprehensive,
+    every window, not only the focused one). Line 1 is the headline."""
+    lines = list(dict.fromkeys(window_topic(f) for f in fs))
+    return "\n".join(lines[:BULLETS + 1]) or "empty"
+
+
+# ── his 2026-11-09 ask 1: a fresh terminal / a browser with no tab is not a
+# workspace to label yet; it "awaits" and relabels the moment work starts ──
+IDLE_BROWSER = re.compile(r"^(new tab|about:blank.*|untitled|google chrome|chromium|mozilla firefox|firefox developer edition|brave)?$", re.I)
+APP_SUFFIX = re.compile(r"\s+[-—–|]\s+(Google Chrome|Chromium|Mozilla Firefox|Firefox Developer Edition|Brave)$")
+
+
+def idle_window(f):
+    """True for a window with nothing to label yet: a terminal at its shell (or
+    Claude started but no prompt given, title still generic), or a browser
+    window showing no page. His words 2026-11-09: 'a new terminal gets opened
+    and I take some time to start claude on it ... or I open a new browser
+    window and don't open any tab'."""
+    if f["private"]:
+        return False
+    title = f["title"].lstrip(SPINNER + " ").strip()
+    if f["kind"] == "terminal":
+        if f["fg"] == "claude":
+            return not title or title == "Ghostty" or bool(GENERIC_SESSION.match(title))
+        at_shell = not f["fg"] or f["fg"] in ("bash", "zsh", "fish", "sh")
+        return at_shell and (not title or bool(GENERIC_TITLE.match(title)))
+    if f["class"] in BROWSERS:
+        return bool(IDLE_BROWSER.match(APP_SUFFIX.sub("", title).strip()))
+    return False
+
+
+def awaiting(fs):
+    """Every window on the desk is idle: no model call, label = the free
+    titles, and the daemon watches it closely (FAST_POLL + title events)."""
+    return bool(fs) and all(idle_window(f) for f in fs)
+
+
+def signature(fs, young=()):
+    """What counts as a change (his words): windows opening/closing/moving and the
+    terminal program changing; NOT the text on them, NOT their size. Windows in
+    `young` (alive < YOUNG s) do not count yet."""
+    return sorted(f["class"] + (":" + f["fg"] if f["fg"] else "") for f in fs if f.get("address") not in young)
+
+
+def image_fingerprint(png):
+    """Coarse picture of a workspace: 16x9 grey cells, 4 levels. Text scrolling
+    in a terminal rarely changes it; a new page or app does."""
+    try:
+        import gi
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf
+        pb = GdkPixbuf.Pixbuf.new_from_file(png).scale_simple(16, 9, GdkPixbuf.InterpType.TILES)
+        px, n, rs = pb.get_pixels(), pb.get_n_channels(), pb.get_rowstride()
+        return "".join(str(sum(px[y * rs + x * n + k] for k in range(3)) // 3 // 64)
+                       for y in range(9) for x in range(16))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+FP_TOLERANCE = 8    # of 144 cells: video / a blinking cursor moved 3 cells in 10 s (measured)
+
+
+def input_hash(fs, png):
+    """What Sonnet would be shown: (facts hash, image fingerprint). Facts are
+    order-free: window set, terminal programs, titles without Claude's spinner,
+    Claude session last text."""
+    import hashlib
+    rows = sorted(f"{f['class']}|{f['fg']}|{f['title'].lstrip(SPINNER + ' ')}|{f.get('claude', '')}" for f in fs)
+    return hashlib.sha1("\n".join(rows).encode()).hexdigest()[:16], image_fingerprint(png)
+
+
+def same_input(a, b):
+    """Round 3: skip the call when the facts are identical and at most
+    FP_TOLERANCE coarse image cells differ."""
+    if not a or not b or a[0] != b[0] or len(a[1]) != len(b[1]):
+        return False
+    return sum(x != y for x, y in zip(a[1], b[1])) <= FP_TOLERANCE
+
+
+def describe_all(sessions=True):
+    """Facts per DESKTOP (both workspace-pair halves together)."""
+    clients = hypr_json("clients") or []
+    by_desk = desk_clients(clients)
+    return {d: facts(cs, clients, sessions) for d, cs in by_desk.items()}
+
+
+def cmd_prompt(args):
+    ws = int(args[0])
+    fs = describe_all().get(ws, [])
+    print(english_prompt(ws, fs))
+    print("signature:", signature(fs))
+
+
+# ── shared spend ledger (USD 200/week for all automatic loops) ─────────────
+LEDGER = "~/.local/share/agent-loops/spend.jsonl"
+# Local spend not yet on the desktop ledger (round 4: kept until it is appended,
+# counted toward the cap meanwhile). The old name is migrated on first use.
+LEDGER_PENDING = os.path.join(STATE, "unsynced.jsonl")
+_OLD_PENDING = os.path.join(STATE, "spend-pending.jsonl")
+# Last successful read of the desktop ledger: {"week": week_start, "usd": sum, "t": when}.
+# Offline, the gate uses it plus local unsynced spend (round 4: offline used to
+# forget the 255.21 and open the gate).
+LEDGER_CACHE = os.path.join(STATE, "ledger-cache.json")
+# His words 2026-11-06 02:2x: "For each individual agent, the weekly limit will be
+# 50usd. The overall limit will be 300usd." (was USD 200 overall, 11-01)
+CAP_USD = 300.0
+LOOP_CAP_USD = 50.0
+LOCAL_UNSYNCED_LIMIT = 5.0     # spend allowed while the desktop is unreachable
+DESKTOP_HOSTS = tuple(os.environ.get("WSL_DESKTOP_HOSTS", "desktop-lan desktop").split())   # LAN first; Tailscale only the fallback; env = tests
+
+
+def week_start(now=None):
+    """Last Friday 10:35 IST as epoch (the cap's reset, his words 2026-11-01)."""
+    from datetime import timedelta
+    ist = timezone(timedelta(hours=5, minutes=30))
+    d = datetime.fromtimestamp(now or time.time(), ist)
+    back = (d.weekday() - 4) % 7
+    s = (d - timedelta(days=back)).replace(hour=10, minute=35, second=0, microsecond=0)
+    if s > d:
+        s -= timedelta(days=7)
+    return s.timestamp()
+
+
+_last_host = {"h": None}
+
+
+def _ssh(cmd, stdin=None):
+    """Run cmd on the desktop; the host that answered last is tried first."""
+    hosts = sorted(DESKTOP_HOSTS, key=lambda h: h != _last_host["h"])
+    for h in hosts:
+        try:
+            r = subprocess.run(["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", h, cmd],
+                               input=stdin, capture_output=True, text=True, timeout=25)
+            if r.returncode == 0:
+                _last_host["h"] = h
+                return r.stdout
+        except subprocess.TimeoutExpired:
+            continue
+    return None
+
+
+# Summed ON the desktop: the ledger is ~0.5 MB and `cat` over a phone hotspot
+# overran the old 15 s timeout, which made a reachable desktop look offline.
+_REMOTE_SUM = ("python3 -c 'import json,sys\nt=0.0\nm=0.0\nfor l in open(sys.argv[1]):\n"
+               " try:\n  r=json.loads(l)\n  u=float(r.get(\"usd\",0)) if float(r.get(\"ts\",0))>=float(sys.argv[2]) else 0\n"
+               "  t+=u\n  m+=u if r.get(\"loop\")==sys.argv[3] else 0\n"
+               " except Exception: pass\nprint(t, m)' " + LEDGER + " {ws0} " + APP + " 2>/dev/null || echo 0 0")
+
+
+LEDGER_LOCK = threading.RLock()     # parallel labellers must not send a line twice
+
+
+def _unsynced_lines():
+    if os.path.exists(_OLD_PENDING):
+        with open(_OLD_PENDING) as f, open(LEDGER_PENDING, "a") as g:
+            g.write(f.read())
+        os.remove(_OLD_PENDING)
+    try:
+        with open(LEDGER_PENDING) as f:
+            return [ln for ln in f.read().splitlines() if ln.strip()]
+    except OSError:
+        return []
+
+
+def _week_usd(lines, ws0):
+    tot = 0.0
+    for ln in lines:
+        try:
+            r = json.loads(ln)
+            if float(r.get("ts", 0)) >= ws0:
+                tot += float(r.get("usd", 0))
+        except (ValueError, TypeError):
+            pass
+    return tot
+
+
+def flush_pending():
+    """Append local unsynced lines to the desktop ledger; on success clear them
+    and add them to the cached week total (the cache stays the desktop's sum)."""
+    with LEDGER_LOCK:
+        lines = _unsynced_lines()
+        if not lines:
+            return True
+        if _ssh(f"mkdir -p ~/.local/share/agent-loops && cat >> {LEDGER}", stdin="\n".join(lines) + "\n") is None:
+            return False
+        ws0 = week_start()
+        cache = load_json(LEDGER_CACHE, {})
+        if cache.get("week") == ws0:
+            cache["usd"] = float(cache.get("usd", 0)) + _week_usd(lines, ws0)
+            cache["loop_usd"] = float(cache.get("loop_usd", 0)) + _week_usd(lines, ws0)
+            save_json(LEDGER_CACHE, cache)
+        os.remove(LEDGER_PENDING)
+        log(f"ledger: appended {len(lines)} unsynced line(s) to the desktop ledger")
+        return True
+
+
+def ledger_week():
+    """(desktop week total, local unsynced week total, reachable, cache age s).
+    Unreachable: the desktop total is the cached one of THIS week (0 after the
+    Friday 10:35 IST reset)."""
+    ws0 = week_start()
+    with LEDGER_LOCK:
+        unsynced = _week_usd(_unsynced_lines(), ws0)
+    out = _ssh(_REMOTE_SUM.format(ws0=ws0))
+    try:
+        total, mine = (float(x) for x in out.strip().splitlines()[-1].split()[:2]) if out is not None else (None, None)
+    except (ValueError, IndexError, AttributeError):
+        total, mine = None, None
+    ledger_week.mine = None
+    if total is not None:
+        save_json(LEDGER_CACHE, {"week": ws0, "usd": total, "loop_usd": mine, "t": time.time()})
+        ledger_week.mine = mine + unsynced
+        return total, unsynced, True, 0
+    cache = load_json(LEDGER_CACHE, {})
+    if cache.get("week") == ws0:
+        ledger_week.mine = float(cache.get("loop_usd", 0)) + unsynced
+        return float(cache.get("usd", 0)), unsynced, False, time.time() - float(cache.get("t", 0))
+    return 0.0, unsynced, False, None
+
+
+_gate = {"t": 0, "val": None, "told": 0}
+# Only he raises the cap. His override for THIS loop is a state file:
+# {"until": epoch, "since": epoch, "reason": "...", "safety_usd": 5}. While
+# now < until the shared USD 200 total is ignored for workspace-labels, but
+# every call still goes to the desktop ledger, the offline unsynced limit
+# still holds, and this loop stops at safety_usd spent since `since`.
+CAP_OVERRIDE = os.path.join(STATE, "cap-override.json")
+SPEND_HISTORY = os.path.join(STATE, "spend-history.jsonl")   # every call of this loop, kept locally
+
+
+def _override():
+    o = load_json(CAP_OVERRIDE, {})
+    try:
+        if time.time() < float(o.get("until", 0)):
+            return o
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _own_spend_since(t0):
+    try:
+        with open(SPEND_HISTORY) as f:
+            return _week_usd(f.read().splitlines(), t0)
+    except OSError:
+        return 0.0
+
+
+def may_spend():
+    """Gate before each call: desktop week total (live, or cached when the
+    desktop is unreachable) + local unsynced spend must stay under CAP_USD, and
+    unsynced spend under LOCAL_UNSYNCED_LIMIT. Result cached 60 s open / 10 min
+    closed; ONE status line per week when it closes, never a question."""
+    if os.environ.get("WSL_CLAUDE") and not os.environ.get("WSL_TEST_GATE"):
+        return True, "test stub (WSL_CLAUDE set, no model call, nothing spent)"
+    if _gate["val"] and time.time() - _gate["t"] < (60 if _gate["val"][0] else 600):
+        return _gate["val"]
+    flush_pending()
+    desk, unsynced, reachable, age = ledger_week()
+    total = desk + unsynced
+    ov = _override()
+    if ov:
+        own = _own_spend_since(float(ov.get("since", 0)))
+        safety = float(ov.get("safety_usd", 5))
+        until = datetime.fromtimestamp(float(ov["until"])).strftime("%H:%M")
+        ok = own < safety and (reachable or unsynced < LOCAL_UNSYNCED_LIMIT)
+        val = (ok, f"gate {'open' if ok else 'closed'}: cap override until {until} ({ov.get('reason', '')}); "
+                   f"this loop USD {own:.2f} / safety {safety:.0f} since the override; shared week total USD {total:.2f}"
+                   + ("" if reachable else f"; desktop unreachable, unsynced USD {unsynced:.2f} / {LOCAL_UNSYNCED_LIMIT:.0f}"))
+        if _gate.get("ov_logged") != ov.get("until"):
+            _gate["ov_logged"] = ov.get("until")
+            log(f"gate open: cap override until {until} ({ov.get('reason', '')})")
+        _gate.update(t=time.time(), val=val)
+        return val
+    mine = ledger_week.mine if ledger_week.mine is not None else unsynced
+    if mine >= LOOP_CAP_USD:
+        val = (False, f"gate closed: this loop USD {mine:.2f} / {LOOP_CAP_USD:.0f} this week (overall USD {total:.2f} / {CAP_USD:.0f})")
+    elif reachable:
+        val = (total < CAP_USD, f"gate {'open' if total < CAP_USD else 'closed'}: week spend USD {total:.2f} / {CAP_USD:.0f}, "
+                                f"this loop USD {mine:.2f} / {LOOP_CAP_USD:.0f}")
+    else:
+        # No desktop total known for this week (no read since the Friday reset):
+        # closed until the desktop answers once. Never assume the week is empty.
+        src = f"cached desktop total USD {desk:.2f} ({age / 60:.0f} min old)" if age is not None else "week total UNKNOWN (no desktop read since the reset)"
+        ok = age is not None and total < CAP_USD and unsynced < LOCAL_UNSYNCED_LIMIT
+        val = (ok, f"gate {'open' if ok else 'closed'}: desktop ledger unreachable; {src} + local unsynced USD "
+                   f"{unsynced:.2f} (offline limit {LOCAL_UNSYNCED_LIMIT:.0f}) = {total:.2f} / {CAP_USD:.0f}")
+    _gate.update(t=time.time(), val=val)
+    if not val[0] and _gate["told"] < week_start():
+        _gate["told"] = time.time()
+        subprocess.run(["notify-send", "-a", APP, "Workspace labels paused",
+                        f"Agent-loop cap reached ({val[1]}); window names until the Friday 10:35 reset."],
+                       capture_output=True, timeout=5)
+    return val
+
+
+def ledger_add(usd, ok, what):
+    line = json.dumps({"ts": time.time(), "loop": APP, "usd": round(float(usd or 0), 5),
+                       "model": "sonnet", "ok": bool(ok), "what": what}) + "\n"
+    with LEDGER_LOCK:
+        _unsynced_lines()                    # migrate the old file first
+        with open(LEDGER_PENDING, "a") as f:
+            f.write(line)
+        with open(SPEND_HISTORY, "a") as f:
+            f.write(line)
+    _gate["val"] = None                      # re-check the gate on the next call
+    flush_pending()
+
+
+# ── STAGE 3: the labeller (claude -p, streamed, mapped to card events) ─────
+EFFORT = "low"
+CLAUDE = os.environ.get("WSL_CLAUDE") or shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+
+
+def first_line(s, n):
+    s = (s or "").strip().splitlines()[0] if (s or "").strip() else ""
+    return s[:n]
+
+
+def tool_input_short(name, inp):
+    if not isinstance(inp, dict):
+        return str(inp)[:80]
+    for k in ("command", "file_path", "path", "pattern", "url", "query"):
+        if k in inp:
+            v = str(inp[k])
+            return os.path.basename(v) if k == "file_path" else v[:80]
+    return json.dumps(inp)[:80]
+
+
+def cut_words(ln, n):
+    """At most n words; prefer to end at a clause boundary (, ; : .) within the
+    last third of the budget, else a clean word cut with an ellipsis."""
+    words = ln.split()
+    if len(words) <= n:
+        return ln
+    keep = " ".join(words[:n])
+    k = max(keep.rfind(", "), keep.rfind("; "), keep.rfind(": "), keep.rfind(". "))
+    if k >= len(keep) * 2 // 3:
+        return keep[:k].rstrip(",;:.") + "…"
+    return keep + "…"
+
+
+def clean_label(text, max_lines=BULLETS + 1):
+    """Multiline label: headline + one bullet per window. Markdown, bullets and
+    'Label:' prefixes removed; the budget (his 2026-11-09: 'consistently the
+    text is too long') is enforced here when the model overshoots it."""
+    out = []
+    for ln in (text or "").splitlines():
+        ln = ln.replace("**", "")
+        ln = re.sub(r"^\s*([-*•·]|\d+[.)])\s+", "", ln)
+        ln = re.sub(r"^(label|workspace label|headline)\s*:\s*", "", ln.strip(), flags=re.I)
+        ln = ln.strip().strip("`\"' ")
+        if ln:
+            ln = cut_words(ln, HEAD_WORDS + 4 if not out else BULLET_WORDS + 8)
+            out.append(ln)
+    return "\n".join(out[:max_lines])
+
+
+# Failures must be cheap and short (round 4: two calls right after a resume from
+# sleep, with Wi-Fi still reconnecting, each hung 124 s until the 120 s kill).
+FIRST_EVENT_S = float(os.environ.get("WSL_FIRST_EVENT_S", 30))   # no assistant output by then -> kill
+HARD_S = 75                       # whole call (slowest real label so far 44 s)
+BACKOFF_S = 300                   # after a failed or offline call: no calls for 5 min
+_net = {"t": 0, "ok": True, "backoff_until": 0}
+
+
+def api_reachable():
+    """TCP connect to the API host in <= 3 s, cached 20 s. Offline -> no call."""
+    if os.environ.get("WSL_CLAUDE"):
+        return True
+    if time.time() - _net["t"] < 20:
+        return _net["ok"]
+    try:
+        socket.create_connection(("api.anthropic.com", 443), timeout=3).close()
+        ok = True
+    except OSError:
+        ok = False
+    _net.update(t=time.time(), ok=ok)
+    return ok
+
+
+def run_labeller(ws, emit, reason="new", rep=None, prev_hash=None):
+    """Capture ws (hidden or not) unless `rep` already holds its capture, build the
+    prompt, stream Sonnet. emit(event) gets SPEC §4 events. Returns the label dict,
+    or {"skipped": True, ...} when the input equals prev_hash (nothing to call)."""
+    if rep is None:
+        rep = capture_desks([ws]).get(ws, {})
+    clients = hypr_json("clients") or []
+    fs = facts(desk_clients(clients).get(ws, []), clients)
+    ihash = list(input_hash(fs, rep.get("png") or ""))
+    if prev_hash and same_input(ihash, prev_hash):
+        return {"skipped": True, "hash": ihash, "sig": signature(fs)}
+    sig = signature(fs)
+    fallback = fallback_label(fs)
+    if awaiting(fs):
+        # his 2026-11-09 ask 1: nothing to label yet; the daemon relabels the
+        # moment work starts in it (FAST_POLL / a title change), not on the 10 s
+        # tick + 20 s settle. Decided BEFORE the ledger check (an ssh of up to 25 s).
+        log(f"ws {ws}: awaiting ({'; '.join(window_topic(f) for f in fs)}); no call until work starts in it")
+        return {"label": fallback, "sig": sig, "fallback": True, "awaiting": True, "hash": ihash}
+    ok_spend, why = may_spend()
+    failed = [short_class(w["class"]) for w in rep.get("windows", [])
+              if not w.get("ok") and "private" not in str(w.get("why"))]
+    prompt = english_prompt(ws, fs, failed)
+    no_call = None
+    if not ok_spend:
+        no_call = f"spend {why}"
+    elif time.time() < _net["backoff_until"]:
+        no_call = f"backing off after a failed call until {datetime.fromtimestamp(_net['backoff_until']).strftime('%H:%M:%S')}"
+    elif not api_reachable():
+        _net["backoff_until"] = time.time() + 60
+        no_call = "offline: api.anthropic.com:443 unreachable in 3 s"
+    if no_call:
+        # no card for this: the card is only for a model call that really runs
+        log(f"ws {ws}: no call ({no_call}); title fallback")
+        return {"label": fallback, "sig": sig, "fallback": True, "hash": ihash}
+    emit({"type": "_calling"})          # daemon: from now on the live card may show
+    emit({"type": "start", "task": f"Labelling workspace {ws}", "prompt": prompt, "kind": "workspace-label"})
+    png = rep.get("png")
+    full = prompt
+    if png:
+        halves = rep.get("halves") or [ws]
+        what = (f"desktop {ws} (workspace {halves[0]} on top, its second half workspace {halves[1]} below)"
+                if len(halves) > 1 else f"workspace {halves[0]}")
+        mos = " Fullscreen workspaces are shown as a mosaic of every window, including those behind." \
+            if any(f.get("fullscreen") for f in fs) else ""
+        full = (f"The screenshot of {what} is {png}. Read it first.{mos}\n\n" + prompt)
+    cmd = [CLAUDE, "-p", full, "--model", "sonnet", "--effort", EFFORT,
+           "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+           "--tools", "Read", "--allowedTools", "Read", "--strict-mcp-config",
+           "--no-session-persistence", "--disable-slash-commands", "--max-turns", "4",
+           "--add-dir", CAPS,
+           "--system-prompt", "You label desktop workspaces. Look at the screenshot, then answer in plain "
+                              f"text: line 1 a headline of at most {HEAD_WORDS} words naming the main activity (no bullet), "
+                              f"then one bullet line starting with '- ' per window or Claude session, at most {BULLETS} "
+                              f"bullets, each at most {BULLET_WORDS} words. One line per window, never one per topic: a busy "
+                              "session is one specific phrase (project, topic, state), not a list of its sub-topics. "
+                              "No filler: do not name window positions, or app names like 'Claude Code session' "
+                              "or 'terminal' unless they are the point. No other markdown, no quotes."]
+    log(f"ws {ws}: labelling ({reason}; {why})")
+    text, usd, ok, outtok = "", 0.0, False, 0
+    t0 = time.monotonic()
+    try:
+        errf = tempfile.TemporaryFile(mode="w+")
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf, text=True, cwd=STATE)
+        seen = {"out": False, "killed": ""}
+
+        def watchdog():
+            while p.poll() is None:
+                el = time.monotonic() - t0
+                if not seen["out"] and el > FIRST_EVENT_S:
+                    seen["killed"] = f"no model output in {FIRST_EVENT_S:.0f} s"
+                elif el > HARD_S:
+                    seen["killed"] = f"over {HARD_S} s"
+                if seen["killed"]:
+                    p.kill()
+                    return
+                time.sleep(0.5)
+        threading.Thread(target=watchdog, daemon=True).start()
+        partial = False
+        for line in p.stdout:
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            t = m.get("type")
+            if t in ("assistant", "stream_event", "result"):
+                seen["out"] = True
+            if t == "stream_event":
+                ev = m.get("event", {})
+                if ev.get("type") == "content_block_delta" and ev.get("delta", {}).get("type") == "text_delta":
+                    partial = True
+                    chunk = ev["delta"]["text"]
+                    shown = re.sub(r"\n[-*] ?", "\n• ", chunk)
+                    if (not text or text.endswith("\n")) and shown[:1] in "-*" and shown:
+                        shown = "•" + shown[1:]
+                    emit({"type": "text_delta", "text": shown})
+                    text += chunk
+                u = (ev.get("usage") or {}).get("output_tokens")
+                if u:
+                    emit({"type": "usage", "output_tokens": outtok + u})
+            elif t == "assistant":
+                msg = m.get("message", {})
+                for b in msg.get("content", []):
+                    if b.get("type") == "thinking":
+                        emit({"type": "thinking", "text": first_line(re.split(r"(?<=[.!?])\s", b.get("thinking", ""))[0], 110)})
+                    elif b.get("type") == "tool_use":
+                        emit({"type": "tool_use", "id": b.get("id"), "name": b.get("name"),
+                              "input": tool_input_short(b.get("name"), b.get("input"))})
+                    elif b.get("type") == "text" and not partial:
+                        emit({"type": "text_delta", "text": b.get("text", "")}); text += b.get("text", "")
+                outtok += (msg.get("usage") or {}).get("output_tokens", 0)
+                emit({"type": "usage", "output_tokens": outtok})
+            elif t == "user":
+                for b in m.get("message", {}).get("content", []) if isinstance(m.get("message", {}).get("content"), list) else []:
+                    if b.get("type") == "tool_result":
+                        c = b.get("content")
+                        s = c if isinstance(c, str) else " ".join(x.get("text", "[image]") if x.get("type") == "text" else "Read image" for x in (c or []))
+                        emit({"type": "tool_result", "id": b.get("tool_use_id"), "summary": first_line(s, 80),
+                              "is_error": bool(b.get("is_error"))})
+                partial = False
+            elif t == "result":
+                usd = m.get("total_cost_usd") or 0.0
+                ok = not m.get("is_error") and m.get("subtype") == "success"
+                if not text and m.get("result"):
+                    text = m["result"]
+        p.wait()
+        if not ok:
+            errf.seek(0)
+            err = " ".join(errf.read().split())[-200:]
+            log(f"ws {ws}: claude call failed: {seen['killed'] or f'exit {p.returncode}'}"
+                + (f"; stderr: {scrub(err)}" if err else ""))
+            _net["backoff_until"] = time.time() + BACKOFF_S
+            _net["t"] = 0                    # re-probe the network next time
+        errf.close()
+    except Exception as e:  # noqa: BLE001
+        log(f"ws {ws}: claude failed: {e}")
+        _net["backoff_until"] = time.time() + BACKOFF_S
+    if not os.environ.get("WSL_CLAUDE"):
+        ledger_add(usd, ok, f"ws {ws} {reason}")
+    label = clean_label(text) if ok else ""
+    log(f"ws {ws}: {'label' if label else 'FAILED'} {label!r} usd={usd:.4f} {time.monotonic() - t0:.1f}s")
+    if not label:
+        emit({"type": "text_delta", "text": fallback})
+        label = fallback
+    emit({"type": "done"})
+    return {"label": label, "sig": sig, "fallback": not ok, "hash": ihash}
+
+
+def cmd_label(args):
+    ws = int(args[0])
+    res = run_labeller(ws, lambda e: print(json.dumps(e, ensure_ascii=False)), "manual")
+    labels = load_json(LABELS, {})
+    labels[str(ws)] = {**res, "at": time.time()}
+    save_json(LABELS, labels)
+    print("LABEL:", res["label"])
+
+
+# ── theme: the accent as the card's 7 gradient stops (SPEC §3) ─────────────
+def _srgb_to_oklch(hexs):
+    r, g, b = (int(hexs[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    lin = [((c + .055) / 1.055) ** 2.4 if c > .04045 else c / 12.92 for c in (r, g, b)]
+    l_ = .4122214708 * lin[0] + .5363325363 * lin[1] + .0514459929 * lin[2]
+    m_ = .2119034982 * lin[0] + .6806995451 * lin[1] + .1073969566 * lin[2]
+    s_ = .0883024619 * lin[0] + .2817188376 * lin[1] + .6299787005 * lin[2]
+    l_, m_, s_ = (x ** (1 / 3) for x in (l_, m_, s_))
+    L = .2104542553 * l_ + .7936177850 * m_ - .0040720468 * s_
+    a = 1.9779984951 * l_ - 2.4285922050 * m_ + .4505937099 * s_
+    bb = .0259040371 * l_ + .7827717662 * m_ - .8086757660 * s_
+    import math
+    return L, math.hypot(a, bb), math.degrees(math.atan2(bb, a)) % 360
+
+
+def _oklch_to_hex(L, C, H):
+    import math
+    a, b = C * math.cos(math.radians(H)), C * math.sin(math.radians(H))
+    l_ = (L + .3963377774 * a + .2158037573 * b) ** 3
+    m_ = (L - .1055613458 * a - .0638541728 * b) ** 3
+    s_ = (L - .0894841775 * a - 1.2914855480 * b) ** 3
+    rgb = (4.0767416621 * l_ - 3.3077115913 * m_ + .2309699292 * s_,
+           -1.2684380046 * l_ + 2.6097574011 * m_ - .3413193965 * s_,
+           -.0041960863 * l_ - .7034186147 * m_ + 1.7076147010 * s_)
+    out = ""
+    for c in rgb:
+        c = min(1, max(0, c))
+        c = 1.055 * c ** (1 / 2.4) - .055 if c > .0031308 else 12.92 * c
+        out += f"{round(c * 255):02x}"
+    return "#" + out
+
+
+THEME_DIR = os.path.expanduser("~/.config/omarchy/current/theme")
+
+
+def theme_id():
+    """Changes when he switches Omarchy theme (the `current/theme` symlink)."""
+    try:
+        return os.path.realpath(THEME_DIR) + str(os.path.getmtime(os.path.join(THEME_DIR, "ghostty.conf")))
+    except OSError:
+        return ""
+
+
+def _read(name):
+    try:
+        with open(os.path.join(THEME_DIR, name)) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def theme_palette():
+    """The current Omarchy theme's colours (hex without #): background,
+    foreground, accent (hyprland active border), border, text, and ghostty's
+    16-colour palette."""
+    g = _read("ghostty.conf")
+    k = _read("kitty.conf")            # every Omarchy theme has full kitty colours; ghostty may only say `theme = X`
+    pal = {int(n): v for n, v in re.findall(r"palette\s*=\s*(\d+)\s*=\s*#?([0-9a-fA-F]{6})", g)}
+    pal.update({int(n): v for n, v in re.findall(r"(?m)^color(\d+)\s+#([0-9a-fA-F]{6})", k)})
+    get = lambda pat, txt: (re.search(pat, txt) or [None, None])[1]
+    g = k + "\n" + g.replace(" = ", " ").replace("=", " ")
+    out = {
+        "background": get(r"(?m)^background\s+#?([0-9a-fA-F]{6})", g) or "111c18",
+        "foreground": get(r"(?m)^foreground\s+#?([0-9a-fA-F]{6})", g) or "c1c497",
+        "accent": get(r"activeBorderColor\s*=\s*rgba?\(([0-9a-fA-F]{6})", _read("hyprland.conf")) or pal.get(6) or "5b8def",
+        "border": get(r"@define-color\s+border\s+#([0-9a-fA-F]{6})", _read("walker.css")) or pal.get(0) or "333333",
+        "text": get(r"@define-color\s+text\s+#([0-9a-fA-F]{6})", _read("walker.css")) or pal.get(15) or "ffffff",
+        "palette": pal,
+    }
+    return out
+
+
+def theme_accent():
+    return theme_palette()["accent"]
+
+
+def _clampL(hexs, lo=0.0, hi=1.0, cmin=None):
+    L, C, H = _srgb_to_oklch(hexs)
+    if cmin is not None and C < cmin:
+        C = cmin
+    return _oklch_to_hex(min(hi, max(lo, L)), C, H)
+
+
+def theme_vars(pal=None):
+    """Card gradient from the theme's own colours, light top to dark bottom
+    (2026-11-02 his ask: the card looks like the theme). Lightness is clamped
+    only where SPEC §3 needs it for legibility: the top three stops carry dark
+    ink, the bottom four carry near-white text."""
+    pal = pal or theme_palette()
+    p = pal["palette"]
+    src = [pal["text"], p.get(14) or p.get(12) or pal["accent"], pal["accent"],
+           p.get(4) or p.get(6) or pal["accent"], pal["border"], p.get(0) or pal["border"], pal["background"]]
+    limits = [(.94, 1), (.86, 1), (.72, 1), (0, .50), (0, .32), (0, .22), (0, .14)]
+    out = {f"--g{i}": _clampL(c, lo, hi) for i, (c, (lo, hi)) in enumerate(zip(src, limits))}
+    out["--ink"] = _clampL(pal["background"], 0, .22)
+    return out
+
+
+# ── STAGE 2b: activity signal (evdev: only THAT input happened, never which) ─
+# The popup's own keys (his 2026-11-09 lock): a key code is compared against
+# these three constants and nothing else; no code is ever stored or logged.
+KEY_ESC, KEY_LEFTMETA, KEY_RIGHTMETA = 1, 125, 126
+WATCHED_KEYS = {KEY_ESC: "esc", KEY_LEFTMETA: "super", KEY_RIGHTMETA: "super"}
+
+
+class Activity(threading.Thread):
+    """Reads every /dev/input/event* (he is in the `input` group; nothing is
+    grabbed) and keeps only a timestamp. Key codes are never looked at, except
+    for an equality test against WATCHED_KEYS (Super, Esc), which are reported
+    as press/release of "super"/"esc" and do not count as input. Autorepeat
+    events (a held key) are ignored: holding Super is not activity. on_input
+    also gets one boolean: a keyboard key (code < 0x100, still never which)
+    went down, as opposed to a mouse / touch / button event."""
+    EV_SIZE = struct.calcsize("llHHi")
+
+    def __init__(self, on_input, on_key=None):
+        super().__init__(daemon=True, name="activity")
+        self.on_input = on_input
+        self.on_key = on_key or (lambda name, pressed, t: None)
+        self.last = 0.0
+        self.fds = {}
+
+    def rescan(self):
+        import glob
+        for p in glob.glob("/dev/input/event*"):
+            if p in self.fds:
+                continue
+            try:
+                self.fds[p] = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError:
+                pass
+
+    def run(self):
+        import select
+        next_scan = 0
+        while True:
+            if time.monotonic() > next_scan:
+                self.rescan(); next_scan = time.monotonic() + 5
+            r, _, _ = select.select(list(self.fds.values()), [], [], 2)
+            hit, keyhit, keys = False, False, []
+            for fd in r:
+                try:
+                    data = os.read(fd, self.EV_SIZE * 64)
+                except OSError:
+                    for p, f in list(self.fds.items()):
+                        if f == fd:
+                            os.close(fd); del self.fds[p]
+                    continue
+                # type 1 = EV_KEY (keys, buttons, touch), 2 = EV_REL (mouse), 3 = EV_ABS (touch/pad)
+                for off in range(0, len(data) - self.EV_SIZE + 1, self.EV_SIZE):
+                    _, _, etype, code, value = struct.unpack_from("llHHi", data, off)
+                    if etype == 1:
+                        if value == 2:                 # autorepeat of a held key: nothing new
+                            continue
+                        if code in WATCHED_KEYS:       # Super / Esc: the popup's own keys
+                            keys.append((WATCHED_KEYS[code], value == 1))
+                            continue
+                        hit = True
+                        if code < 0x100 and value == 1:   # a keyboard key went down (not a button / touch)
+                            keyhit = True
+                    elif etype in (2, 3):
+                        hit = True
+            now = time.time()
+            if hit:
+                self.last = now
+                self.on_input(now, keyhit)
+            for name, pressed in keys:
+                self.on_key(name, pressed, now)
+
+
+# ── the daemon: events, scheduler, popup ──────────────────────────────────
+SETTLE = 20          # s a changed workspace must stay unchanged before a relabel
+REFRESH = 600        # his "every 10m", only for workspaces he is working on
+# "Worked on it" (round 3): at least WORK_SECONDS distinct seconds with input
+# while the workspace was active, within the last REFRESH seconds. Not counted:
+# input in the first SWITCH_GRACE s after a switch (the Super+N key, a quick
+# glance) and the input that dismissed the popup.
+WORK_SECONDS = 30
+SWITCH_GRACE = 2.0
+POLL = 10
+COALESCE_MS = 25     # workspace events closer than this are one switch (pair halves land within ~5 ms)
+# His 2026-11-06: "the transparency should have been a gradient": the card is
+# opaque behind all text and dissolves into the windows only at its outer edges
+# (text has >= 16 px padding, so the fade never crosses it).
+CARD_MASK = ("-webkit-mask-image:linear-gradient(to right,transparent 0,#000 16px,#000 calc(100% - 16px),transparent 100%),"
+             "linear-gradient(to bottom,#000 0,#000 calc(100% - 26px),transparent 100%);"
+             "-webkit-mask-composite:source-in;mask-composite:intersect")
+DET_UNDER_CHARS = 118  # bullet wrap width under the card (13 px font)
+PX_PER_CM = 62       # eDP-1: 1920 px over 31 cm
+LABEL_DROP = 2 * PX_PER_CM    # his 2026-11-05: label 2 cm lower
+CARD_DROP = 5 * PX_PER_CM     # his 2026-11-05: agent card 5 cm lower
+CARD_ALPHA = 1.00             # card gradient opacity: windows below show through, text stays readable (0.62 was unreadable over a busy terminal)
+MAX_PARALLEL = 4     # Sonnet calls in flight at once (captures are all parallel)
+LOCK_HOLD_S = 7.0    # his 2026-11-09: "Pressing it [Super] for 5s should lock it"; 2026-11-10: "Make it to 7s from 5s."
+CARD_GRACE_S = 5.0   # his 2026-11-10: the live card ignores input this long, then the first input hides it
+FAST_POLL = 2        # s between looks at an awaiting desk (idle terminal / tabless browser)
+
+
+class Daemon:
+    # GTK3 + gtk-layer-shell + WebKit2GTK 4.1 (same stack as bar-touch). The
+    # GTK4/WebKitGTK-6.0 route in SPEC §1 is blocked on this laptop: the repo's
+    # webkitgtk-6.0 2.52.6 needs glibc 2.44 (installed 2.43) until the next -Syu.
+    def __init__(self):
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
+        gi.require_version("GtkLayerShell", "0.1")
+        gi.require_version("WebKit2", "4.1")
+        from gi.repository import GLib, Gtk, Gdk, GtkLayerShell as LS, WebKit2
+        self.GLib, self.Gtk, self.Gdk, self.LS, self.WebKit = GLib, Gtk, Gdk, LS, WebKit2
+        self.labels = load_json(LABELS, {})
+        self.runs = {}            # ws -> {"events": [...], "done": bool}
+        self.changed = {}         # ws+sig -> time the signature first differed
+        self.activity = {}        # ws -> [int seconds with real input while it was active]
+        self.switched_at = 0.0
+        self.sw_lock = threading.Lock()
+        self.sw_events = []       # workspace events of the current burst
+        self.sw_t0 = None         # monotonic time of the burst's first event
+        self.first_seen = {}      # window address -> (time first seen, class, ws)
+        self.noted = {}           # ws -> last skip reason logged (log each reason once)
+        self.active_ws = (hypr_json("activeworkspace") or {}).get("id")
+        self.shown_ws = None
+        self.shown_at = 0.0
+        self.card_ws = None
+        self.page_ready = False
+        self.queue = []
+        self.slots = threading.Semaphore(MAX_PARALLEL)
+        self.locked = False        # popup stays until Esc / tap / unlock (his 2026-11-09)
+        self.super_down = None     # time Super went down (None = up)
+        self.super_quiet = 0.0     # last other input while Super was held
+        self.super_combo = False   # another key went down during this Super hold: it never locks
+        self.hold_src = None       # GLib source watching the Super hold
+        self.fast_src = None       # GLib source polling awaiting desks
+        self._esc_t = 0.0
+
+    # popup ------------------------------------------------------------------
+    def build(self):
+        Gtk, LS, WebKit, Gdk = self.Gtk, self.LS, self.WebKit, self.Gdk
+        win = Gtk.Window()
+        win.set_decorated(False)
+        win.set_app_paintable(True)
+        vis = win.get_screen().get_rgba_visual()
+        if vis:
+            win.set_visual(vis)
+        LS.init_for_window(win)
+        LS.set_namespace(win, APP)
+        LS.set_layer(win, LS.Layer.OVERLAY)
+        LS.set_anchor(win, LS.Edge.TOP, True)
+        LS.set_keyboard_mode(win, LS.KeyboardMode.NONE)
+        LS.set_exclusive_zone(win, -1)
+        self.css = None
+        self.theme = None
+        self.apply_theme()
+        win.get_style_context().add_class("wsl")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        old = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        old.get_style_context().add_class("wsl-old")
+        old.set_halign(Gtk.Align.CENTER)
+        self.ws_lbl = Gtk.Label(); self.ws_lbl.get_style_context().add_class("wsl-ws")
+        self.lbl = Gtk.Label(); self.lbl.get_style_context().add_class("wsl-label")
+        self.lbl.set_max_width_chars(48); self.lbl.set_line_wrap(False)
+        self.lbl.set_justify(Gtk.Justification.CENTER)
+        self.det = Gtk.Label(); self.det.get_style_context().add_class("wsl-det")
+        self.det.set_justify(Gtk.Justification.LEFT); self.det.set_xalign(0); self.det.set_no_show_all(True)
+        self.det.set_line_wrap(True); self.det.set_max_width_chars(84)
+        old.pack_start(self.ws_lbl, False, False, 0); old.pack_start(self.lbl, False, False, 0)
+        old.pack_start(self.det, False, False, 0)
+        self.hint = Gtk.Label(); self.hint.get_style_context().add_class("wsl-hint")
+        self.hint.set_no_show_all(True)
+        old.pack_start(self.hint, False, False, 0)
+        # the lock (his 2026-11-09): Esc reaches the popup (exclusive keyboard
+        # focus while locked); a tap on the popup locks / unlocks (touch twin)
+        win.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.KEY_PRESS_MASK)
+        win.connect("key-press-event", self.on_key_press)
+        win.connect("button-press-event", self.on_tap)
+        old.connect("size-allocate", lambda *_: self.GLib.idle_add(self.set_input_region))
+        # the relabel divider: a real separator (an empty GtkBox drew nothing)
+        self.line = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        self.line.get_style_context().add_class("wsl-line")
+        ucm = WebKit.UserContentManager()
+        ucm.register_script_message_handler("wsl")
+        ucm.connect("script-message-received::wsl", self.on_js)
+        self.web = WebKit.WebView.new_with_user_content_manager(ucm)
+        self.web.set_background_color(Gdk.RGBA(0, 0, 0, 0))
+        self.web.set_size_request(460, 440)
+        self.web.set_halign(Gtk.Align.CENTER)   # the label's soft halo makes the window wider than the card
+        self.web.connect("load-changed", self.on_load)
+        self.web.load_uri("file://" + os.path.join(WEB, "agent-card.html") + "?embed=1")
+        box.pack_start(old, False, False, 0)
+        box.pack_start(self.line, False, False, 0)
+        # spacer so the card lands CARD_DROP below its old spot while the label
+        # only moves LABEL_DROP (old card top = label + divider)
+        self.gap = Gtk.Box(); self.gap.set_size_request(-1, CARD_DROP - LABEL_DROP)
+        box.pack_start(self.gap, False, False, 0)
+        box.pack_start(self.web, False, False, 0)
+        # his 2026-11-06 pick: headline, line + live card, THEN the bullet list,
+        # so the card's place never depends on the list length. The list sits in
+        # the headline's halo normally and moves under the card while it runs.
+        self.det_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.det_box.get_style_context().add_class("wsl-old")
+        self.det_box.set_halign(Gtk.Align.CENTER)
+        box.pack_start(self.det_box, False, False, 0)
+        self.det_in = old
+        for w in (old, self.line, self.gap, self.web, self.det_box):
+            w.set_no_show_all(True)
+        self.old_box = old
+        win.add(box)
+        box.show(); self.ws_lbl.show(); self.lbl.show()
+        self.win = win
+        # realize once offscreen-hidden so the web view loads before the first switch
+        threading.Thread(target=self.socket2, daemon=True, name="socket2").start()
+        threading.Thread(target=self.cmd_server, daemon=True, name="cmd").start()
+        Activity(self.on_input_thread, self.on_key_thread).start()
+        self.GLib.timeout_add_seconds(POLL, self.tick)
+        self.GLib.timeout_add(1500, lambda: (self.tick(), False)[1])
+        log(f"daemon up; {len(self.labels)} stored labels; state {STATE}")
+
+    def apply_theme(self):
+        """Colours from the current Omarchy theme; re-run when he switches theme."""
+        Gtk, Gdk = self.Gtk, self.Gdk
+        self.theme = theme_id()
+        pal = theme_palette()
+        bg, fg, acc = "#" + pal["background"], "#" + pal["text"], "#" + pal["accent"]
+        rgba = lambda h, a: f"rgba({int(h[1:3], 16)},{int(h[3:5], 16)},{int(h[5:7], 16)},{a})"
+        css = Gtk.CssProvider()
+        css.load_from_data(f"""
+          window.wsl {{ background: transparent; }}
+          .wsl-old {{ background: radial-gradient(ellipse farthest-side at center, {rgba(bg, .97)} 0%, {rgba(bg, .97)} 86%, {rgba(bg, 0)} 100%);
+                      border: none; border-radius: 40px; padding: 26px 124px 30px 124px; }}
+          .wsl-label {{ font-family: Geist, sans-serif; font-size: 26px; font-weight: 600; color: {fg};
+                        text-shadow: 0 1px 3px rgba(0,0,0,0.9), 0 0 8px rgba(0,0,0,0.6); }}
+          .wsl-det {{ font-family: Geist, sans-serif; font-size: 15px; font-weight: 500; color: {fg};
+                      margin-top: 4px; text-shadow: 0 1px 3px rgba(0,0,0,0.9); }}
+          .wsl-det-under {{ font-size: 13px; margin-top: 0; }}
+          .wsl-under {{ padding: 10px 28px 12px 28px; border-radius: 16px;
+                        background: linear-gradient(to bottom, {rgba(bg, .95)} 0%, {rgba(bg, .95)} 80%, {rgba(bg, .75)} 100%); }}
+          .wsl-ws {{ font-family: 'Geist Mono', monospace; font-size: 13px; color: {acc}; }}
+          .wsl-hint {{ font-family: 'Geist Mono', monospace; font-size: 12px; color: {acc}; margin-top: 8px; opacity: 0.9; }}
+          separator.wsl-line {{ background: {acc}; min-height: 3px; margin: 10px 80px; opacity: 1; }}
+        """.encode())
+        scr = Gdk.Screen.get_default()
+        if self.css:
+            Gtk.StyleContext.remove_provider_for_screen(scr, self.css)
+        Gtk.StyleContext.add_provider_for_screen(scr, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+        self.css = css
+        self.push_theme()
+        log(f"theme applied: {os.path.basename(os.path.realpath(THEME_DIR))} accent {acc}")
+
+    def push_theme(self):
+        tv = theme_vars()
+        ink = tv.pop("--ink")
+        a = f"{round(CARD_ALPHA * 255):02x}"
+        tv = {k: v + a for k, v in tv.items()}       # #rrggbbaa: see-through card
+        self.js(f"AgentCard.setTheme({json.dumps(tv)});"
+                "var s=document.getElementById('wsl-ink')||document.head.appendChild(Object.assign("
+                "document.createElement('style'),{id:'wsl-ink'}));"
+                f"s.textContent='.agent{{--ink:{ink};box-shadow:none;{CARD_MASK}}}"
+                " .out,.out p{{white-space:pre-line;font-size:15px;line-height:1.3}}';")
+
+    def on_load(self, web, ev):
+        if ev == self.WebKit.LoadEvent.FINISHED:
+            self.page_ready = True
+            hist = load_json(HISTORY, {})
+            self.js(f"window.CARD_EFFORT={json.dumps(EFFORT)};"
+                    f"AgentCard.setHistory({json.dumps(hist)});"
+                    "AgentCard.onDone=function(d){window.webkit.messageHandlers.wsl.postMessage("
+                    "JSON.stringify({done:d,history:AgentCard.getHistory()}))};")
+            self.push_theme()
+            log("card page loaded")
+
+    def on_js(self, ucm, result):
+        try:
+            d = json.loads(result.get_js_value().to_string())
+            save_json(HISTORY, d.get("history") or {})
+        except Exception as e:  # noqa: BLE001
+            log(f"js message: {e}")
+
+    def js(self, code):
+        if self.page_ready:
+            self.web.run_javascript(code, None, None, None)
+
+    def push_card(self, ev):
+        if ev.get("type") == "start":
+            self.js(f"AgentCard.setHistory({json.dumps(load_json(HISTORY, {}))});")
+        self.js(f"AgentCard.push({json.dumps(ev, ensure_ascii=False)});")
+
+    def bar_height(self):
+        if time.time() - getattr(self, "_bar_t", 0) < 30:
+            return self._bar_h
+        self._bar_h, self._bar_t = self._bar_height(), time.time()
+        return self._bar_h
+
+    def screen_height(self):
+        mon = next((m for m in (hypr_json("monitors") or []) if m.get("focused")), None)
+        return int(mon["height"] / mon.get("scale", 1)) if mon else 1080
+
+    def _bar_height(self):
+        for mon in (hypr_json("layers") or {}).values():
+            for lvl in mon.get("levels", {}).values():
+                for s in lvl:
+                    if s.get("namespace", "").startswith("waybar") and s.get("y", 1) == 0:
+                        return s.get("h", 30)
+        return 30
+
+    def show(self, ws, upgrade=False, clients_by_ws=None):
+        """On a switch: plain label / live card / old label over the running agent.
+        The card is shown ONLY while a real model call runs (round 5: with the
+        spend gate closed the card played ~15 s and fell back to the title, and
+        that card was the popup he kept seeing)."""
+        ws = desk_of(ws)
+        by_desk = clients_by_ws if clients_by_ws is not None else desk_clients()
+        if not by_desk.get(ws):
+            self.hide()                      # empty: no popup, no agent, no card
+            log(f"popup ws {ws}: empty, nothing shown")
+            return False
+        if upgrade and self.shown_ws != ws:
+            return False                     # he has moved on; no popup for an old switch
+        lab = self.labels.get(str(ws))
+        run = self.runs.get(ws)
+        if not lab and not (run is not None and not run["done"]):
+            self.enqueue(ws, "switched to an unlabelled workspace", front=True)
+            run = self.runs.get(ws)
+        card = run is not None and not run["done"] and run.get("calling", False)
+        if not lab:                          # no stored label yet: the window-title label now
+            clients = hypr_json("clients") or []
+            lab = {"label": fallback_label(facts(desk_clients(clients).get(ws, []), clients, sessions=False))}
+        # placement (his 2026-11-05 ask, eDP-1 ~62 px/cm): label 2 cm lower, card 5 cm lower
+        bar = self.bar_height()
+        self.LS.set_margin(self.win, self.LS.Edge.TOP, bar + 8 + LABEL_DROP)
+        hs = sorted({c.get("workspace", {}).get("id") for c in by_desk.get(ws, [])})
+        self.ws_lbl.set_text(f"workspace {' + '.join(map(str, hs))}" if len(hs) > 1 else f"workspace {hs[0] if hs else ws}")
+        head, _, rest = lab["label"].partition("\n")
+        self.lbl.set_text(head)
+        # a long headline wraps (70 chars) instead of running off the screen
+        self.lbl.set_line_wrap(len(head) > 70); self.lbl.set_max_width_chars(70)
+        self.lbl.set_width_chars(min(70, len(head)))
+        rest = "\n".join("• " + x for x in rest.splitlines() if x.strip())   # his 11-06: bullet points
+        self.det.set_text(rest)
+        # natural width for wrapping (GTK3 wraps to the minimum without it)
+        self.det.set_width_chars(min(84, max((len(x) for x in rest.splitlines()), default=0)))
+        self.det.set_visible(bool(rest.strip()))
+        want = self.det_box if card else self.old_box
+        if self.det_in is not want:               # move the bullet list above/below the card
+            self.det_in.remove(self.det)
+            want.pack_start(self.det, False, False, 0)
+            self.det_in = want
+        self.det_box.set_visible(card and bool(rest.strip()))
+        # his 2026-11-06: the list under the card was cut off at the screen's
+        # bottom. With the card up, the list gets the height that is left and
+        # ends in '…' only if it is truly longer.
+        # (Pango's line limit applies per paragraph, i.e. per bullet, so the
+        # budget is applied here, bullet by bullet.)
+        sc = self.det.get_style_context()
+        if card:
+            sc.add_class("wsl-det-under"); self.det_box.get_style_context().add_class("wsl-under")
+            head_h = 68 + 34 * (-(-len(head) // 70))       # ws line + padding + headline lines
+            room = self.screen_height() - (bar + 8 + LABEL_DROP) - head_h - 24 - (CARD_DROP - LABEL_DROP) - 440 - 20
+            budget, kept = max(2, room // 17), []
+            for b in rest.splitlines():
+                need = -(-len(b) // DET_UNDER_CHARS)
+                if need > budget:
+                    if budget >= 1:
+                        kept.append(b[:budget * DET_UNDER_CHARS - 1].rsplit(" ", 1)[0] + " …")
+                    break
+                kept.append(b); budget -= need
+            hidden = len(rest.splitlines()) - len(kept)
+            if hidden > 0:                     # say what does not fit; overview/switch-back shows all
+                if budget < 1 and kept:
+                    kept.pop(); hidden += 1
+                kept.append(f"   … {hidden} more (shown when the agent is done)")
+            self.det.set_text("\n".join(kept))
+            self.det.set_max_width_chars(DET_UNDER_CHARS)
+            self.det.set_width_chars(min(DET_UNDER_CHARS, max((len(x) for x in kept), default=0)))
+        else:
+            sc.remove_class("wsl-det-under"); self.det_box.get_style_context().remove_class("wsl-under")
+            self.det.set_max_width_chars(84)
+        self.old_box.set_visible(True)
+        self.line.set_visible(card)
+        self.gap.set_visible(card)
+        self.web.set_visible(card)
+        if card:
+            self.card_ws = ws
+            if not run["events"]:
+                self.push_card({"type": "start", "task": f"Labelling workspace {ws}",
+                                "prompt": "Capturing the workspace...", "kind": "workspace-label"})
+            for ev in list(run["events"]):
+                self.push_card(ev)
+        else:
+            self.card_ws = None
+        self.win.resize(1, 1)
+        self.shown_ws, self.shown_at = ws, time.monotonic()
+        self.win.show()
+        self.GLib.idle_add(self.set_input_region)
+        log(f"popup ws {ws}: label {lab['label']!r}{' + live card (model call running)' if card else ''}")
+        # The card does not lock (his 2026-11-10: the auto-lock ate his typing;
+        # "the live agent should behave mostly like the label. Except it gets
+        # shown forever until any key is pressed after a certain timeout"):
+        # on_input ignores input for CARD_GRACE_S, then the first input hides it.
+        return False
+
+    def resolve_switch(self):
+        """One Super+N fires two workspace events (workspace-pair: N and N+10).
+        Treat the burst as one switch: show the label of the half he lands on,
+        or its non-empty partner; an empty half never dismisses it (round 6:
+        'ws 3 dismissed after 0.01s' then 'ws 13: empty', label back 2-3 s later)."""
+        with self.sw_lock:
+            evs, t0 = self.sw_events, self.sw_t0
+            self.sw_events, self.sw_t0 = [], None
+        if not evs:
+            return False
+        last = evs[-1]
+        by_desk = desk_clients()
+        d = desk_of(last)
+        ws = d if by_desk.get(d) else None              # one label per digit, either half
+        by_ws = by_desk
+        if ws is None:
+            self.hide()
+            log(f"switch {evs}: desktop empty, nothing shown ({(time.monotonic() - t0) * 1000:.0f} ms)")
+            return False
+        if ws == self.shown_ws:
+            log(f"switch {evs}: ws {ws} already shown, kept ({(time.monotonic() - t0) * 1000:.0f} ms)")
+            return False
+        self.show(ws, clients_by_ws=by_ws)
+        log(f"switch {evs} -> ws {ws}: popup visible {(time.monotonic() - t0) * 1000:.0f} ms after the first event")
+        return False
+
+    def set_input_region(self):
+        """Clicks pass through everywhere except on the popup's own boxes, where
+        a tap locks / unlocks it (touch twin of Super-hold / Esc)."""
+        import cairo
+        gw = self.win.get_window()
+        if not gw:
+            return False
+        reg = cairo.Region()
+        for w in (self.old_box, self.web, self.det_box):
+            if w.get_visible():
+                a = w.get_allocation()
+                reg.union(cairo.RectangleInt(a.x, a.y, a.width, a.height))
+        gw.input_shape_combine_region(reg, 0, 0)
+        return False
+
+    # the lock (his 2026-11-09) --------------------------------------------------
+    def set_locked(self, on, why):
+        """Locked: the popup stays, and takes exclusive keyboard focus so that Esc
+        (and anything else typed meanwhile) reaches the popup and never a work
+        window ("otherwise my agents or browser apps may capture it"). Hyprland
+        binds (Super+N) still work: the compositor handles them before focus."""
+        if on == self.locked:
+            return
+        self.locked = on
+        LS = self.LS
+        LS.set_keyboard_mode(self.win, LS.KeyboardMode.EXCLUSIVE if on else LS.KeyboardMode.NONE)
+        if on:
+            self._swallowed = 0
+            self.hint.set_text("🔒 locked · Esc or a tap closes it")
+            self.hint.show()
+            log(f"popup ws {self.shown_ws} locked ({why}); Esc / tap / `workspace-labels unlock` ends it")
+        else:
+            self.hint.hide()
+            log(f"popup ws {self.shown_ws} unlocked ({why})")
+
+    def on_key_press(self, win, ev):
+        if ev.keyval in (self.Gdk.KEY_Escape,):
+            if self.locked:
+                self.set_locked(False, "Esc")
+                self.hide()
+        elif self.locked:
+            self._swallowed += 1
+            if self._swallowed == 1:
+                log("a key reached the locked popup (swallowed, not a work window)")
+        return True                        # nothing typed while locked leaves the popup
+
+    def on_tap(self, win, ev):
+        if self.shown_ws is None:
+            return True
+        if self.locked:
+            self.set_locked(False, "tap"); self.hide()
+        else:
+            self.set_locked(True, "tap on the popup")
+        return True
+
+    def on_key_thread(self, name, pressed, t):
+        """Super / Esc from evdev (Activity thread). Super held LOCK_HOLD_S with no
+        other input locks the popup (shows the current desk's label first if none
+        is up). Esc here is the fallback behind the GTK handler: if the GTK loop
+        does not unlock within 2 s while locked, exit so systemd restarts the
+        daemon and the keyboard is released (never a stuck keyboard)."""
+        if name == "super":
+            if pressed:
+                self.super_down, self.super_quiet, self.super_combo = t, t, False
+                if self.hold_src is None:
+                    self.hold_src = self.GLib.timeout_add(250, self.hold_check)
+            else:
+                self.super_down = None
+        elif name == "esc" and pressed and self.locked:
+            self._esc_t = t
+            self.GLib.idle_add(self.esc_fallback)
+
+            def still_locked():
+                if self.locked and self._esc_t == t:
+                    log("GTK loop did not release the lock 2 s after Esc: exiting so systemd restarts the daemon")
+                    os._exit(3)
+            threading.Timer(2.0, still_locked).start()
+
+    def cmd_lock(self, on):
+        if on and self.shown_ws is None and self.active_ws is not None:
+            self.show(desk_of(self.active_ws))
+        if on and self.shown_ws is not None:
+            self.set_locked(True, "asked")
+        elif not on:
+            self.set_locked(False, "asked")
+            self.hide()
+        return False
+
+    def esc_fallback(self):
+        if self.locked:
+            self.set_locked(False, "Esc (evdev)")
+            self.hide()
+        return False
+
+    def hold_check(self):
+        if self.super_down is None:
+            self.hold_src = None
+            return False
+        # his 2026-11-10: he keeps Super held while flipping desks (Super+N) and
+        # reading labels; that locked the popup under him. A hold in which any
+        # other key went down never locks: only Super pressed alone does.
+        if not self.locked and not self.super_combo and time.time() - self.super_quiet >= LOCK_HOLD_S:
+            if self.shown_ws is None and self.active_ws is not None:
+                self.show(desk_of(self.active_ws))
+            if self.shown_ws is not None:
+                self.set_locked(True, f"Super held {LOCK_HOLD_S:.0f} s")
+        return True
+
+    def hide(self):
+        if self.locked:
+            self.set_locked(False, "hidden")
+        if self.shown_ws is not None:
+            self.win.hide()
+            log(f"popup ws {self.shown_ws} dismissed after {time.monotonic() - self.shown_at:.2f}s")
+            self.shown_ws = None
+            self.card_ws = None
+
+    def on_input_thread(self, t, key=False):
+        if self.super_down is not None:
+            self.super_quiet = t                        # mouse / touch: the hold clock restarts
+            if key:
+                self.super_combo = True                 # Super+key (a switch): this hold never locks
+        aw = desk_of(self.active_ws) if self.active_ws is not None else None
+        dismissing = self.shown_ws is not None and not self.locked   # this input closes the popup
+        if aw is not None and not dismissing and t - self.switched_at >= SWITCH_GRACE:
+            secs = self.activity.setdefault(aw, [])
+            if not secs or secs[-1] != int(t):
+                secs.append(int(t))
+                if len(secs) > 2000:
+                    del secs[:1000]
+        self.GLib.idle_add(self.on_input)
+
+    def worked_seconds(self, ws, since):
+        return sum(1 for x in self.activity.get(ws, ()) if x >= since)
+
+    def note(self, ws, reason):
+        """Log a skipped trigger at most once per minute per (workspace, cause);
+        repeats are counted and reported with the next line."""
+        k = (ws, reason)
+        last, n = self.noted.get(k, (0, 0))
+        if time.time() - last >= 60:
+            self.noted[k] = (time.time(), 0)
+            log(f"skip ws {ws}: {reason}" + (f" (+{n} more in the last minute)" if n else ""))
+        else:
+            self.noted[k] = (last, n + 1)
+
+    def screenshot_busy(self):
+        """A screenshot is being taken (screenshot-save running: slurp/wayfreeze/
+        satty) or ended < 1 s ago. His 2026-11-06: 'pressing that buttons make it
+        go away' - the popup must survive so he can capture it."""
+        run = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+        try:
+            pid = int(open(os.path.join(run, "screenshot-busy")).read().strip())
+            if os.path.exists(f"/proc/{pid}"):
+                return True
+        except (OSError, ValueError):
+            pass
+        try:
+            return time.time() - os.path.getmtime(os.path.join(run, "screenshot-done")) < 1.0
+        except OSError:
+            return False
+
+    def on_input(self):
+        """Dismiss on the first input after 400 ms (the live card: after
+        CARD_GRACE_S, counted from when the card appeared) - 300 ms later, so
+        that a screenshot key (whose script raises the busy flag within ~50 ms)
+        is never what closes the popup. Input during a screenshot is ignored."""
+        grace = CARD_GRACE_S if self.card_ws is not None and self.card_ws == self.shown_ws else 0.4
+        if self.shown_ws is None or self.locked or time.monotonic() - self.shown_at <= grace:
+            return False
+        if self.screenshot_busy() or getattr(self, "_hide_pending", False):
+            return False
+        self._hide_pending = True
+        shown = self.shown_ws
+
+        def later():
+            self._hide_pending = False
+            if self.shown_ws == shown and not self.locked and not self.screenshot_busy():
+                self.hide()
+            return False
+        self.GLib.timeout_add(300, later)
+        return False
+
+    # hyprland events ------------------------------------------------------------
+    def socket2(self):
+        path = f"{os.environ['XDG_RUNTIME_DIR']}/hypr/{os.environ['HYPRLAND_INSTANCE_SIGNATURE']}/.socket2.sock"
+        while True:
+            try:
+                s = socket.socket(socket.AF_UNIX); s.connect(path)
+                buf = b""
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        ev, _, data = line.decode(errors="replace").partition(">>")
+                        if ev == "workspacev2":
+                            try:
+                                ws = int(data.split(",")[0])
+                            except ValueError:
+                                continue
+                            self.active_ws = ws
+                            self.switched_at = time.time()
+                            if ws > 0:
+                                with self.sw_lock:
+                                    self.sw_events.append(ws)
+                                    if self.sw_t0 is None:
+                                        self.sw_t0 = time.monotonic()
+                                        self.GLib.timeout_add(COALESCE_MS, self.resolve_switch)
+                        elif ev in ("openwindow", "closewindow", "movewindowv2"):
+                            self.GLib.idle_add(self.tick)
+                        elif ev in ("windowtitle", "windowtitlev2") and self.fast_src is not None:
+                            self.GLib.idle_add(self.fast_check)      # an awaiting desk may have woken
+            except OSError as e:
+                log(f"socket2: {e}")
+            time.sleep(1)
+
+    def cmd_server(self):
+        try:
+            os.unlink(CMD_SOCK)
+        except OSError:
+            pass
+        srv = socket.socket(socket.AF_UNIX); srv.bind(CMD_SOCK); srv.listen(4)
+        while True:
+            c, _ = srv.accept()
+            try:
+                msg = c.recv(256).decode().split()
+                if msg and msg[0] == "show":
+                    ws = desk_of(int(msg[1]) if len(msg) > 1 else self.active_ws)
+                    self.GLib.idle_add(self.show, ws)
+                    c.sendall(b"ok\n")
+                elif msg and msg[0] == "simulate":      # test: a burst of workspace events, no real switch
+                    with self.sw_lock:
+                        self.sw_events += [int(x) for x in msg[1:]]
+                        if self.sw_t0 is None:
+                            self.sw_t0 = time.monotonic()
+                            self.GLib.timeout_add(COALESCE_MS, self.resolve_switch)
+                    c.sendall(b"ok\n")
+                elif msg and msg[0] == "relabel":
+                    self.GLib.idle_add(self.enqueue, desk_of(int(msg[1])), "asked", True)
+                    c.sendall(b"ok\n")
+                elif msg and msg[0] in ("lock", "unlock"):
+                    self.GLib.idle_add(self.cmd_lock, msg[0] == "lock")
+                    c.sendall(b"ok\n")
+            except Exception as e:  # noqa: BLE001
+                log(f"cmd: {e}")
+            finally:
+                c.close()
+
+    # scheduler --------------------------------------------------------------
+    def tick(self):
+        """Stage 2: decide which workspaces need a (re)label. Runs on the GTK loop."""
+        if theme_id() != self.theme:
+            self.apply_theme()
+        try:
+            allf = describe_all(sessions=False)
+        except Exception as e:  # noqa: BLE001
+            log(f"tick: {e}")
+            return True
+        now = time.time()
+        gone = [k for k in self.labels if int(k) not in allf]
+        for k in gone:                       # emptied workspace: forget its label
+            del self.labels[k]
+        if gone:
+            save_json(LABELS, self.labels)
+        # window ages: a window younger than YOUNG s is not a change yet; one that
+        # dies young is logged as an ignored pop-up
+        alive = {f["address"]: (ws, f["class"]) for ws, fs in allf.items() for f in fs}
+        for a, (ws, cls) in alive.items():
+            self.first_seen.setdefault(a, (now, cls, ws))
+        for a in [a for a in self.first_seen if a not in alive]:
+            t0, cls, ws = self.first_seen.pop(a)
+            if now - t0 < YOUNG + POLL:
+                self.note(ws, f"short-lived window {cls} (< {YOUNG + POLL} s) ignored")
+        young = {a for a, (t0, _, _) in self.first_seen.items() if now - t0 < YOUNG}
+        self.watch_awaiting(any(l.get("awaiting") for l in self.labels.values()))
+        for ws, fs in allf.items():
+            key = str(ws)
+            sig = signature(fs, young)
+            lab = self.labels.get(key)
+            if ws in self.runs and not self.runs[ws]["done"]:
+                continue
+            if not lab:
+                self.enqueue(ws, "no label yet")
+                continue
+            if lab.get("fallback") and not (ws in self.runs and not self.runs[ws]["done"]):
+                fb = fallback_label(fs)        # free: no model, follows the titles
+                if fb != lab.get("label"):
+                    lab["label"] = fb
+                    save_json(LABELS, self.labels)
+            if lab.get("awaiting") and not awaiting(fs):
+                self.wake(ws, fs)
+                continue
+            if lab.get("fallback") and not lab.get("awaiting") and now - lab.get("at", 0) >= 1800 and (_gate["val"] or (True,))[0]:  # cached: no ssh on the GTK loop
+                self.enqueue(ws, "retry: last label was the window-name fallback")
+                continue
+            if lab.get("sig") == sig:
+                self.changed.pop(key, None)
+            if lab.get("sig") != sig:
+                seen_sig, first = self.changed.get(key, (None, now))
+                if seen_sig != sig:              # a new difference: its 20 s start now
+                    self.changed[key] = (sig, now)
+                    first = now
+                if now - first >= SETTLE:
+                    self.enqueue(ws, f"windows changed: {lab.get('sig')} -> {sig}")
+                continue
+            if now - lab.get("at", 0) >= REFRESH:
+                worked = self.worked_seconds(ws, max(lab.get("at", 0), now - REFRESH))
+                if worked >= WORK_SECONDS:
+                    self.enqueue(ws, f"10-minute refresh (he worked on it: {worked} s of input)")
+                elif worked:
+                    self.note(ws, f"10-minute refresh due, input below {WORK_SECONDS} s in the window (glances / switch keys only)")
+        self.pump()
+        return True
+
+    # awaiting desks (his 2026-11-09 ask 1) ----------------------------------------
+    def watch_awaiting(self, on):
+        if on and self.fast_src is None:
+            self.fast_src = self.GLib.timeout_add(FAST_POLL * 1000, self.fast_check)
+        elif not on and self.fast_src is not None:
+            self.GLib.source_remove(self.fast_src)
+            self.fast_src = None
+
+    def fast_check(self):
+        """Every FAST_POLL s (and on every title event) while a desk awaits: the
+        moment its windows stop being idle, relabel it at once, front of the
+        queue, no settle, no young-window wait."""
+        waiting = [int(k) for k, l in self.labels.items() if l.get("awaiting")]
+        if not waiting:
+            self.fast_src = None
+            return False
+        try:
+            clients = hypr_json("clients") or []
+            by_desk = desk_clients(clients)
+            for ws in waiting:
+                fs = facts(by_desk.get(ws, []), clients, sessions=False)
+                if fs and not awaiting(fs):
+                    self.wake(ws, fs)
+        except Exception as e:  # noqa: BLE001
+            log(f"fast_check: {e}")
+        return True
+
+    def wake(self, ws, fs):
+        if ws in self.runs and not self.runs[ws]["done"]:
+            return
+        lab = self.labels.get(str(ws))
+        if lab:
+            lab["awaiting"] = False
+        busy = [window_topic(f) for f in fs if not idle_window(f)]
+        log(f"ws {ws}: woke up ({'; '.join(busy)[:120]}): labelling now")
+        self.enqueue(ws, "woke up: work started in an idle desk", front=True)
+
+    def enqueue(self, ws, reason, front=False):
+        """Queue a (re)label. Never for an empty workspace (his rule)."""
+        if ws in self.runs and not self.runs[ws]["done"]:
+            return False
+        if not any(q[0] == ws for q in self.queue):
+            self.queue.append((ws, reason, time.time(), front))
+        if front:
+            self.pump()
+        return False
+
+    def pump(self):
+        """Start EVERY queued workspace now: one parallel capture pass for all of
+        them, then their labellers in parallel (MAX_PARALLEL Sonnet calls in flight;
+        the workspace he just switched to never waits for a slot)."""
+        if not self.queue:
+            return
+        batch, self.queue = self.queue, []
+        for ws, *_ in batch:
+            self.runs[ws] = {"events": [], "done": False}
+        threading.Thread(target=self.batch, args=(batch,), daemon=True, name="batch").start()
+
+    def batch(self, items):
+        """Capture every queued workspace in parallel; each labeller starts the
+        moment ITS capture is done (a 2.5 s mpv timeout delays only its own ws)."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        t0 = time.monotonic()
+        with ThreadPoolExecutor(max_workers=max(1, min(8, len(items)))) as pool:
+            futs = {pool.submit(capture_desks, [it[0]]): it for it in items}
+            for fut in as_completed(futs):
+                ws, reason, t_need, front = futs[fut]
+                try:
+                    rep = fut.result().get(ws)
+                except Exception as e:  # noqa: BLE001
+                    log(f"ws {ws}: capture crashed: {e}"); rep = None
+                if rep is None:          # emptied meanwhile: no agent
+                    self.runs[ws]["done"] = True
+                    continue
+                threading.Thread(target=self.work, args=(ws, reason, rep, t_need, front),
+                                 daemon=True, name=f"label-{ws}").start()
+        log(f"batch: {len(items)} workspaces captured in parallel, all done in {int((time.monotonic() - t0) * 1000)} ms")
+
+    def work(self, ws, reason, rep, t_need, front):
+        run = self.runs[ws]
+
+        def emit(ev):
+            if ev.get("type") == "_calling":
+                run["calling"] = True
+                if self.shown_ws == ws and self.card_ws != ws:
+                    self.GLib.idle_add(self.show, ws, True)    # upgrade the shown label to the card
+                return
+            run["events"].append(ev)
+            if self.card_ws == ws:
+                self.GLib.idle_add(lambda e=ev: (self.push_card(e), False)[1])
+        slot = None if front else self.slots
+        if slot:
+            slot.acquire()
+        t_start = time.time()
+        try:
+            prev = self.labels.get(str(ws), {}).get("hash") if not front and reason != "asked" else None
+            res = run_labeller(ws, emit, reason, rep, prev)
+        except Exception as e:  # noqa: BLE001
+            log(f"ws {ws}: worker crashed: {e}")
+            res = None
+        finally:
+            if slot:
+                slot.release()
+        t_done = time.time()
+        if res and res.get("skipped"):
+            self.labels[str(ws)]["at"] = t_done       # restart the 10-min clock, keep the label
+            if res.get("sig") is not None:
+                self.labels[str(ws)]["sig"] = res["sig"]   # adopt it: else the same 'change' re-fires (ws 9 loop)
+            save_json(LABELS, self.labels)
+            self.note(ws, f"input unchanged since the last label ({reason.split(':')[0]}); no call")
+            run["done"] = True
+            self.GLib.idle_add(self.after_run, ws)
+            return
+        if res:
+            self.labels[str(ws)] = {**res, "at": t_done}
+            save_json(LABELS, self.labels)
+        log(f"timing ws {ws}: capture {rep.get('ms')} ms, label start +{t_start - t_need:.1f} s, "
+            f"label ready +{t_done - t_need:.1f} s after the need was seen ({reason})"
+            + (" [fallback]" if res and res.get("fallback") else ""))
+        run["done"] = True
+        self.GLib.idle_add(self.after_run, ws)
+
+    def after_run(self, ws):
+        if self.shown_ws == ws and self.old_box.get_visible():
+            # the popup may be locked and read later: show the finished label in
+            # full (headline + every bullet), the card keeps its done state
+            head, _, rest = self.labels.get(str(ws), {}).get("label", "").partition("\n")
+            self.lbl.set_text(head)
+            self.lbl.set_line_wrap(len(head) > 70); self.lbl.set_width_chars(min(70, len(head)))
+            rest = "\n".join("• " + x for x in rest.splitlines() if x.strip())
+            self.det.set_text(rest)
+            cap = self.det.get_max_width_chars() or 84
+            self.det.set_width_chars(min(cap, max((len(x) for x in rest.splitlines()), default=0)))
+            self.det.set_visible(bool(rest.strip()))
+            if self.det_in is self.det_box:
+                self.det_box.set_visible(bool(rest.strip()))
+            self.GLib.idle_add(self.set_input_region)
+        self.pump()
+        return False
+
+    def run(self):
+        self.build()
+        self.Gtk.main()
+
+
+def cmd_daemon(args):
+    Daemon().run()
+
+
+def _send(msg):
+    s = socket.socket(socket.AF_UNIX)
+    try:
+        s.connect(CMD_SOCK); s.sendall(msg.encode()); print(s.recv(64).decode().strip())
+    except OSError as e:
+        print(f"daemon not running ({e})"); return 1
+    return 0
+
+
+def cmd_show(args):
+    return _send("show " + " ".join(args))
+
+
+def cmd_simulate(args):
+    return _send("simulate " + " ".join(args))
+
+
+def cmd_relabel(args):
+    return _send("relabel " + args[0])
+
+
+def cmd_lock(args):
+    return _send("lock")
+
+
+def cmd_unlock(args):
+    return _send("unlock")
+
+
+def cmd_status(args):
+    labels = load_json(LABELS, {})
+    health = load_json(HEALTH, {})
+    for ws in sorted({*labels, *health}, key=int):
+        lab = labels.get(ws, {})
+        h = health.get(ws, {})
+        age = f"{(time.time() - lab['at']) / 60:.0f} min ago" if lab.get("at") else "-"
+        print(f"ws {ws:>2}  {lab.get('label', '(none)')!r:40} {age:>12}  capture {h.get('ok', '?')}/{len(h.get('windows', []))}"
+              + (f"  fallback: {'; '.join(h['failed'])}" if h.get("failed") else ""))
+
+
+def main():
+    cmd, args = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("help", [])
+    fn = {"capture": cmd_capture, "prompt": cmd_prompt, "label": cmd_label, "daemon": cmd_daemon,
+          "show": cmd_show, "relabel": cmd_relabel, "simulate": cmd_simulate, "status": cmd_status,
+          "lock": cmd_lock, "unlock": cmd_unlock}.get(cmd)
+    if not fn:
+        print(__doc__)
+        return 0 if cmd in ("help", "-h", "--help") else 2
+    return fn(args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,15 @@
+[Unit]
+Description=media-history-recorder: what any MPRIS player plays (VLC, browsers, ...) into the cone-icon watch history
+Documentation=file://%h/Programs/local-bootstrapping/docs/mpv-history.md
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/.local/bin/media-history-recorder
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=graphical-session.target

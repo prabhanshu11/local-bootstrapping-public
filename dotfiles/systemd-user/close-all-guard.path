@@ -1,0 +1,10 @@
+[Unit]
+Description=Delete omarchy-hyprland-window-close-all the moment it reappears
+
+[Path]
+# %h is expanded; OMARCHY_PATH is the default ~/.local/share/omarchy on both machines.
+PathExists=%h/.local/share/omarchy/bin/omarchy-hyprland-window-close-all
+Unit=close-all-guard.service
+
+[Install]
+WantedBy=default.target

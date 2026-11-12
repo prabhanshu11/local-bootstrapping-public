@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Stand-in for `claude -p ... --output-format stream-json` (no model call, no
+spend). Emits the SPEC §7 fixture as Claude Code stream-json lines, 300-900 ms
+apart. Use: WSL_CLAUDE=tests/workspace-labels/fake-claude workspace-labels ..."""
+import json, random, sys, time
+def out(o):
+    print(json.dumps(o), flush=True); time.sleep(random.uniform(.3, .9))
+A = lambda blocks, tok: out({"type": "assistant", "message": {"content": blocks, "usage": {"output_tokens": tok}}})
+U = lambda tid, text: out({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": tid, "content": text}]}})
+D = lambda t: out({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": t}}})
+out({"type": "system", "subtype": "init"})
+A([{"type": "thinking", "thinking": "A terraform run next to GCP docs suggests infrastructure work. Check the repo name."}], 60)
+A([{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "hyprctl clients -j"}}], 40)
+U("t1", "5 clients on workspace 3")
+A([{"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "/x/workspace-3.png"}}], 40)
+U("t2", [{"type": "image"}])
+import os
+_lab = open(os.environ["WSL_FAKE_LABEL_FILE"]).read().strip() if os.environ.get("WSL_FAKE_LABEL_FILE") else None
+_chunks = ([_lab.split("\n")[0]] + ["\n- " + x for x in _lab.split("\n")[1:]]) if _lab else \
+    ("Fake stub headline", "\n- first ", "activity", "\n", "- second activity")
+for t in _chunks:
+    D(t)
+A([{"type": "text", "text": "Fake stub label"}], 30)
+out({"type": "result", "subtype": "success", "is_error": False, "result": "Fake stub label", "total_cost_usd": 0})

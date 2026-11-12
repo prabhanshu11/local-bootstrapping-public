@@ -1,0 +1,47 @@
+# QWERTY keycode to character (reverse mapping)
+# Format: keycode=character
+# Used to determine what character a QWERTY-assuming app intended to send
+#
+# Only includes keys that differ between layouts (letters, punctuation)
+# Modifiers and special keys don't need translation
+
+# Letters (keycodes from standard US QWERTY)
+16=q
+17=w
+18=e
+19=r
+20=t
+21=y
+22=u
+23=i
+24=o
+25=p
+30=a
+31=s
+32=d
+33=f
+34=g
+35=h
+36=j
+37=k
+38=l
+39=semicolon
+40=apostrophe
+44=z
+45=x
+46=c
+47=v
+48=b
+49=n
+50=m
+51=comma
+52=period
+53=slash
+
+# Top row punctuation
+12=minus
+13=equal
+26=bracketleft
+27=bracketright
+43=backslash
+41=grave

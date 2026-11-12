@@ -1,0 +1,17 @@
+[Unit]
+Description=Sync local-bootstrapping from master branch
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/Programs/local-bootstrapping/scripts/sync-from-master.sh
+StandardOutput=journal
+StandardError=journal
+
+# Environment
+Environment=HOME=%h
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

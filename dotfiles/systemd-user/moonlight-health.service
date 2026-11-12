@@ -1,0 +1,11 @@
+[Unit]
+Description=Moonlight client readiness check
+After=graphical-session.target network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/streaming-health moonlight check-fix
+SuccessExitStatus=1
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=workspace-labels: one label per Hyprland workspace (hidden ones captured too), popup under the bar on switch
+Documentation=file://%h/Programs/local-bootstrapping/docs/workspace-labels/REPORT.md
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/.local/bin/workspace-labels daemon
+Restart=on-failure
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=graphical-session.target

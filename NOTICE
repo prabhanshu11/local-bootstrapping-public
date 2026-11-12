@@ -1,0 +1,8 @@
+Third-party material in this repository
+
+dotfiles/local-lib/hyprwhspr-patch/
+    A patched launcher and overlay for hyprwhspr (https://github.com/goodroot/hyprwhspr).
+    hyprwhspr is MIT licensed, Copyright (c) 2025 goodroot. Parts of these files derive
+    from it; the patches are under this repository's MIT licence.
+
+Everything else is original to this repository unless a file says otherwise in its header.

@@ -1,0 +1,9 @@
+{
+  "name": "claude-memory-check",
+  "version": "1.0.0",
+  "description": "Pre-tool memory check hook that prevents system freeze by blocking Bash commands when memory usage is critical",
+  "author": {
+    "name": "main1",
+    "email": "you@example.com"
+  }
+}

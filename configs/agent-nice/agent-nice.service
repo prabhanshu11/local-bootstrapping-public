@@ -1,0 +1,11 @@
+[Unit]
+Description=agent-nice: agent work (Claude tool commands, ~/lanes) at nice 19 + idle IO so the UI and tracker win
+Documentation=file://%h/Programs/local-bootstrapping/configs/agent-nice/README.md
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.local/bin/agent-nice
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

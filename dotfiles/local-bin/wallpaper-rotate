@@ -1,0 +1,37 @@
+#!/bin/bash
+# wallpaper-rotate - Rotate wallpapers from ~/Pictures/Wallpapers/braces-*-4k.png
+# Called by systemd timer for slideshow effect
+
+WALLPAPER_DIR="$HOME/Pictures/Wallpapers"
+STATE_FILE="$HOME/.cache/wallpaper-rotate-index"
+
+# Get sorted list of wallpapers
+mapfile -t wallpapers < <(find "$WALLPAPER_DIR" -name 'braces-*-4k.png' -type f | sort)
+
+if [[ ${#wallpapers[@]} -eq 0 ]]; then
+    echo "No wallpapers found in $WALLPAPER_DIR"
+    exit 1
+fi
+
+# Read current index
+index=0
+if [[ -f "$STATE_FILE" ]]; then
+    index=$(cat "$STATE_FILE")
+fi
+
+# Wrap around
+if [[ $index -ge ${#wallpapers[@]} ]]; then
+    index=0
+fi
+
+current="${wallpapers[$index]}"
+
+# Set wallpaper
+pkill -x swaybg 2>/dev/null
+sleep 0.3
+setsid uwsm-app -- swaybg -i "$current" -m fill >/dev/null 2>&1 &
+
+# Save next index
+echo $(( (index + 1) % ${#wallpapers[@]} )) > "$STATE_FILE"
+
+echo "[$(date)] Set wallpaper: $(basename "$current")"

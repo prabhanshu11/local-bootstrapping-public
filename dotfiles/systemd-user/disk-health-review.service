@@ -1,0 +1,10 @@
+[Unit]
+Description=disk-health-review: one-off reminder + Opus review of the btrfs/power-button week
+Documentation=file://%h/Programs/local-bootstrapping/docs/issues/btrfs-commit-stall/REVIEW-BRIEF.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/disk-health-review
+TimeoutStartSec=50min
+Nice=10

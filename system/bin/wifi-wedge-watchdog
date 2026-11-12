@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# wifi-wedge-watchdog — recover a Wi-Fi link that associates but never gets an IP.
+#
+# FAILURE MODE (observed on desktop, 2026-08-29)
+#   iwd completes association (WPA3/SAE, good RSSI) but the interface's
+#   RFC-2863 operstate stays IF_OPER_DORMANT. systemd-networkd's
+#   link_has_carrier() explicitly treats DORMANT as "no carrier", so it never
+#   starts the DHCP client. Result: Wi-Fi reads "connected" in iwctl/impala
+#   with no IPv4 address, indefinitely, and *nothing is logged as an error*.
+#   Telltale: /sys/class/net/<if>/carrier=1 and dormant=0, yet operstate=dormant.
+#   Restarting iwd clears it immediately.
+#
+#   Trigger appears to be autoconnect churn: when several known networks are in
+#   range (e.g. a phone hotspot competing with the house router), iwd cycles
+#   connect -> disconnect -> connect, and a netlink operstate update gets lost.
+#
+# NOT the same as the RTL8821AU LPS firmware wedge (docs/rtl8821au-lps-wedge.md).
+# There the radio goes deaf and cannot scan at all; here association succeeds.
+# That one is prevented by /etc/modprobe.d/rtw88.conf (disable_lps_deep=Y).
+#
+# Runs as root from wifi-wedge-watchdog.timer every 15s (first check 30s after boot).
+#
+# 2026-09-11: thresholds tightened after the wedge hit 4 of 5 boots at the new
+# house (router is plain WPA2-PSK there, so SAE is not a factor): the old
+# 60s/120s/180s ladder cost ~2.5 min of no network on every power-cut recovery.
+# Repo copy: local-bootstrapping/system/bin/ (installed by scripts/install.sh).
+
+set -uo pipefail
+
+STATE_DIR="/var/lib/wifi-wedge-watchdog"
+STRIKE_FILE="$STATE_DIR/strikes"
+COOLDOWN_FILE="$STATE_DIR/cooldown-until"
+
+# Seconds to stay quiet after the most disruptive step, so a genuinely dead
+# network (AP switched off, moved house) does not cause an endless reset loop.
+COOLDOWN_SECS=600
+
+mkdir -p "$STATE_DIR"
+
+log() { echo "wifi-wedge-watchdog: $*"; }
+
+# Auto-detect the wireless interface. Do not hardcode wlan0: after a USB
+# re-enumeration the dongle comes back as wlan1 (see rtl8821au-lps-wedge.md).
+detect_iface() {
+    local d
+    for d in /sys/class/net/*/wireless; do
+        [[ -e "$d" ]] || continue
+        basename "$(dirname "$d")"
+        return 0
+    done
+    return 1
+}
+
+is_associated() {
+    # "Connected to <bssid>" is printed only once the association completes.
+    iw dev "$1" link 2>/dev/null | grep -q '^Connected to'
+}
+
+has_usable_ipv4() {
+    # 'scope global' excludes 169.254.x link-local self-assignment, which is
+    # not a working lease and must still count as wedged.
+    ip -4 -o addr show dev "$1" scope global 2>/dev/null | grep -q 'inet '
+}
+
+read_num() { local v; v=$(cat "$1" 2>/dev/null); [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 0; }
+
+reset_strikes() { echo 0 > "$STRIKE_FILE"; }
+
+# ---------------------------------------------------------------------------
+# Escalation policy.
+#
+# Each strike is one poll (15s). We wait 2 strikes (~30s) before touching
+# anything, because a legitimate association + DHCP handshake briefly looks
+# identical to a wedge (a healthy boot gets DHCP within ~10s of association).
+# Steps climb from cheap to disruptive:
+#
+#   strike 2 (~30s)  networkctl reconfigure  — just re-trigger DHCP (has never
+#                                              actually cleared the wedge; cheap)
+#   strike 3 (~45s)  restart iwd             — rebuilds the association (the
+#                                              known fix for this exact wedge)
+#   strike 8 (~2min) reset-usb-wifi          — USB/xHCI re-enumeration, last
+#                                              resort; then cool down
+#
+# Tune the thresholds here if it turns out to act too eagerly or too slowly.
+# ---------------------------------------------------------------------------
+escalate() {
+    local strikes="$1" iface="$2"
+
+    case "$strikes" in
+        2)
+            log "wedged ~30s on $iface — re-triggering DHCP (networkctl reconfigure)"
+            networkctl reconfigure "$iface"
+            ;;
+        3)
+            log "still wedged ~45s on $iface — restarting iwd"
+            systemctl restart iwd
+            ;;
+        8)
+            if command -v reset-usb-wifi >/dev/null 2>&1; then
+                log "still wedged ~2min on $iface — USB reset (last resort)"
+                reset-usb-wifi
+            else
+                log "still wedged ~2min on $iface — reset-usb-wifi not installed, skipping"
+            fi
+            echo $(( $(date +%s) + COOLDOWN_SECS )) > "$COOLDOWN_FILE"
+            reset_strikes
+            log "cooling down ${COOLDOWN_SECS}s before trying again"
+            ;;
+        *)
+            # Other strikes: give the previous action time to land before judging.
+            ;;
+    esac
+}
+
+main() {
+    local iface strikes now cooldown_until
+
+    iface=$(detect_iface) || { reset_strikes; exit 0; }
+
+    # Respect a cooldown from a previous escalation round.
+    now=$(date +%s)
+    cooldown_until=$(read_num "$COOLDOWN_FILE")
+    if (( now < cooldown_until )); then
+        exit 0
+    fi
+
+    # Not associated: iwd's own autoconnect owns this case. Nothing to fix,
+    # and interfering would fight it.
+    if ! is_associated "$iface"; then
+        reset_strikes
+        exit 0
+    fi
+
+    # Associated with a real lease: healthy.
+    if has_usable_ipv4 "$iface"; then
+        reset_strikes
+        exit 0
+    fi
+
+    strikes=$(( $(read_num "$STRIKE_FILE") + 1 ))
+    echo "$strikes" > "$STRIKE_FILE"
+    log "associated but no global IPv4 on $iface (strike $strikes, operstate=$(cat "/sys/class/net/$iface/operstate" 2>/dev/null))"
+
+    escalate "$strikes" "$iface"
+}
+
+main "$@"

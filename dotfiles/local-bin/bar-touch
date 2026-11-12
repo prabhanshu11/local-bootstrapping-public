@@ -1,0 +1,3769 @@
+#!/usr/bin/env python3
+"""
+bar-touch — a touch-native top bar, plus "mouse mode" for the laptop touchscreen.
+
+TOUCH ON THE BAR (always on)
+  Every waybar module's "on-click" is `bar-touch click <module>`. The real
+  command lives in that module's "touch" object in config.jsonc (waybar ignores
+  unknown keys). The daemon reads the touchscreen itself, so it knows whether a
+  click came from a finger and how long the finger stayed down:
+    * mouse click          -> run the command, exactly as before (no popup)
+    * finger tap  (<0.5 s) -> run the command, then a popup under the finger
+                              shows the module's state before -> after
+    * long press (>=0.5 s) -> a card: what the module is, its full state, and a
+                              big button for every action it has (tap,
+                              right-click, middle-click, scroll up/down), so
+                              right-click and scroll are reachable by finger
+  Workspace buttons and tray icons are built into waybar and cannot be wrapped;
+  they keep waybar's own touch behaviour (a tap activates).
+
+ON-SCREEN KEYBOARD (the layout icon, hyprland/language; 2026-10-03)
+  tap = show / hide a full keyboard along the bottom of the screen (windows shrink
+  above it, focus stays where it was), typed through a uinput keyboard; its
+  layout key switches every keyboard between the layouts in Hyprland's
+  input:kb_layout, and the keycaps are labelled for the active layout (xkbcli).
+  Long press = card. A touch outside it does NOT close it (unlike the popups).
+
+MOUSE MODE (the hand icon; state in ~/.config/bar-touch/mouse-mode)
+  The daemon grabs the touchscreen (EVIOCGRAB), so apps stop seeing touches,
+  and turns them into pointer input:
+    * tap            -> the arrow jumps to the finger and left-clicks
+    * long press     -> the arrow jumps there and right-clicks (fires at 0.5 s)
+    * drag           -> left-button drag, the arrow follows the finger
+    * two fingers swiped up -> an overview of every open window; tap one to
+                               switch to it, its ✕ to close it (also the
+                               windows icon on the bar, in any mode)
+  On the bar itself a touch holds the left button for as long as the finger
+  is down, so bar taps and long presses behave the same in both modes.
+  Stopping the daemon releases the grab (the kernel drops it with the fd).
+
+TESTED FACTS (waybar 0.15.0, Hyprland, 2026-09-24)
+  * A touch tap on a waybar module fires "on-click" ~6 ms after finger-down,
+    and "on-click-release" at finger-up — so the verdict waits for the finger.
+  * `hyprctl dispatch movecursor X Y` then a uinput BTN_LEFT lands on the
+    surface under the new position.
+  * A uinput multitouch device is picked up by Hyprland like a real screen;
+    the tests drive the whole path with one (see docs/touch-bar.md).
+
+Commands spawned by the daemon get the environment of the waybar process that
+invoked the client (waybar's PATH/OMARCHY_PATH), and the unit uses
+KillMode=process so restarting the daemon never kills apps it launched.
+
+Usage:
+  bar-touch daemon                  # the service (bar-touch.service)
+  bar-touch click <module>          # waybar on-click
+  bar-touch mouse [toggle|on|off]   # mouse mode
+  bar-touch mouse-status            # waybar JSON for the hand icon
+  bar-touch overview                # show all open windows
+  bar-touch status                  # daemon diagnostics
+
+Testing: BAR_TOUCH_DEVICES="name1,name2" limits the daemon to those input
+devices, so a test instance can grab a virtual screen without the real one.
+"""
+
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+SOCK = os.path.join(RUNTIME, "bar-touch.sock")
+STATE_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "bar-touch")
+MOUSE_FLAG = os.path.join(STATE_DIR, "mouse-mode")
+WAYBAR_CONFIG = os.path.expanduser("~/.config/waybar/config.jsonc")
+THEME_CSS = os.path.expanduser("~/.config/omarchy/current/theme/waybar.css")
+MOUSE_SIGNAL = 12            # waybar "signal" of custom/mouse-mode
+HAND = "\U000f0741"          # nf-md-gesture_tap
+
+LONG_PRESS = 0.5             # s
+BAR_MOVE_TOL = 20            # logical px a bar press may wander and still count
+MOVE_TOL = 14                # logical px before a mouse-mode touch becomes a drag
+SWIPE_MIN = 110              # logical px of two-finger upward travel for the overview
+RECENT = 0.35                # s: a touch that ended this recently still owns a click
+# Touch-dead waybar (docs/issues/waybar-ignores-touch-stale-touch-2026-10-02.md): GTK3
+# turns a touch into a click only while no other touch is held, so one lost lift leaves
+# waybar ignoring every tap until it restarts. Unanswered bar taps reveal it.
+DEAD_WINDOW = 30             # s in which unanswered bar taps add up
+DEAD_SAME_SPOT = 2           # unanswered taps within DEAD_SPOT px of each other
+DEAD_SPOT = 30               # logical px
+DEAD_ANY = 3                 # unanswered taps anywhere on the bar
+DEAD_COOLDOWN = 120          # s between two waybar restarts
+# Walker menus by finger (docs/issues/walker-menu-ignores-touch-2026-10-11.md): walker
+# keeps its result list untargetable until the POINTER moves twice, so a finger tap on
+# an entry does nothing. The daemon nudges the pointer when a walker menu opens.
+WALKER_NS = "walker"         # layer namespace of walker's window
+WALKER_BOX_HALF = 380        # logical px either side of the monitor centre: walker's box
+WALKER_TOUCH_RECENT = 5.0    # s: a menu opening this soon after a touch was opened by finger
+WALKER_REPLAY_DELAY = 200    # ms after the lift before a lost tap is replayed as a click
+
+
+# ─────────────────────────────── shared helpers ───────────────────────────────
+
+def strip_jsonc(text):
+    """Remove // and /* */ comments outside strings (waybar config is JSONC)."""
+    out, i, n = [], 0, len(text)
+    in_str = False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1]); i += 2; continue
+            if c == '"':
+                in_str = False
+            i += 1
+        elif c == '"':
+            in_str = True; out.append(c); i += 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        else:
+            out.append(c); i += 1
+    return "".join(out)
+
+
+_config_cache = {"mtime": None, "data": {}}
+
+
+def waybar_modules():
+    """Top-level waybar config as a dict, re-read when the file changes."""
+    try:
+        mtime = os.stat(WAYBAR_CONFIG).st_mtime
+        if mtime != _config_cache["mtime"]:
+            with open(WAYBAR_CONFIG) as f:
+                data = json.loads(strip_jsonc(f.read()), strict=False)
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            _config_cache.update(mtime=mtime, data=data)
+    except (OSError, ValueError) as exc:
+        print(f"config read failed: {exc}", flush=True)
+    return _config_cache["data"]
+
+
+def module_spec(name):
+    cfg = waybar_modules()
+    mod = cfg.get(name, {}) if isinstance(cfg.get(name), dict) else {}
+    touch = mod.get("touch", {}) if isinstance(mod.get("touch"), dict) else {}
+    return mod, touch
+
+
+def send(msg, timeout=0.4, reply_timeout=3.0):
+    """Reply dict, or None ONLY when the daemon cannot be reached (connect
+    failed). A slow or missing reply returns {"no_reply": True}: the daemon has
+    the request and will act on it, so callers must not run it a second time.
+    (Before 2026-11-01 a reply slower than 0.4 s returned None and cmd_click ran
+    the module's command itself too: a swapped-in daemon toggled the power
+    profile twice. docs/issues/power-button-ram-resident-risk-analysis.md risk 4.)"""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(SOCK)
+    except OSError:
+        return None
+    try:
+        s.settimeout(reply_timeout)
+        s.sendall((json.dumps(msg) + "\n").encode())
+        s.shutdown(socket.SHUT_WR)
+        reply = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            reply += chunk
+        s.close()
+        return json.loads(reply) if reply else {}
+    except (OSError, ValueError):
+        s.close()
+        return {"no_reply": True}
+
+
+def mouse_mode_on():
+    try:
+        with open(MOUSE_FLAG) as f:
+            return f.read().strip() == "on"
+    except OSError:
+        return False
+
+
+def run_detached(cmd, env=None):
+    subprocess.Popen(["setsid", "-f", "sh", "-c", cmd], env=env,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL).wait()
+
+
+def send_line(sock_name, line):
+    """Fire one text line at a RAM-resident helper's unix socket (relative names
+    live in $XDG_RUNTIME_DIR). False when it cannot connect: the caller then runs
+    the module's command instead. The reply is drained in a thread, never waited on.
+    Used by "click-socket" (power-profile-daemon, 2026-11-01): skips the shell
+    and a Python start-up on every tap."""
+    path = sock_name if sock_name.startswith("/") else os.path.join(RUNTIME, sock_name)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(0.3)
+    try:
+        s.connect(path)
+        s.sendall((line + "\n").encode())
+    except OSError:
+        s.close()
+        return False
+
+    def drain():
+        try:
+            s.settimeout(5)
+            s.recv(4096)
+        except OSError:
+            pass
+        s.close()
+    threading.Thread(target=drain, daemon=True).start()
+    return True
+
+
+def run_click(touch, env=None):
+    """A module's tap action: its "click-socket" line when the helper is up,
+    else its "click" command."""
+    spec = touch.get("click-socket")
+    if spec:
+        sock_name, _, line = spec.partition(" ")
+        if send_line(sock_name, line):
+            return
+    run_detached(touch["click"], env)
+
+
+# ─────────────────────────────── client commands ──────────────────────────────
+
+def cmd_click(module):
+    if send({"cmd": "click", "module": module, "env": dict(os.environ)}) is None:
+        # Daemon down (could not even connect): behave like the plain bar did.
+        _, touch = module_spec(module)
+        if touch.get("click"):
+            run_detached(touch["click"])
+
+
+def cmd_mouse(action):
+    reply = send({"cmd": "mouse", "set": action})
+    if reply is None:
+        subprocess.run(["notify-send", "-u", "critical", "Mouse mode",
+                        "bar-touch daemon is not running:\nsystemctl --user start bar-touch"])
+        sys.exit(1)
+
+
+def cmd_mouse_status():
+    if mouse_mode_on():
+        print(json.dumps({"text": HAND, "class": "on",
+                          "tooltip": "Mouse mode ON\nTap = left click where you touch, long press = right click,\n"
+                                     "drag = drag, two fingers up = all open windows"}))
+    else:
+        print(json.dumps({"text": HAND, "class": "off",
+                          "tooltip": "Mouse mode OFF\nTap to make the touchscreen act as a mouse"}))
+
+
+# ─────────────────────────────────── daemon ───────────────────────────────────
+
+def cmd_daemon():
+    import faulthandler
+    import signal as _signal
+    # `kill -USR1 <pid>` dumps every thread's Python stack to the journal.
+    faulthandler.register(_signal.SIGUSR1, all_threads=True)
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("GtkLayerShell", "0.1")
+    gi.require_version("PangoCairo", "1.0")
+    from gi.repository import Gdk, GLib, Gtk, GtkLayerShell, Pango, PangoCairo
+    import evdev
+    from evdev import UInput, ecodes as E
+
+    def log(msg):
+        print(msg, flush=True)
+
+    # ── Hyprland IPC ──
+    def hypr(cmd):
+        sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+        path = os.path.join(RUNTIME, "hypr", sig, ".socket.sock")
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            s.connect(path)
+            s.sendall(cmd.encode())
+            data = b""
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+            s.close()
+            return data.decode(errors="replace")
+        except OSError as exc:
+            log(f"hyprland ipc failed ({cmd.split()[0]}): {exc}")
+            return ""
+
+    def hypr_json(what):
+        try:
+            return json.loads(hypr("j/" + what) or "null")
+        except ValueError:
+            return None
+
+    def with_target_window(name, env):
+        """"pass-target-window": true (voice typing, 2026-09-27): the window that
+        was active when the card opened / the tap landed goes to the action as
+        HYPRWHSPR_TARGET_WINDOW=<address>, so a touch on the card (which may
+        refocus a window under it) cannot change where the text is typed."""
+        _, touch = module_spec(name)
+        if not touch.get("pass-target-window"):
+            return env
+        aw = hypr_json("activewindow") or {}
+        env = dict(env or os.environ)
+        env.pop("HYPRWHSPR_TARGET_WINDOW", None)
+        if aw.get("address"):
+            env["HYPRWHSPR_TARGET_WINDOW"] = aw["address"]
+            log(f"{name}: target window {aw.get('class')} / {(aw.get('title') or '')[:40]} {aw['address']}")
+        else:
+            log(f"{name}: no active window to pass as the target")
+        return env
+
+    def touch_monitor():
+        mons = hypr_json("monitors") or []
+        for m in mons:
+            if m.get("name", "").startswith("eDP"):
+                return m
+        for m in mons:
+            if m.get("focused"):
+                return m
+        return mons[0] if mons else {"x": 0, "y": 0, "width": 1920, "height": 1080, "scale": 1, "transform": 0}
+
+    def bar_height(mon=None):
+        """Height of the top waybar on the touchscreen's monitor (26 or 33)."""
+        mon = mon or touch_monitor()
+        layers = hypr_json("layers") or {}
+        levels = (layers.get(mon.get("name", "")) or {}).get("levels", {})
+        for level in levels.values():
+            for surf in level:
+                if "waybar" in surf.get("namespace", "") and surf.get("y", 99) <= mon.get("y", 0) + 2:
+                    return surf.get("h", 26)
+        return 26
+
+    def gdk_monitor_for(mon):
+        display = Gdk.Display.get_default()
+        for i in range(display.get_n_monitors()):
+            gm = display.get_monitor(i)
+            g = gm.get_geometry()
+            if g.x == mon.get("x") and g.y == mon.get("y"):
+                return gm
+        return display.get_monitor(0)
+
+    # ── styling: the omarchy theme's colours when present ──
+    theme = ""
+    try:
+        with open(THEME_CSS) as f:
+            theme = f.read()
+    except OSError:
+        pass
+    if "@define-color background" not in theme:
+        theme += "\n@define-color background #1a1b26;\n"
+    if "@define-color foreground" not in theme:
+        theme += "\n@define-color foreground #cdd6f4;\n"
+    css = theme + """
+    window.bt-win { background-color: transparent; }
+    window.bt-overview { background-color: alpha(#000000, 0.62); }
+    .bt-pop { background-color: alpha(@background, 0.97); color: @foreground;
+              border: 1px solid alpha(@foreground, 0.35); border-radius: 10px; padding: 10px 14px;
+              font-family: 'JetBrainsMono Nerd Font'; }
+    .bt-pop label { color: @foreground; }
+    .bt-title { font-size: 16px; font-weight: bold; }
+    .bt-toast { padding: 6px 12px; }
+    .bt-body { font-size: 14px; }
+    .bt-dim { font-size: 12px; opacity: 0.7; }
+    .bt-state { font-size: 13px; font-family: 'JetBrainsMono Nerd Font Mono'; }
+    .bt-arrow { font-size: 15px; font-weight: bold; color: #a6e3a1; }
+    .bt-btn { min-height: 28px; padding: 2px 10px; font-size: 13px; border-radius: 7px; margin-top: 4px;
+              background-image: none; background-color: alpha(@foreground, 0.10);
+              color: @foreground; border: 1px solid alpha(@foreground, 0.25); box-shadow: none; }
+    .bt-btn:hover, .bt-btn:active { background-color: alpha(@foreground, 0.22); }
+    .bt-btn label { font-size: 13px; }
+    .bt-close { min-height: 30px; min-width: 34px; font-size: 14px; margin-top: 0; }
+    .bt-chip { min-height: 26px; padding: 0 10px; margin-top: 0; }
+    .bt-chip label { font-size: 12px; }
+    .bt-tile { min-width: 300px; min-height: 130px; border-radius: 12px; padding: 10px;
+               background-image: none; background-color: alpha(@background, 0.95);
+               border: 1px solid alpha(@foreground, 0.30); color: @foreground; box-shadow: none; }
+    .bt-tile.current { border: 3px solid #a6e3a1; }
+    .bt-tile:hover, .bt-tile:active { background-color: alpha(@foreground, 0.20); }
+    .bt-tile-title { font-size: 15px; font-weight: bold; }
+    .bt-tile-ws { font-size: 14px; font-style: italic; }
+    .bt-tile-close { min-height: 48px; min-width: 48px; margin: 6px; font-size: 18px; }
+    .bt-ov-head { font-size: 20px; font-weight: bold; color: #ffffff; }
+    .bt-ov-hint { font-size: 14px; color: #dddddd; }
+    .bt-vol-value { font-size: 26px; font-weight: bold; }
+    .bt-headline { font-size: 17px; font-weight: bold; }
+    .bt-primary { min-height: 60px; border-width: 2px; }
+    .bt-on { border: 2px solid #a6e3a1; background-color: alpha(#a6e3a1, 0.25); }
+    .bt-on label { font-weight: bold; }
+    .bt-loading { border: 2px solid alpha(#f9e2af, 0.35); background-color: alpha(@foreground, 0.06); }
+    .bt-loading.bt-pulse { border-color: #f9e2af; background-color: alpha(#f9e2af, 0.16); }
+    .bt-primary label, .bt-primary-label { font-size: 18px; font-weight: bold; }
+    .bt-entry { min-height: 46px; font-size: 16px; padding: 0 10px; border-radius: 8px;
+                background-image: none; background-color: alpha(@foreground, 0.08);
+                color: @foreground; border: 1px solid alpha(@foreground, 0.35); }
+    .bt-mh-row { padding: 6px; border-radius: 10px; background-color: alpha(@foreground, 0.04); }
+    .bt-mh-row.previewing { background-color: alpha(#89b4fa, 0.16); }
+    .bt-mh-thumb { padding: 0; border-radius: 8px; border: 1px solid alpha(@foreground, 0.25);
+                   background-image: none; background-color: #000000; box-shadow: none; }
+    .bt-mh-name { font-size: 14px; font-weight: bold; }
+    .bt-mh-pos { font-size: 12px; font-family: 'JetBrainsMono Nerd Font Mono'; }
+    .bt-mh-btn { min-width: 128px; }
+    .bt-mh-tab { min-height: 44px; min-width: 150px; margin-top: 0; font-weight: bold; }
+    .bt-mh-tab.selected { background-color: alpha(#89b4fa, 0.30); border-color: #89b4fa; }
+    .bt-pop label.bt-mh-badge { font-size: 12px; font-weight: bold; color: #ffffff; background-color: alpha(#000000, 0.65);
+                   padding: 1px 6px; border-radius: 6px; margin: 4px; }
+    .bt-pop label.bt-mh-remote { font-size: 11px; color: #1e1e2e; background-color: #89b4fa; padding: 0 6px; border-radius: 6px; }
+    .bt-pop label.bt-mh-offline { font-size: 11px; color: #1e1e2e; background-color: #f9e2af; padding: 0 6px; border-radius: 6px; }
+    .bt-pop label.bt-mh-missing { font-size: 11px; color: #1e1e2e; background-color: #f38ba8; padding: 0 6px; border-radius: 6px; }
+    progressbar.bt-mh-progress trough { min-height: 8px; border-radius: 4px; background-color: alpha(@foreground, 0.15); }
+    progressbar.bt-mh-progress progress { min-height: 8px; border-radius: 4px; background-color: #89b4fa; }
+    .bt-kbd { border-radius: 14px 14px 0 0; padding: 10px 16px 12px 16px; }
+    .bt-key { min-height: 58px; border-radius: 8px; margin: 0; padding: 0 2px;
+              background-image: none; background-color: alpha(@foreground, 0.10);
+              color: @foreground; border: 1px solid alpha(@foreground, 0.25); box-shadow: none; }
+    .bt-key:hover { background-color: alpha(@foreground, 0.14); }
+    .bt-key:active { background-color: alpha(#89b4fa, 0.45); }
+    .bt-key-special, .bt-key-mod { background-color: alpha(@foreground, 0.05); }
+    .bt-key-tool { background-color: alpha(#89b4fa, 0.12); border-color: alpha(#89b4fa, 0.5); }
+    .bt-key.active-mod { background-color: alpha(#a6e3a1, 0.30); border: 2px solid #a6e3a1; }
+    .bt-pop label.bt-kbd-cap { font-size: 19px; }
+    .bt-pop label.bt-kbd-small { font-size: 11px; opacity: 0.65; }
+    scale.bt-vol trough { min-height: 16px; border-radius: 8px; }
+    scale.bt-vol highlight { min-height: 16px; border-radius: 8px; background-color: #89b4fa; }
+    scale.bt-vol slider { min-width: 38px; min-height: 38px; border-radius: 19px; margin: -12px; }
+    """
+    provider = Gtk.CssProvider()
+    try:
+        provider.load_from_data(css.encode())
+    except GLib.Error as exc:
+        log(f"css failed, using plain style: {exc}")
+        provider.load_from_data(css.replace(theme, "@define-color background #1a1b26;\n@define-color foreground #cdd6f4;\n").encode())
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider,
+                                             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def markup_or_escape(text):
+        try:
+            Pango.parse_markup(text, -1, "\0")
+            return text
+        except GLib.Error:
+            return GLib.markup_escape_text(text)
+
+    def label(text, cls, markup=False, wrap=True, xalign=0.0):
+        lab = Gtk.Label()
+        if markup:
+            lab.set_markup(markup_or_escape(text))
+        else:
+            lab.set_text(text)
+        lab.set_xalign(xalign)
+        lab.set_line_wrap(wrap)
+        lab.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        lab.get_style_context().add_class(cls)
+        return lab
+
+    def layer_window(namespace, mon, anchor_all=False, keyboard=False, bottom=False):
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        GtkLayerShell.init_for_window(win)
+        GtkLayerShell.set_namespace(win, namespace)
+        GtkLayerShell.set_layer(win, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_monitor(win, gdk_monitor_for(mon))
+        if bottom:
+            # the on-screen keyboard: centred on the bottom edge, and it takes an
+            # exclusive zone so the windows above shrink instead of hiding under it
+            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.BOTTOM, True)
+            GtkLayerShell.auto_exclusive_zone_enable(win)
+        elif anchor_all:
+            for edge in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM,
+                         GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
+                GtkLayerShell.set_anchor(win, edge, True)
+            GtkLayerShell.set_exclusive_zone(win, -1)
+        else:
+            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.TOP, True)
+            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.LEFT, True)
+        GtkLayerShell.set_keyboard_mode(win, GtkLayerShell.KeyboardMode.EXCLUSIVE if keyboard
+                                        else GtkLayerShell.KeyboardMode.NONE)
+        visual = win.get_screen().get_rgba_visual()
+        if visual:
+            win.set_visual(visual)
+        win.get_style_context().add_class("bt-overview" if anchor_all else "bt-win")
+        return win
+
+    def place_below_bar(win, width, x_local, mon):
+        mon_w = mon["width"] / (mon.get("scale") or 1)
+        left = int(min(max(x_local - width / 2, 8), mon_w - width - 8))
+        # Margins count from the edge of the bar's exclusive zone, not the screen.
+        GtkLayerShell.set_margin(win, GtkLayerShell.Edge.TOP, 6)
+        GtkLayerShell.set_margin(win, GtkLayerShell.Edge.LEFT, left)
+
+    # ── module state (runs commands; call from worker threads only) ──
+    def module_state(name, env):
+        """(short, full) state strings for a module, or ("", "") when unknown."""
+        mod, touch = module_spec(name)
+        cmd = touch.get("state")
+        json_out = bool(cmd and touch.get("state-json"))
+        if not cmd and mod.get("exec"):
+            cmd, json_out = mod["exec"], mod.get("return-type") == "json"
+        if not cmd:
+            return "", ""
+        try:
+            out = subprocess.run(["sh", "-c", cmd], env=env, capture_output=True, text=True, timeout=3).stdout.strip()
+        except subprocess.TimeoutExpired:
+            return "(no answer)", "(the state command timed out)"
+        if json_out:
+            try:
+                data = json.loads(out.splitlines()[-1] if out else "{}")
+            except ValueError:
+                data = {"text": out}
+            tip = str(data.get("tooltip") or "").strip()
+            text = str(data.get("text") or "").strip().replace("​", "")
+            lines = [l for l in tip.splitlines() if l.strip()]
+            cls = data.get("class", "")
+            cls = " ".join(map(str, cls)) if isinstance(cls, list) else str(cls)
+            short = lines[0] if lines else (text or cls)
+            full = tip or text
+            return short, full
+        lines = [l for l in out.splitlines() if l.strip()]
+        return (lines[0] if lines else ""), out
+
+    def module_class(name, env):
+        """The "class" of a JSON custom module's exec output ("" when unknown)."""
+        mod, touch = module_spec(name)
+        # A module whose exec streams forever (power-profile-daemon watch) names a
+        # one-shot JSON command as "state" + "state-json": true instead.
+        cmd = touch.get("state") if touch.get("state-json") else mod.get("exec")
+        if not cmd or mod.get("return-type") != "json":
+            return ""
+        try:
+            out = subprocess.run(["sh", "-c", cmd], env=env, capture_output=True,
+                                 text=True, timeout=3).stdout.strip()
+            cls = json.loads(out.splitlines()[-1]).get("class", "") if out else ""
+        except (subprocess.TimeoutExpired, ValueError, IndexError, AttributeError):
+            return ""
+        return (cls[0] if cls else "") if isinstance(cls, list) else str(cls)
+
+    ACTIONS = [  # (event, config key holding the command, default label)
+        ("click", None, "Tap action"),
+        ("right", "on-click-right", "Right-click action"),
+        ("middle", "on-click-middle", "Middle-click action"),
+        ("scroll-up", "on-scroll-up", "Scroll up"),
+        ("scroll-down", "on-scroll-down", "Scroll down"),
+    ]
+
+    def module_actions(name):
+        mod, touch = module_spec(name)
+        acts = []
+        for event, key, default in ACTIONS:
+            cmd = touch.get("click") if key is None else mod.get(key)
+            if isinstance(cmd, str) and cmd.strip():
+                acts.append((event, touch.get(f"{event}-label", default), cmd))
+        return acts
+
+    def title_of(name):
+        _, touch = module_spec(name)
+        return touch.get("title") or name.split("/")[-1].replace("-", " ").title()
+
+    # ── popups ──
+    class Toast:
+        """One line under the finger, 1.5 s, and taps pass straight through it."""
+
+        def __init__(self):
+            self.win = None
+            self.timer = None
+
+        def show(self, title, text, x_local, mon):
+            self.hide()
+            text = (text or "").strip()
+            if text and text.lower().startswith(title.split()[0].lower()):
+                line = markup_or_escape(text)
+            else:
+                line = f"<b>{GLib.markup_escape_text(title)}</b>" + (
+                    f"  ·  {markup_or_escape(text)}" if text else "")
+            win = layer_window("bar-touch-toast", mon)
+            lab = label(line, "bt-body", markup=True, wrap=False)
+            box = Gtk.Box()
+            box.get_style_context().add_class("bt-pop")
+            box.get_style_context().add_class("bt-toast")
+            box.pack_start(lab, False, False, 0)
+            win.add(box)
+            plain = Pango.parse_markup(line, -1, "\x00")[2] if "<" in line else line
+            width = min(len(plain) * 9 + 34, 560)   # ~9 px per 14 px mono char
+            place_below_bar(win, width, x_local, mon)
+            win.show_all()
+            import cairo
+            win.input_shape_combine_region(cairo.Region())   # never blocks a tap
+            self.win = win
+            self.timer = GLib.timeout_add(1500, self.hide)
+
+        def hide(self, *_):
+            if self.timer:
+                GLib.source_remove(self.timer)
+                self.timer = None
+            if self.win:
+                self.win.destroy()
+                self.win = None
+            return False
+
+    def inputs():
+        """[(name, description, is_default)] for real microphones: speaker
+        monitors and unplugged ports ("not available", e.g. the jack mic
+        with nothing in it) are left out."""
+        try:
+            sources = json.loads(subprocess.run(["pactl", "-f", "json", "list", "sources"],
+                                                capture_output=True, text=True, timeout=3).stdout or "[]")
+            default = subprocess.run(["pactl", "get-default-source"], capture_output=True,
+                                     text=True, timeout=3).stdout.strip()
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            return []
+        out = []
+        for src in sources:
+            if src.get("monitor_source") or src.get("name", "").endswith(".monitor"):
+                continue
+            port = src.get("active_port")
+            avail = [pt.get("availability") for pt in src.get("ports", []) if pt.get("name") == port]
+            if avail and avail[0] == "not available":
+                continue
+            out.append((src.get("name", ""), src.get("description") or src.get("name", ""),
+                        src.get("name") == default))
+        return out
+
+    class Card:
+        WIDTH = 440
+
+        def __init__(self, daemon):
+            self.d = daemon
+            self.win = None
+            self.timer = None
+            self.state_lab = None
+
+        def show(self, name, env, x_local, mon):
+            self.hide()
+            env = with_target_window(name, env)
+            self.name, self.env, self.x, self.mon = name, env, x_local, mon
+            mod, touch = module_spec(name)
+            win = layer_window("bar-touch-card", mon)
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            outer.get_style_context().add_class("bt-pop")
+            outer.set_size_request(self.WIDTH, -1)
+            head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            head.pack_start(label(title_of(name), "bt-title"), True, True, 0)
+            close = Gtk.Button(label="✕")
+            close.get_style_context().add_class("bt-btn")
+            close.get_style_context().add_class("bt-close")
+            close.connect("clicked", lambda *a: self.hide())
+            head.pack_end(close, False, False, 0)
+            outer.pack_start(head, False, False, 0)
+            # The right-click action is a small chip beside ✕, named by what it does: "right-chip"
+            # (short), else "right-label". No "Right-click:" prefix; a finger has no right button
+            # (2026-11-03, his pick for every popup; it was a full-width "Right-click: …" button).
+            for event, text, cmd in module_actions(name):
+                if event != "right":
+                    continue
+                chip = Gtk.Button()
+                chip.add(label(touch.get("right-chip") or text, "bt-body", wrap=False))
+                for c in ("bt-btn", "bt-chip"):
+                    chip.get_style_context().add_class(c)
+                chip.set_valign(Gtk.Align.CENTER)
+                chip.connect("clicked", self.on_action, event, text, cmd)
+                head.pack_end(chip, False, False, 0)
+            if touch.get("about"):
+                outer.pack_start(label(touch["about"], "bt-body"), False, False, 0)
+            # "status-labels" / "click-labels" ({class: text, "default": text}): a
+            # headline and the tap button's text follow the module's live class,
+            # e.g. voice typing: "● Start recording" / "■ Stop recording and type".
+            self.labels = (touch.get("status-labels") or {}, touch.get("click-labels") or {})
+            self.headline = None
+            if self.labels[0]:
+                self.headline = label("", "bt-headline", wrap=True)
+                outer.pack_start(self.headline, False, False, 2)
+            self.state_lab = label("Reading state…", "bt-state", wrap=True)
+            self.big_state = bool(touch.get("big-state"))
+            outer.pack_start(self.state_lab, False, False, 4)
+            self.click_lab = None
+            popup = self.d.popups.get(touch.get("popup"))
+            if popup:
+                btn = Gtk.Button()
+                # "popup-label" names what the tap opens (default: "Open the … controls").
+                btn.add(label(f"Tap:  {touch.get('popup-label') or f'Open the {title_of(name)} controls'}",
+                              "bt-body", wrap=True))
+                btn.get_style_context().add_class("bt-btn")
+                btn.connect("clicked", lambda *_: (self.hide(),
+                                                   self.d.open_popup(popup, self.env, self.x, self.mon)))
+                outer.pack_start(btn, False, False, 0)
+            for event, text, cmd in module_actions(name):
+                if event == "right":
+                    continue                          # the title-row chip above
+                prefix = {"click": "Tap", "middle": "Middle-click",
+                          "scroll-up": "Scroll ↑", "scroll-down": "Scroll ↓"}[event]
+                btn = Gtk.Button()
+                if event == "click" and self.labels[1]:
+                    self.click_lab = label("Checking…", "bt-primary-label", wrap=True, xalign=0.5)
+                    btn.add(self.click_lab)
+                    btn.get_style_context().add_class("bt-primary")
+                    btn.set_sensitive(False)          # until the live state is known
+                    self.click_btn = btn
+                else:
+                    btn.add(label(f"{prefix}:  {text}", "bt-body", wrap=True))
+                btn.get_style_context().add_class("bt-btn")
+                btn.connect("clicked", self.on_action, event, text, cmd)
+                outer.pack_start(btn, False, False, 0)
+            # "actions": [{"label": text, "cmd": command}] -> one button each (2026-11-01, the VDI
+            # moon: every action of the fullscreen VDI bar must also be a finger away from the icon;
+            # five mouse events are not enough). Runs like the other actions.
+            # "state-cmd" (2026-11-03, voice typing "Source:" button): prints {"label": text,
+            # "active": bool} (or one plain line). The button shows that text, highlighted
+            # (.bt-on) while active; a tap runs "cmd" and re-reads it in place, the card stays
+            # open, so the button itself is the indicator (no toast, no notification).
+            self.state_btns = []
+            self.state_seq, self.state_busy, self.pulsing = {}, set(), set()
+            for i, a in enumerate(x for x in (touch.get("actions") or []) if isinstance(x, dict) and x.get("cmd")):
+                btn = Gtk.Button()
+                lab = label(a.get("label") or ("Checking…" if a.get("state-cmd") else a["cmd"]),
+                            "bt-body", wrap=True)
+                btn.add(lab)
+                btn.get_style_context().add_class("bt-btn")
+                if a.get("state-cmd"):
+                    self.state_btns.append((btn, lab, a["state-cmd"]))
+                    btn.connect("clicked", self.on_state_action, a["cmd"], btn, lab, a["state-cmd"])
+                else:
+                    btn.connect("clicked", self.on_action, f"action-{i}", a.get("label") or a["cmd"], a["cmd"])
+                outer.pack_start(btn, False, False, 0)
+            # "links": [{"label": text, "url": url}] -> one button each; it hides the
+            # card and opens the URL with xdg-open (voice typing: the labels web app).
+            links = [l for l in (touch.get("links") or []) if isinstance(l, dict) and l.get("url")]
+            for link in links:
+                btn = Gtk.Button()
+                btn.add(label(f"↗  {link.get('label') or link['url']}", "bt-body", wrap=True))
+                btn.get_style_context().add_class("bt-btn")
+                btn.connect("clicked", self.on_link, link["url"])
+                outer.pack_start(btn, False, False, 0)
+            # "mic-picker": true -> a Microphone list; tapping one makes it the
+            # default source (voice typing records from the default, 2026-09-30).
+            self.mic_box = None
+            if touch.get("mic-picker"):
+                outer.pack_start(label("Microphone (tap to make it the default)", "bt-dim"), False, False, 4)
+                self.mic_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+                outer.pack_start(self.mic_box, False, False, 0)
+                self.fill_mics()
+            if not module_actions(name) and not popup and not links and not self.mic_box and not touch.get("actions"):
+                outer.pack_start(label("Display only: this module has no actions.", "bt-dim"), False, False, 0)
+            win.add(outer)
+            place_below_bar(win, self.WIDTH + 30, x_local, mon)
+            win.show_all()
+            self.win = win
+            self.bump()
+            self.refresh()
+            for btn, lab, state_cmd in self.state_btns:
+                self.fill_state_btn(btn, lab, state_cmd)
+
+        def refresh(self):
+            name, env, win = self.name, self.env, self.win
+
+            def work():
+                _, full = module_state(name, env)
+                full = "\n".join(l for l in full.splitlines() if not l.startswith("_ts:"))
+                GLib.idle_add(self.set_state, win, full or "No state reported.")
+                if any(self.labels):
+                    cls = module_class(name, env)
+                    GLib.idle_add(self.set_class, win, cls)
+            threading.Thread(target=work, daemon=True).start()
+
+        def set_class(self, win, cls):
+            if win is not self.win:
+                return False
+            status, click = self.labels
+            if self.headline is not None:
+                self.headline.set_text(status.get(cls, status.get("default", "")))
+            if self.click_lab is not None:
+                self.click_lab.set_text(click.get(cls, click.get("default", "Tap action")))
+                self.click_btn.set_sensitive(True)
+            return False
+
+        def set_state(self, win, text):
+            if win is self.win and self.state_lab:
+                text = markup_or_escape(text)
+                if self.big_state:
+                    text = f"<span size='x-large'>{text}</span>"
+                self.state_lab.set_markup(text)
+            return False
+
+        def on_action(self, _btn, event, text, cmd):
+            if event.startswith("scroll"):
+                run_detached(cmd, self.env)          # stay open: scroll is repeatable
+                GLib.timeout_add(350, lambda: (self.refresh(), False)[1])
+                self.bump()
+                return
+            name, env, x, mon = self.name, self.env, self.x, self.mon
+            self.hide()
+            self.d.act_and_report(name, env, x, mon, cmd=cmd, label_text=text)
+
+        def fill_mics(self):
+            for child in self.mic_box.get_children():
+                child.destroy()
+            mics = inputs()
+            if not mics:
+                self.mic_box.pack_start(label("No microphones found.", "bt-dim"), False, False, 0)
+            for name, desc, is_default in mics:
+                b = Gtk.Button()
+                esc = GLib.markup_escape_text(desc)
+                b.add(label(f"● <b>{esc}</b>" if is_default else f"○ {esc}", "bt-body", markup=True))
+                b.get_style_context().add_class("bt-btn")
+                b.connect("clicked", self.on_mic, name)
+                self.mic_box.pack_start(b, False, False, 0)
+            self.mic_box.show_all()
+
+        def fill_state_btn(self, btn, lab, state_cmd, from_pulse=False):
+            win, env = self.win, self.env
+            if from_pulse and btn in self.state_busy:
+                return                                # the last read is still running
+            self.state_busy.add(btn)
+            seq = self.state_seq[btn] = self.state_seq.get(btn, 0) + 1
+
+            def work():
+                try:
+                    out = subprocess.run(["sh", "-c", state_cmd], env=env, capture_output=True,
+                                         text=True, timeout=5, stdin=subprocess.DEVNULL).stdout.strip()
+                except (subprocess.TimeoutExpired, OSError):
+                    out = ""
+                try:
+                    d = json.loads(out)
+                    text, active = str(d.get("label") or ""), bool(d.get("active"))
+                    loading = bool(d.get("loading"))
+                except (ValueError, AttributeError):
+                    text, active, loading = (out.splitlines() or [""])[0], False, False
+                GLib.idle_add(self.set_state_btn, win, btn, lab, text, active, loading, state_cmd, seq)
+            threading.Thread(target=work, daemon=True).start()
+
+        def set_state_btn(self, win, btn, lab, text, active, loading=False, state_cmd=None, seq=None):
+            if seq is not None and seq == self.state_seq.get(btn):
+                self.state_busy.discard(btn)
+            if win is not self.win or (seq is not None and seq != self.state_seq.get(btn)):
+                return False                          # card closed, or a newer read is on its way
+            if text:
+                lab.set_text(text)
+            ctx = btn.get_style_context()
+            (ctx.add_class if active else ctx.remove_class)("bt-on")
+            btn.set_sensitive(True)
+            # "loading": true (2026-11-03, voice typing: local models loading, or Deepgram not
+            # reached yet) -> the button pulses until a re-read says ready. Cheap on purpose: one
+            # class flip per 0.8 s (no CSS animation), a re-read every 1.6 s, only while the card
+            # is open.
+            if loading:
+                ctx.add_class("bt-loading")
+                if btn not in self.pulsing and state_cmd:
+                    self.pulsing.add(btn)
+                    tick = [0]
+
+                    def pulse():
+                        c = btn.get_style_context()
+                        if win is not self.win or not c.has_class("bt-loading"):
+                            self.pulsing.discard(btn)
+                            c.remove_class("bt-pulse")
+                            return False
+                        (c.remove_class if c.has_class("bt-pulse") else c.add_class)("bt-pulse")
+                        tick[0] += 1
+                        if tick[0] % 2 == 0:
+                            self.fill_state_btn(btn, lab, state_cmd, from_pulse=True)
+                        return True
+                    GLib.timeout_add(800, pulse)
+            else:
+                ctx.remove_class("bt-loading")
+                ctx.remove_class("bt-pulse")
+            return False
+
+        def on_state_action(self, _btn, cmd, btn, lab, state_cmd):
+            env = self.env
+            btn.set_sensitive(False)
+            log(f"state action: {cmd}")
+
+            def work():
+                try:
+                    subprocess.run(["sh", "-c", cmd], env=env, timeout=10, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except (subprocess.TimeoutExpired, OSError) as e:
+                    log(f"state action failed: {e}")
+                GLib.idle_add(lambda: (self.fill_state_btn(btn, lab, state_cmd), self.refresh(), False)[-1])
+            threading.Thread(target=work, daemon=True).start()
+            self.bump()
+
+        def on_mic(self, _btn, name):
+            subprocess.run(["pactl", "set-default-source", name], timeout=3)
+            log(f"default mic -> {name}")
+            self.fill_mics()
+            self.bump()
+
+        def on_link(self, _btn, url):
+            env = self.env
+            self.hide()
+            subprocess.Popen(["setsid", "-f", "xdg-open", url], env=env, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def bump(self):
+            if self.timer:
+                GLib.source_remove(self.timer)
+            self.timer = GLib.timeout_add_seconds(20, self.hide)
+
+        def hide(self, *_):
+            if self.timer:
+                GLib.source_remove(self.timer)
+                self.timer = None
+            if self.win:
+                self.win.destroy()
+                self.win = None
+            self.state_lab = None
+            return False
+
+    class VolumePopup:
+        """Touch volume control: a big slider, mute / -5 / +5, and the output
+        devices (tap one to make it the default). Replaces the wiremix TUI."""
+        WIDTH = 420
+
+        def __init__(self):
+            self.win = None
+            self.timer = None
+            self.pending = None
+            self.env = dict(os.environ)
+
+        @staticmethod
+        def read():
+            def q(*args):
+                return subprocess.run(["pamixer", *args], capture_output=True, text=True).stdout.strip()
+            try:
+                vol = int(q("--get-volume") or 0)
+            except ValueError:
+                vol = 0
+            sink = subprocess.run(["sh", "-c", "pactl get-default-sink 2>/dev/null; "
+                                   "pactl list sinks 2>/dev/null | awk -v s=\"$(pactl get-default-sink)\" "
+                                   "'$1==\"Name:\"{n=$2} $1==\"Description:\" && n==s{sub(/^[ \\t]*Description: /,\"\"); print; exit}'"],
+                                  capture_output=True, text=True).stdout.strip().splitlines()
+            return vol, q("--get-mute") == "true", (sink[-1] if sink else "")
+
+        # Bluetooth codec order on the button row, best last (2026-10-25: the FiiO
+        # BR13 came up on SBC after a re-pair; "most devices show AAC").
+        CODEC_ORDER = ["SBC", "SBC-XQ", "AAC", "aptX", "aptX-LL", "aptX HD", "LDAC"]
+
+        @staticmethod
+        def bt_cards():
+            """{address_with_underscores: {"card", "active", "codec", "codecs": [(profile, label)]}}
+            for every connected Bluetooth audio card. The codec is negotiated per
+            audio stream (A2DP) on top of the link, so changing it is a PipeWire card
+            profile, not a Bluetooth reconnect."""
+            try:
+                cards = json.loads(subprocess.run(["pactl", "-f", "json", "list", "cards"],
+                                                  capture_output=True, text=True, timeout=3).stdout or "[]")
+            except (subprocess.TimeoutExpired, ValueError, OSError):
+                return {}
+            out = {}
+            for c in cards:
+                name = c.get("name", "")
+                if not name.startswith("bluez_card."):
+                    continue
+                active = c.get("active_profile", "")
+                codecs, codec = [], None
+                for prof, info in (c.get("profiles") or {}).items():
+                    m = re.search(r"A2DP Sink, codec ([^)]+)\)", info.get("description", ""))
+                    if not m or not info.get("available", True):
+                        continue
+                    codecs.append((prof, m.group(1)))
+                    if prof == active:
+                        codec = m.group(1)
+                if codec is None and active.startswith("headset"):
+                    codec = "headset (mic)"
+                order = {k: i for i, k in enumerate(VolumePopup.CODEC_ORDER)}
+                codecs.sort(key=lambda pc: order.get(pc[1], len(order)))
+                out[name[len("bluez_card."):]] = {"card": name, "active": active,
+                                                  "codec": codec, "codecs": codecs}
+            return out
+
+        @staticmethod
+        def outputs():
+            """[(name, description, is_default, bt)] for plugged-in outputs; unplugged
+            HDMI ports ("not available") are left out. bt is the bt_cards() entry for
+            a Bluetooth sink (its codec and the codecs it can switch to), else None."""
+            try:
+                sinks = json.loads(subprocess.run(["pactl", "-f", "json", "list", "sinks"],
+                                                  capture_output=True, text=True, timeout=3).stdout or "[]")
+                default = subprocess.run(["pactl", "get-default-sink"], capture_output=True,
+                                         text=True, timeout=3).stdout.strip()
+            except (subprocess.TimeoutExpired, ValueError, OSError):
+                return []
+            cards = VolumePopup.bt_cards() if any(sk.get("name", "").startswith("bluez_") for sk in sinks) else {}
+            out = []
+            for sk in sinks:
+                port = sk.get("active_port")
+                avail = [pt.get("availability") for pt in sk.get("ports", []) if pt.get("name") == port]
+                if avail and avail[0] == "not available":
+                    continue
+                name = sk.get("name", "")
+                bt = None
+                if name.startswith("bluez_output."):
+                    bt = cards.get(name[len("bluez_output."):].rsplit(".", 1)[0])
+                out.append((name, sk.get("description") or name, name == default, bt))
+            return out
+
+        def show(self, env, x_local, mon):
+            self.hide()
+            self.env, self.x, self.mon = env or self.env, x_local, mon
+            vol, muted, sink = self.read()
+            win = layer_window("bar-touch-volume", mon)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            box.get_style_context().add_class("bt-pop")
+            box.set_size_request(self.WIDTH, -1)
+            head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            head.pack_start(label("Volume", "bt-title"), True, True, 0)
+            self.value = label("", "bt-vol-value", wrap=False, xalign=1.0)
+            head.pack_start(self.value, False, False, 0)
+            close = Gtk.Button(label="\u2715")
+            close.get_style_context().add_class("bt-btn")
+            close.get_style_context().add_class("bt-close")
+            close.connect("clicked", lambda *a: self.hide())
+            head.pack_end(close, False, False, 0)
+            box.pack_start(head, False, False, 0)
+            if sink:
+                box.pack_start(label(sink, "bt-dim"), False, False, 0)
+            self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+            self.scale.set_draw_value(False)
+            self.scale.set_value(vol)
+            self.scale.get_style_context().add_class("bt-vol")
+            self.scale.set_size_request(-1, 56)
+            self.scale.connect("value-changed", self.on_slide)
+            box.pack_start(self.scale, False, False, 6)
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            row.set_homogeneous(True)
+            self.mute_btn = Gtk.Button()
+            for widget, cb in ((self.mute_btn, self.on_mute),
+                               (Gtk.Button(label="\u2212 5"), lambda *a: self.nudge(-5)),
+                               (Gtk.Button(label="+ 5"), lambda *a: self.nudge(5))):
+                widget.get_style_context().add_class("bt-btn")
+                widget.connect("clicked", cb)
+                row.pack_start(widget, True, True, 0)
+            box.pack_start(row, False, False, 0)
+            outs = self.outputs()
+            if len(outs) > 1:
+                box.pack_start(label("Output", "bt-dim"), False, False, 4)
+                for name, desc, is_default, bt in outs:
+                    b = Gtk.Button()
+                    esc = GLib.markup_escape_text(desc)
+                    codec = f" · {GLib.markup_escape_text(bt['codec'])}" if bt and bt.get("codec") else ""
+                    b.add(label(f"● <b>{esc}</b>{codec}" if is_default else f"○ {esc}{codec}",
+                                "bt-body", markup=True))
+                    b.get_style_context().add_class("bt-btn")
+                    b.connect("clicked", self.on_output, name)
+                    box.pack_start(b, False, False, 0)
+                    if is_default and bt and len(bt["codecs"]) > 1:
+                        self.codec_rows(box, bt)
+            win.add(box)
+            place_below_bar(win, self.WIDTH + 30, x_local, mon)
+            win.show_all()
+            self.win = win
+            self.render(vol, muted)
+            self.bump()
+
+        def render(self, vol, muted):
+            if not self.win:
+                return
+            self.value.set_text("muted" if muted else f"{vol}%")
+            self.mute_btn.set_label("Unmute" if muted else "Mute")
+
+        def on_slide(self, scale):
+            self.bump()
+            if self.pending:
+                GLib.source_remove(self.pending)
+            self.pending = GLib.timeout_add(60, self.apply, int(scale.get_value()))
+            self.value.set_text(f"{int(scale.get_value())}%")
+
+        def apply(self, vol):
+            self.pending = None
+            subprocess.run(["pamixer", "--unmute", "--set-volume", str(vol)])
+            self.render(vol, False)
+            return False
+
+        def nudge(self, delta):
+            self.bump()
+            vol = max(0, min(100, int(self.scale.get_value()) + delta))
+            self.scale.set_value(vol)          # triggers on_slide -> apply
+
+        def on_mute(self, *_):
+            self.bump()
+            subprocess.run(["pamixer", "-t"])
+            vol, muted, _ = self.read()
+            self.render(vol, muted)
+
+        def on_output(self, _btn, name):
+            subprocess.run(["pactl", "set-default-sink", name])
+            self.show(self.env, self.x, self.mon)     # redraw: new default, its volume
+
+        def codec_rows(self, box, bt):
+            """Codec buttons under the selected Bluetooth output, four to a row, the
+            active one marked. A tap sets the card profile; the stream reopens with
+            the new codec in about a second and the panel redraws."""
+            box.pack_start(label("Codec", "bt-dim"), False, False, 2)
+            codecs = bt["codecs"]
+            for i in range(0, len(codecs), 4):
+                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                row.set_homogeneous(True)
+                for prof, name in codecs[i:i + 4]:
+                    active = prof == bt["active"]
+                    b = Gtk.Button()
+                    esc = GLib.markup_escape_text(name)
+                    b.add(label(f"● <b>{esc}</b>" if active else esc, "bt-body", markup=True, xalign=0.5))
+                    b.get_style_context().add_class("bt-btn")
+                    b.connect("clicked", self.on_codec, bt["card"], prof, name)
+                    row.pack_start(b, True, True, 0)
+                box.pack_start(row, False, False, 0)
+
+        def on_codec(self, _btn, card, profile, name):
+            self.bump()
+            self.value.set_text(f"→ {name}…")
+            subprocess.run(["pactl", "set-card-profile", card, profile], timeout=5)
+            log(f"volume: {card} codec -> {profile} ({name})")
+            # WirePlumber remembers the profile per card (default-profile), so the
+            # choice survives reconnects. The sink vanishes while the stream reopens
+            # (LDAC took ~3 s on the BR13), so redraw when it is back, or at 6 s.
+            addr = card[len("bluez_card."):]
+            deadline = time.time() + 6
+
+            def back():
+                try:
+                    names = subprocess.run(["pactl", "-f", "json", "list", "short", "sinks"],
+                                           capture_output=True, text=True, timeout=2).stdout
+                except (subprocess.TimeoutExpired, OSError):
+                    names = ""
+                if f"bluez_output.{addr}." not in names and time.time() < deadline:
+                    return True                          # keep polling
+                self.show(self.env, self.x, self.mon)
+                return False
+            GLib.timeout_add(500, back)
+
+        def bump(self):
+            if self.timer:
+                GLib.source_remove(self.timer)
+            self.timer = GLib.timeout_add_seconds(8, self.hide)
+
+        def hide(self, *_):
+            for attr in ("timer", "pending"):
+                if getattr(self, attr):
+                    GLib.source_remove(getattr(self, attr))
+                    setattr(self, attr, None)
+            if self.win:
+                self.win.destroy()
+                self.win = None
+            return False
+
+    ANSI = __import__("re").compile(r"\x1b\[[0-9;]*m")
+
+    def sh_out(cmd, timeout=12):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+        except (subprocess.TimeoutExpired, OSError):
+            return ""
+
+    class ListPopup:
+        """A popup under the bar: header row, a scrollable list of big buttons
+        filled from a worker thread, and a footer row. Subclasses implement
+        load() (worker thread, returns data) and rows(data) (main thread)."""
+        WIDTH = 440
+        TITLE = ""
+
+        def __init__(self):
+            self.win = None
+            self.timer = None
+            self.env = dict(os.environ)
+            self.gen = 0
+
+        def show(self, env, x_local, mon):
+            self.hide()
+            self.env, self.x, self.mon = env or self.env, x_local, mon
+            win = layer_window("bar-touch-" + self.TITLE.lower().replace(" ", "-"), mon)
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            outer.get_style_context().add_class("bt-pop")
+            outer.set_size_request(self.WIDTH, -1)
+            head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            head.pack_start(label(self.TITLE, "bt-title", wrap=False), True, True, 0)
+            self.head_extra = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            head.pack_start(self.head_extra, False, False, 0)
+            close = Gtk.Button(label="✕")
+            close.get_style_context().add_class("bt-btn")
+            close.get_style_context().add_class("bt-close")
+            close.connect("clicked", lambda *a: self.hide())
+            head.pack_end(close, False, False, 0)
+            outer.pack_start(head, False, False, 0)
+            self.status = label("Reading…", "bt-dim")
+            outer.pack_start(self.status, False, False, 0)
+            self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroller.set_propagate_natural_height(True)
+            scroller.set_max_content_height(430)
+            scroller.add(self.list)
+            self.scroller = scroller
+            outer.pack_start(scroller, True, True, 0)
+            foot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            foot.set_homogeneous(True)
+            for text, cb in self.footer():
+                b = Gtk.Button(label=text)
+                b.get_style_context().add_class("bt-btn")
+                b.connect("clicked", cb)
+                foot.pack_start(b, True, True, 0)
+            outer.pack_start(foot, False, False, 0)
+            win.add(outer)
+            place_below_bar(win, self.WIDTH + 30, x_local, mon)
+            win.show_all()
+            self.win = win
+            self.bump()
+            self.reload()
+
+        def reload(self, note=None):
+            self.gen += 1
+            gen = self.gen
+            if note and self.win:
+                self.status.set_text(note)
+
+            def work():
+                data = self.load()
+                GLib.idle_add(self.fill, gen, data)
+            threading.Thread(target=work, daemon=True).start()
+
+        def fill(self, gen, data):
+            if gen != self.gen or not self.win:
+                return False
+            for child in self.list.get_children():
+                child.destroy()
+            for child in self.head_extra.get_children():
+                child.destroy()
+            status = self.rows(data)
+            self.status.set_text(status or "")
+            # Natural-height propagation is not re-run after the rows arrive, so
+            # size the list explicitly: up to ~8 rows, then it scrolls.
+            n = len(self.list.get_children())
+            self.scroller.set_min_content_height(min(n * 58, 430))
+            self.win.show_all()
+            return False
+
+        def row_button(self, text, cb, *args, dim=False):
+            b = Gtk.Button()
+            lab = label(text, "bt-body", markup=True)
+            b.add(lab)
+            b.get_style_context().add_class("bt-btn")
+            if dim:
+                b.set_opacity(0.6)
+            b.connect("clicked", lambda *_: (self.bump(), cb(*args)))
+            self.list.pack_start(b, False, False, 0)
+            return b
+
+        def head_button(self, text, cb):
+            b = Gtk.Button(label=text)
+            b.get_style_context().add_class("bt-btn")
+            b.connect("clicked", lambda *_: (self.bump(), cb()))
+            self.head_extra.pack_start(b, False, False, 0)
+
+        def run_then_reload(self, cmd, note):
+            """Run a (possibly slow) command off the main thread, then refresh."""
+            self.reload_note = note
+            if self.win:
+                self.status.set_text(note)
+
+            def work():
+                sh_out(cmd, timeout=25)
+                GLib.idle_add(lambda: (self.reload(), False)[1])
+            threading.Thread(target=work, daemon=True).start()
+
+        def set_status(self, text):
+            """Main thread only (GLib.idle_add from workers)."""
+            if self.win:
+                self.status.set_text(text)
+                self.bump()
+            return False
+
+        def bump(self):
+            if self.timer:
+                GLib.source_remove(self.timer)
+            self.timer = GLib.timeout_add_seconds(20, self.hide)
+
+        def hide(self, *_):
+            if self.timer:
+                GLib.source_remove(self.timer)
+                self.timer = None
+            if self.win:
+                self.win.destroy()
+                self.win = None
+            return False
+
+    def bars(n):
+        n = max(0, min(4, n))
+        return "▂▄▆█"[:n] + "<span alpha='30%'>" + "▂▄▆█"[n:] + "</span>"
+
+    class WifiPopup(ListPopup):
+        TITLE = "Wi-Fi"
+
+        def __init__(self):
+            super().__init__()
+            self.dev = None
+
+        def footer(self):
+            return [("Rescan", lambda *_: self.run_then_reload(
+                        ["sh", "-c", f"iwctl station {self.dev or 'wlan0'} scan; sleep 3"], "Scanning…"))]
+
+        def load(self):
+            devs = []
+            for line in ANSI.sub("", sh_out(["iwctl", "station", "list"])).splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].startswith("wl"):
+                    devs.append((parts[0], parts[1]))
+            route = sh_out(["ip", "route", "show", "default"])
+            internet = next((d for d, _ in devs if f"dev {d} " in route), None)
+            dev = self.dev if self.dev in [d for d, _ in devs] else (internet or (devs[0][0] if devs else None))
+            nets = []
+            if dev:
+                raw = sh_out(["iwctl", "station", dev, "get-networks"])
+                for line in raw.splitlines():
+                    connected = "> " in ANSI.sub("", line)[:8]
+                    clean = ANSI.sub("", line).replace(">", " ", 1) if connected else ANSI.sub("", line)
+                    m = __import__("re").match(r"^\s+(.+?)\s{2,}(psk|open|8021x|wep)\s+(\*+)\s*$", clean)
+                    if not m:
+                        continue
+                    sig = line.split(m.group(2))[-1]
+                    filled = sig.split("\x1b")[0].count("*")
+                    nets.append({"ssid": m.group(1).strip(), "sec": m.group(2), "bars": filled, "on": connected})
+            known = set()
+            kraw = ANSI.sub("", sh_out(["iwctl", "known-networks", "list"]))
+            for line in kraw.splitlines():
+                m = __import__("re").match(r"^\s{2}(.+?)\s{2,}(psk|open|8021x|wep)\s", line)
+                if m:
+                    known.add(m.group(1).strip())
+            return {"devs": devs, "dev": dev, "internet": internet, "nets": nets, "known": known}
+
+        def rows(self, d):
+            self.dev = d["dev"]
+            for dev, state in d["devs"]:
+                tag = " (internet)" if dev == d["internet"] else ""
+                mark = "● " if dev == d["dev"] else ""
+                self.head_button(f"{mark}{dev}{tag}", lambda dv=dev: (setattr(self, "dev", dv), self.reload("Reading…")))
+            if not d["dev"]:
+                return "No Wi-Fi device found."
+            for n in d["nets"]:
+                esc = GLib.markup_escape_text(n["ssid"])
+                lock = "" if n["sec"] == "open" else " \U000f033e"
+                saved = " · saved" if n["ssid"] in d["known"] else ""
+                state = "  <b>connected</b>" if n["on"] else ""
+                text = f"{bars(n['bars'])}  <b>{esc}</b>{lock}{saved}{state}"
+                self.row_button(text, self.pick, n, d["known"])
+            on = next((n["ssid"] for n in d["nets"] if n["on"]), None)
+            return (f"{d['dev']}: connected to {on}" if on else f"{d['dev']}: not connected")
+
+        def pick(self, n, known):
+            if n["on"]:
+                self.status.set_text(f"Already connected to {n['ssid']}")
+                return
+            if n["sec"] == "8021x" and n["ssid"] not in known:
+                self.status.set_text(f"{n['ssid']} is an enterprise (802.1X) network: it needs an iwd config file.")
+                return
+            if n["sec"] != "open" and n["ssid"] not in known:
+                self.ask_password(n)
+                return
+            self.connect(n["ssid"])
+
+        def ask_password(self, n):
+            """Replace the list with a password field (the popup takes the keyboard
+            only while it is open)."""
+            for child in self.list.get_children():
+                child.destroy()
+            GtkLayerShell.set_keyboard_mode(self.win, GtkLayerShell.KeyboardMode.ON_DEMAND)
+            self.list.pack_start(label(f"Password for <b>{GLib.markup_escape_text(n['ssid'])}</b>",
+                                       "bt-body", markup=True), False, False, 6)
+            entry = Gtk.Entry()
+            entry.set_visibility(False)
+            entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+            entry.get_style_context().add_class("bt-entry")
+            entry.connect("changed", lambda *_: self.bump())
+            entry.connect("activate", lambda *_: self.submit(n["ssid"], entry))
+            self.list.pack_start(entry, False, False, 0)
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            row.set_homogeneous(True)
+            show = Gtk.Button(label="Show")
+            show.connect("clicked", lambda b: (entry.set_visibility(not entry.get_visibility()),
+                                               b.set_label("Hide" if entry.get_visibility() else "Show"),
+                                               self.bump()))
+            for b, cb in ((show, None),
+                          (Gtk.Button(label="Cancel"), lambda *_: self.reload("Reading…")),
+                          (Gtk.Button(label="Connect"), lambda *_: self.submit(n["ssid"], entry))):
+                b.get_style_context().add_class("bt-btn")
+                if cb:
+                    b.connect("clicked", cb)
+                row.pack_start(b, True, True, 0)
+            self.list.pack_start(row, False, False, 0)
+            self.scroller.set_min_content_height(170)
+            self.status.set_text("Type the password, then Connect (or Enter).")
+            self.win.show_all()
+            entry.grab_focus()
+            self.bump()
+
+        def submit(self, ssid, entry):
+            pw = entry.get_text()
+            if len(pw) < 8:
+                self.status.set_text("Wi-Fi passwords are at least 8 characters.")
+                return
+            GtkLayerShell.set_keyboard_mode(self.win, GtkLayerShell.KeyboardMode.NONE)
+            self.connect(ssid, pw)
+
+        def connect(self, ssid, password=None):
+            """iwctl connect off the main thread; report failure instead of a silent reload.
+            The passphrase goes in argv (visible to this user's processes for a moment)."""
+            dev = self.dev
+            self.status.set_text(f"Connecting {dev} to {ssid}…")
+            cmd = ["iwctl"] + (["--passphrase", password] if password else []) + ["station", dev, "connect", ssid]
+
+            def work():
+                try:
+                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                    ok, msg = r.returncode == 0, ANSI.sub("", (r.stdout + r.stderr)).strip()
+                except (subprocess.TimeoutExpired, OSError) as exc:
+                    ok, msg = False, str(exc)
+                log(f"wifi connect {dev} {ssid}: {'ok' if ok else 'failed: ' + msg}")
+                note = None if ok else f"Could not connect to {ssid}: {msg or 'failed'}"
+                GLib.idle_add(lambda: (self.reload(note) if note is None else self.fail(note), False)[1])
+            threading.Thread(target=work, daemon=True).start()
+
+        def fail(self, note):
+            def after():
+                self.set_status(note)
+                return False
+            self.reload()
+            GLib.timeout_add(2500, after)      # after the list refills
+
+    BT_ICONS = {"audio-headset": "\U000f02ce", "audio-headphones": "\U000f02cb", "audio-card": "\U000f04c3",
+                "input-keyboard": "\U000f030c", "input-mouse": "\U000f037d", "input-gaming": "\U000f0297",
+                "phone": "\U000f03f2", "computer": "\U000f0322"}
+
+    class BluetoothPopup(ListPopup):
+        TITLE = "Bluetooth"
+
+        def __init__(self):
+            super().__init__()
+            self.scanned = False
+            self.pairing = False
+
+        def footer(self):
+            return [("Scan for new devices", lambda *_: self.scan())]
+
+        def scan(self):
+            if self.pairing:
+                return
+            self.scanned = True
+            self.run_then_reload(["bluetoothctl", "--timeout", "10", "scan", "on"],
+                                 "Scanning for 10 s… put the device in pairing mode.")
+
+        def load(self):
+            powered = "Powered: yes" in sh_out(["bluetoothctl", "show"])
+            devs, seen = [], set()
+            for line in sh_out(["bluetoothctl", "devices", "Paired"]).splitlines():
+                parts = line.split(" ", 2)
+                if len(parts) < 3 or parts[1] in seen:
+                    continue
+                seen.add(parts[1])
+                info = sh_out(["bluetoothctl", "info", parts[1]], timeout=4)
+                icon = next((l.split(":", 1)[1].strip() for l in info.splitlines() if l.strip().startswith("Icon:")), "")
+                devs.append({"mac": parts[1], "name": parts[2], "icon": icon,
+                             "on": "Connected: yes" in info})
+            devs.sort(key=lambda d: (not d["on"], d["name"].lower()))
+            new = []
+            if self.scanned and powered:
+                for line in sh_out(["bluetoothctl", "devices"]).splitlines():
+                    parts = line.split(" ", 2)
+                    if len(parts) < 3 or parts[1] in seen:
+                        continue
+                    # Unnamed devices show their address with dashes as the name.
+                    if parts[2].replace("-", ":") == parts[1]:
+                        continue
+                    info = sh_out(["bluetoothctl", "info", parts[1]], timeout=4)
+                    if "RSSI:" not in info:        # not heard in this scan: out of range
+                        continue
+                    icon = next((l.split(":", 1)[1].strip() for l in info.splitlines()
+                                 if l.strip().startswith("Icon:")), "")
+                    new.append({"mac": parts[1], "name": parts[2], "icon": icon})
+                new.sort(key=lambda d: d["name"].lower())
+            return {"powered": powered, "devs": devs, "new": new}
+
+        def rows(self, d):
+            self.head_button("Turn off" if d["powered"] else "Turn on",
+                             lambda: self.run_then_reload(["bluetoothctl", "power", "off" if d["powered"] else "on"],
+                                                          "Switching Bluetooth…"))
+            if not d["powered"]:
+                return "Bluetooth is off."
+            for dev in d["devs"]:
+                glyph = BT_ICONS.get(dev["icon"], "\U000f00af")
+                esc = GLib.markup_escape_text(dev["name"])
+                state = "  <b>connected</b>" if dev["on"] else ""
+                self.row_button(f"{glyph}  <b>{esc}</b>{state}", self.toggle, dev, dim=not dev["on"])
+            if d["new"]:
+                self.list.pack_start(label("New devices (tap to pair)", "bt-dim"), False, False, 6)
+                for dev in d["new"]:
+                    glyph = BT_ICONS.get(dev["icon"], "\U000f00af")
+                    esc = GLib.markup_escape_text(dev["name"])
+                    self.row_button(f"{glyph}  {esc}", self.pair, dev)
+            elif self.scanned:
+                self.list.pack_start(label("No new devices found. Is it in pairing mode?", "bt-dim"),
+                                     False, False, 6)
+            n = sum(1 for dev in d["devs"] if dev["on"])
+            return f"{n} connected"
+
+        def pair(self, dev):
+            """Pair the way bt-connect-pair does (proven on BLE keyboards that reject a
+            host "pair"): own agent, CONNECT so the device starts security itself,
+            answer yes, show any passkey, trust once paired. Falls back to "pair"."""
+            if self.pairing:
+                return
+            self.pairing = True
+            mac, name = dev["mac"], dev["name"]
+            self.status.set_text(f"Pairing {name}…")
+
+            def work():
+                import re
+                p = subprocess.Popen(["bluetoothctl"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, text=True, bufsize=0)
+                buf = []
+
+                def reader():
+                    while True:
+                        c = p.stdout.read(1)
+                        if not c:
+                            break
+                        buf.append(c)
+                threading.Thread(target=reader, daemon=True).start()
+
+                def send(c):
+                    try:
+                        p.stdin.write(c + "\n"); p.stdin.flush()
+                    except OSError:
+                        pass
+                for c in ("agent KeyboardDisplay", "default-agent", "pairable on", "scan on", f"connect {mac}"):
+                    send(c); time.sleep(0.3)
+                t0, pos, tried_pair, trusted, result = time.time(), 0, False, False, None
+                while time.time() - t0 < 45 and result is None:
+                    time.sleep(0.2)
+                    text = ANSI.sub("", "".join(buf)).replace("\r", "\n")
+                    new, pos = text[pos:], len(text)
+                    if "(yes/no)" in new:
+                        send("yes")
+                    m = re.search(r"Passkey: (\d{6})", new)
+                    if m:
+                        GLib.idle_add(self.set_status, f"On {name}: type {m.group(1)}, then Enter")
+                    if not trusted and ("Paired: yes" in new or "Pairing successful" in new):
+                        send(f"trust {mac}"); trusted = True
+                    if "Connection successful" in new or "Connected: yes" in new:
+                        result = "ok"
+                    elif ("Failed to connect" in new or "Failed to pair" in new) and not tried_pair:
+                        tried_pair = True
+                        GLib.idle_add(self.set_status, f"Pairing {name} (second try)…")
+                        send(f"pair {mac}"); time.sleep(4); send(f"connect {mac}")
+                info = sh_out(["bluetoothctl", "info", mac], timeout=4)
+                if "Paired: yes" in info and not trusted:
+                    send(f"trust {mac}"); time.sleep(0.5)
+                for c in ("scan off", "quit"):
+                    send(c)
+                try:
+                    p.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                ok = "Connected: yes" in info or result == "ok"
+                log(f"bluetooth pair {mac} {name}: {'ok' if ok else 'failed'}")
+
+                def done():
+                    self.pairing = False
+                    self.reload(f"Paired and connected: {name}" if ok else None)
+                    if not ok:
+                        GLib.timeout_add(2500, lambda: (self.set_status(
+                            f"Could not pair {name}. Put it in pairing mode and tap it again."), False)[1])
+                    return False
+                GLib.idle_add(done)
+            threading.Thread(target=work, daemon=True).start()
+
+        def toggle(self, dev):
+            verb = "disconnect" if dev["on"] else "connect"
+            self.run_then_reload(["bluetoothctl", verb, dev["mac"]],
+                                 f"{'Disconnecting' if dev['on'] else 'Connecting'} {dev['name']}…")
+
+    BATTERY_INFO = os.path.expanduser("~/.local/bin/battery-info")
+    POWER_PROFILE = os.path.expanduser("~/.local/bin/power-profile-monitor")
+    GREEN, AMBER, RED = (0.65, 0.89, 0.63), (0.98, 0.89, 0.69), (0.95, 0.55, 0.66)
+
+    def hexcol(rgb):
+        return "#%02x%02x%02x" % tuple(int(c * 255) for c in rgb)
+
+    class BatteryPopup:
+        """The battery panel (2026-09-30, "very informative about the state of
+        battery, its drainage, charging, charging status"): what it is doing and
+        why, when it runs out (or fills), health, the last hours as a chart with a
+        forecast, and the power-profile buttons that change the drain. All data
+        comes from battery-info (the same source as the bar icon and its
+        tooltip); it refreshes every 5 s while open."""
+        WIDTH = 490
+        SPANS = (("1 h", 3600), ("6 h", 6 * 3600), ("24 h", 24 * 3600))
+        PROFILES = (("power-saver", "Saver"), ("balanced", "Balanced"), ("performance", "Performance"))
+
+        def __init__(self):
+            self.win = None
+            self.timer = None
+            self.tick = None
+            self.env = dict(os.environ)
+            self.data = None
+            self.span = 6 * 3600
+            self.gen = 0
+
+        # ── layout ──
+        def show(self, env, x_local, mon):
+            self.hide()
+            self.env, self.x, self.mon = env or self.env, x_local, mon
+            win = layer_window("bar-touch-battery", mon)
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            outer.get_style_context().add_class("bt-pop")
+            outer.set_size_request(self.WIDTH, -1)
+
+            head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            head.pack_start(label("Battery", "bt-title", wrap=False), False, False, 0)
+            self.pct = label("", "bt-vol-value", wrap=False, xalign=1.0)
+            head.pack_start(self.pct, True, True, 0)
+            close = Gtk.Button(label="✕")
+            close.get_style_context().add_class("bt-btn")
+            close.get_style_context().add_class("bt-close")
+            close.connect("clicked", lambda *a: self.hide())
+            head.pack_end(close, False, False, 0)
+            outer.pack_start(head, False, False, 0)
+
+            self.headline = label("Reading…", "bt-headline", markup=True)
+            outer.pack_start(self.headline, False, False, 0)
+            self.why = label("", "bt-body")
+            outer.pack_start(self.why, False, False, 0)
+
+            self.gauge = Gtk.DrawingArea()
+            self.gauge.set_size_request(-1, 40)
+            self.gauge.connect("draw", self.draw_gauge)
+            outer.pack_start(self.gauge, False, False, 2)
+
+            self.now_grid = Gtk.Grid(column_spacing=14, row_spacing=3)
+            outer.pack_start(self.now_grid, False, False, 0)
+
+            hist_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            hist_head.pack_start(label("History", "bt-dim", wrap=False), True, True, 0)
+            self.span_btns = {}
+            for text, secs in self.SPANS:
+                b = Gtk.Button(label=text)
+                b.get_style_context().add_class("bt-btn")
+                b.set_size_request(64, -1)
+                b.connect("clicked", self.on_span, secs)
+                hist_head.pack_start(b, False, False, 0)
+                self.span_btns[secs] = b
+            outer.pack_start(hist_head, False, False, 4)
+            self.chart = Gtk.DrawingArea()
+            self.chart.set_size_request(-1, 130)
+            self.chart.connect("draw", self.draw_chart)
+            outer.pack_start(self.chart, False, False, 0)
+            self.legend = label("", "bt-dim", markup=True)
+            outer.pack_start(self.legend, False, False, 0)
+
+            self.bat_grid = Gtk.Grid(column_spacing=14, row_spacing=3)
+            outer.pack_start(self.bat_grid, False, False, 6)
+
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            row.set_homogeneous(True)
+            self.prof_btns = {}
+            for key, text in self.PROFILES:
+                b = Gtk.Button(label=text)
+                b.get_style_context().add_class("bt-btn")
+                b.connect("clicked", self.on_profile, key)
+                row.pack_start(b, True, True, 0)
+                self.prof_btns[key] = b
+            outer.pack_start(row, False, False, 0)
+            menu = Gtk.Button()
+            menu.add(label("Power menu: lock, suspend, restart, shut down", "bt-body", xalign=0.5))
+            menu.get_style_context().add_class("bt-btn")
+            menu.connect("clicked", self.on_menu)
+            outer.pack_start(menu, False, False, 0)
+
+            win.add(outer)
+            place_below_bar(win, self.WIDTH + 30, x_local, mon)
+            win.show_all()
+            self.why.hide()
+            self.win = win
+            self.bump()
+            self.reload()
+            self.tick = GLib.timeout_add_seconds(5, self.on_tick)
+
+        # ── data ──
+        def reload(self):
+            self.gen += 1
+            gen, span = self.gen, self.span
+
+            def work():
+                try:
+                    data = json.loads(sh_out([BATTERY_INFO, "json", str(span)], timeout=6) or "null")
+                except ValueError:
+                    data = None
+                GLib.idle_add(self.render, gen, data)
+            threading.Thread(target=work, daemon=True).start()
+
+        def on_tick(self):
+            if not self.win:
+                self.tick = None
+                return False
+            self.reload()
+            return True
+
+        def color(self):
+            d = self.data
+            cls = d.get("classes", [])
+            if "critical" in cls:
+                return RED
+            if "warning" in cls or d["state"] == "ac-drain":
+                return AMBER
+            if d["state"] in ("charging", "full", "held", "plugged"):
+                return GREEN
+            return None
+
+        def render(self, gen, d):
+            if gen != self.gen or not self.win:
+                return False
+            if not d:
+                self.headline.set_text("battery-info gave no answer.")
+                return False
+            self.data = d
+            b, c, g = d["battery"], d["charger"], d["guard"]
+            col = self.color()
+            esc = GLib.markup_escape_text
+            self.pct.set_markup(f"<span foreground='{hexcol(col)}'>{b['percent']:.0f}%</span>"
+                                if col else f"{b['percent']:.0f}%")
+            glyph = d.get("icon", "")
+            head = f"{glyph}  {esc(d['headline'])}"
+            self.headline.set_markup(f"<span foreground='{hexcol(col)}'>{head}</span>" if col else head)
+            self.why.set_text(d.get("why") or "")
+            self.why.set_visible(bool(d.get("why")))
+
+            now_rows = []
+            flow = d.get("flow_w")
+            def hm(hours):
+                m = int(round(hours * 60))
+                return f"{m // 60} h {m % 60:02d} min" if m >= 60 else f"{m} min"
+            if flow is not None:
+                if abs(flow) <= 0.4:
+                    txt = "steady, neither rising nor falling"
+                else:
+                    txt = f"<b>{'charging' if flow > 0 else 'draining'} {abs(flow):.1f} W</b>"
+                    if d.get("pct_per_h") is not None:
+                        txt += f" ({abs(d['pct_per_h']):.0f}%/h)"
+                src = "10-min average" if d.get("net_w") is not None else "reading now"
+                now_rows.append(("Flow", f"{txt} <span alpha='60%'>· {src}</span>"))
+            for i, e in enumerate(d.get("estimates") or []):
+                now_rows.append(("Forecast" if i == 0 else "",
+                                 f"{esc(e.get('short') or e['what'])}: <b>in {hm(e['hours'])}</b>, ~{e['at']}"))
+            if d.get("since"):
+                s = d["since"]
+                where = s.get("what", "plugged in").capitalize()
+                now_rows.append(("Since", f"{where} since {s['at']} ({hm(s['hours'])}), from {s['pct']:.0f}%"))
+            self.fill_grid(self.now_grid, now_rows)
+
+            bat_rows = []
+            if b.get("wh_now") is not None and b.get("wh_full"):
+                volts = f" · {b['volts']:.2f} V" if b.get("volts") else ""
+                bat_rows.append(("Energy", f"{b['wh_now']:.1f} of {b['wh_full']:.1f} Wh{volts}"))
+            if b.get("health"):
+                bat_rows.append(("Health", f"{b['health']:.0f}% of new ({b['wh_design']:.1f} Wh) · "
+                                           f"{b['cycles']} cycles"))
+            bat_rows.append(("Charger", esc(d.get("charger_text") or "")))
+            lo, hi = b.get("limit_start"), b.get("limit_end")
+            if hi and hi < 100:
+                bat_rows.append(("Limit", f"charging stops at {hi:.0f}%" + (f", resumes below {lo:.0f}%" if lo else "")))
+            else:
+                bat_rows.append(("Limit", "none, charges to 100%"))
+            if g.get("active"):
+                gtxt = f"suspends at {g['upper']}%, again at {g['lower']}%"
+                if g.get("last_resort", "none") != "none":
+                    gtxt += f" · last resort: {g['last_resort']} at {g.get('last_resort_pct')}%"
+                if g.get("ac_drain"):
+                    gtxt += " · <b>AC-drain watch on</b>"
+                if g.get("retry_pending"):
+                    gtxt += " · <b>last forced suspend failed, retrying</b>"
+                bat_rows.append(("Guard", gtxt))
+            elif g.get("installed"):
+                bat_rows.append(("Guard", f"<b>guard timer {esc(str(g.get('timer')))}</b> — nothing suspends at "
+                                          f"{g['upper']}%/{g['lower']}%"))
+            ls = d.get("last_sleep")
+            if ls:   # sleep-verified's last verdict (2026-10-03)
+                bat_rows.append(("Last sleep", esc(ls["text"]) if ls.get("ok") else f"<b>{esc(ls['text'])}</b>"))
+            self.fill_grid(self.bat_grid, bat_rows)
+
+            for key, btn in self.prof_btns.items():
+                name = dict(self.PROFILES)[key]
+                btn.set_label(f"● {name}" if key == d.get("profile") else name)
+            for secs, btn in self.span_btns.items():
+                btn.set_label(("● " if secs == self.span else "") + dict((v, k) for k, v in self.SPANS)[secs])
+            leg = (f"<span foreground='{hexcol(GREEN)}'>▨ charging</span>  "
+                   f"<span foreground='{hexcol(AMBER)}'>▥ plugged, not charging</span>  ▬ on battery  ┄ forecast")
+            self.legend.set_markup(leg)
+            self.gauge.queue_draw()
+            self.chart.queue_draw()
+            self.win.show_all()
+            self.why.set_visible(bool(d.get("why")))
+            return False
+
+        def fill_grid(self, grid, rows):
+            for child in grid.get_children():
+                child.destroy()
+            for i, (k, v) in enumerate(rows):
+                kl = label(k, "bt-dim", wrap=False)
+                kl.set_valign(Gtk.Align.START)
+                grid.attach(kl, 0, i, 1, 1)
+                vl = label(v, "bt-body", markup=True)
+                vl.set_hexpand(True)
+                grid.attach(vl, 1, i, 1, 1)
+
+        # ── drawing ──
+        def text(self, cr, s, x, y, size=9, align=0.0, rgba=None):
+            layout = PangoCairo.create_layout(cr)
+            layout.set_font_description(Pango.FontDescription(f"JetBrainsMono Nerd Font {size}"))
+            layout.set_text(s, -1)
+            w, h = layout.get_pixel_size()
+            if rgba:
+                cr.set_source_rgba(*rgba)
+            cr.move_to(x - w * align, y)
+            PangoCairo.show_layout(cr, layout)
+            return w, h
+
+        def draw_gauge(self, area, cr):
+            d = self.data
+            if not d:
+                return False
+            fg = area.get_style_context().get_color(Gtk.StateFlags.NORMAL)
+            W = area.get_allocated_width()
+            bh, top = 22, 2
+            pct = max(0.0, min(100.0, d["battery"]["percent"]))
+
+            def rounded(x, y, w, h, r):
+                cr.new_sub_path()
+                cr.arc(x + w - r, y + r, r, -1.5708, 0)
+                cr.arc(x + w - r, y + h - r, r, 0, 1.5708)
+                cr.arc(x + r, y + h - r, r, 1.5708, 3.1416)
+                cr.arc(x + r, y + r, r, 3.1416, 4.7124)
+                cr.close_path()
+            rounded(0, top, W, bh, 6)
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.10)
+            cr.fill_preserve()
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.35)
+            cr.set_line_width(1)
+            cr.stroke()
+            col = self.color()
+            fw = W * pct / 100
+            if fw > 1:
+                cr.save()
+                rounded(0, top, W, bh, 6)
+                cr.clip()
+                cr.rectangle(0, top, fw, bh)
+                cr.set_source_rgba(*(col or (fg.red, fg.green, fg.blue)), 0.85 if col else 0.55)
+                cr.fill()
+                if d["state"] == "charging":          # hatch: a pattern, not only a colour
+                    cr.rectangle(0, top, fw, bh)
+                    cr.clip()
+                    cr.set_source_rgba(0, 0, 0, 0.25)
+                    cr.set_line_width(2)
+                    for x0 in range(-bh, int(fw) + bh, 8):
+                        cr.move_to(x0, top + bh)
+                        cr.line_to(x0 + bh, top)
+                    cr.stroke()
+                cr.restore()
+            # marks: battery-guard suspend levels and the charge limit
+            g, b = d["guard"], d["battery"]
+            marks = []
+            if g.get("active"):
+                marks += [(g["lower"], f"{g['lower']}%"), (g["upper"], f"{g['upper']}% suspend")]
+                if g.get("last_resort", "none") != "none":
+                    # short label left of its tick: it sits ~20 px from the bar's left edge and
+                    # next to the lower limit's (the Guard row names the hibernate)
+                    marks.append((g["last_resort_pct"], f"{g['last_resort_pct']}%", 1.0))
+            if b.get("limit_end") and b["limit_end"] < 100:
+                marks.append((b["limit_end"], f"limit {b['limit_end']:.0f}%"))
+            for lvl, text, *al in marks:
+                x = W * lvl / 100
+                cr.set_source_rgba(*RED, 0.95)
+                cr.set_line_width(2)
+                cr.set_dash([3, 2])
+                cr.move_to(x, top - 1)
+                cr.line_to(x, top + bh + 3)
+                cr.stroke()
+                cr.set_dash([])
+                align = al[0] if al else 0.0
+                self.text(cr, text, x - 3 if align else x + 3, top + bh + 1, size=8, align=align,
+                          rgba=(fg.red, fg.green, fg.blue, 0.75))
+            return False
+
+        def draw_chart(self, area, cr):
+            d = self.data
+            if not d:
+                return False
+            fg = area.get_style_context().get_color(Gtk.StateFlags.NORMAL)
+            W, H = area.get_allocated_width(), area.get_allocated_height()
+            L, R, T, B = 34, 6, 6, 18
+            now, span = d["time"], self.span
+            est = (d.get("estimates") or [])[:1]
+            ahead = span * 0.25 if est else span * 0.04
+            t0, t1 = now - span, now + ahead
+            X = lambda t: L + (t - t0) / (t1 - t0) * (W - L - R)
+            Y = lambda v: T + (1 - v / 100) * (H - T - B)
+            dim = (fg.red, fg.green, fg.blue)
+            # grid + labels
+            cr.set_line_width(1)
+            for v in (0, 25, 50, 75, 100):
+                cr.set_source_rgba(*dim, 0.12 if v % 50 else 0.22)
+                cr.move_to(L, Y(v) + 0.5)
+                cr.line_to(W - R, Y(v) + 0.5)
+                cr.stroke()
+                if v % 50 == 0:
+                    self.text(cr, f"{v}%", L - 4, Y(v) - 7, size=8, align=1.0, rgba=(*dim, 0.6))
+            g = d["guard"]
+            if g.get("active"):
+                cr.set_source_rgba(*RED, 0.7)
+                cr.set_dash([4, 3])
+                cr.move_to(L, Y(g["upper"]))
+                cr.line_to(W - R, Y(g["upper"]))
+                cr.stroke()
+                cr.set_dash([])
+                self.text(cr, f"suspend {g['upper']}%", L + 3, Y(g["upper"]) + 1, size=8,
+                          rgba=(*RED, 0.9))
+            # time axis: round clock times
+            step = {3600: 900, 6 * 3600: 3600, 24 * 3600: 4 * 3600}.get(span, span // 6)
+            lt = time.localtime(t0)
+            t = t0 - (lt.tm_min * 60 + lt.tm_sec + (lt.tm_hour * 3600 if step >= 4 * 3600 else 0)) % step + step
+            while t < t1:
+                x = X(t)
+                cr.set_source_rgba(*dim, 0.10)
+                cr.move_to(x + 0.5, T)
+                cr.line_to(x + 0.5, H - B)
+                cr.stroke()
+                if x < W - R - 16:          # a label cut by the right edge is noise
+                    self.text(cr, time.strftime("%H:%M", time.localtime(t)), x, H - B + 2, size=8,
+                              align=0.5, rgba=(*dim, 0.6))
+                t += step
+            # the series: history points + "now"
+            pts = [(max(tt, t0), v, s) for tt, v, s in d.get("history") or []]
+            state_now = {"charging": "charging", "discharging": "discharging"}.get(d["state"], "plugged")
+            pts.append((now, d["battery"]["percent"], state_now))
+            colors = {"charging": GREEN, "discharging": dim, "plugged": AMBER, "full": GREEN}
+            for (ta, va, _), (tb, vb, sb) in zip(pts, pts[1:]):
+                if tb <= ta:
+                    continue
+                col = colors.get(sb, dim)
+                cr.move_to(X(ta), Y(va))
+                cr.line_to(X(tb), Y(vb))
+                cr.line_to(X(tb), Y(0))
+                cr.line_to(X(ta), Y(0))
+                cr.close_path()
+                cr.set_source_rgba(*col, 0.28 if sb == "charging" else 0.12)
+                if sb in ("charging", "plugged"):
+                    # a pattern per state, not only a colour: diagonal hatch =
+                    # charging, vertical stripes = plugged in but not charging
+                    cr.save()
+                    cr.fill_preserve()
+                    cr.clip()
+                    cr.set_source_rgba(*col, 0.35 if sb == "charging" else 0.45)
+                    cr.set_line_width(1)
+                    lean = H if sb == "charging" else 0      # 45° hatch
+                    for x0 in range(int(X(ta)) - H - 10, int(X(tb)) + 10, 7 if lean else 5):
+                        cr.move_to(x0 + 0.5, Y(0))
+                        cr.line_to(x0 + 0.5 + lean, Y(0) - H)
+                    cr.stroke()
+                    cr.restore()
+                    cr.new_path()
+                else:
+                    cr.fill()
+                cr.set_source_rgba(*col, 0.95)
+                cr.set_line_width(2)
+                cr.move_to(X(ta), Y(va))
+                cr.line_to(X(tb), Y(vb))
+                cr.stroke()
+            # now marker
+            cr.set_source_rgba(*dim, 0.35)
+            cr.set_line_width(1)
+            cr.move_to(X(now) + 0.5, T)
+            cr.line_to(X(now) + 0.5, H - B)
+            cr.stroke()
+            pct = d["battery"]["percent"]
+            cr.set_source_rgba(*(self.color() or dim), 1)
+            cr.arc(X(now), Y(pct), 4, 0, 6.2832)
+            cr.fill()
+            # forecast to the first stop (guard suspend / empty / full)
+            if est:
+                e = est[0]
+                te = now + e["hours"] * 3600
+                frac = min(1.0, (t1 - now) / max(1.0, te - now))
+                xe, ye = now + (te - now) * frac, pct + (e["level"] - pct) * frac
+                cr.set_source_rgba(*(self.color() or dim), 0.9)
+                cr.set_line_width(2)
+                cr.set_dash([5, 4])
+                cr.move_to(X(now), Y(pct))
+                cr.line_to(X(xe), Y(ye))
+                cr.stroke()
+                cr.set_dash([])
+                tag = f"{e['level']:.0f}% ~{e['at']}" if frac >= 1 else f"→ {e['level']:.0f}% ~{e['at']}"
+                self.text(cr, tag, min(X(xe), W - R - 2), Y(ye) + (4 if ye > 50 else -16), size=8, align=1.0,
+                          rgba=(*(self.color() or dim), 1))
+            return False
+
+        # ── actions ──
+        def on_span(self, _btn, secs):
+            self.bump()
+            self.span = secs
+            self.reload()
+
+        def on_profile(self, _btn, key):
+            self.bump()
+
+            def work():
+                sh_out([POWER_PROFILE, "set", key], timeout=8)
+                GLib.idle_add(lambda: (self.reload(), False)[1])
+            threading.Thread(target=work, daemon=True).start()
+
+        def on_menu(self, *_):
+            env = self.env
+            self.hide()
+            run_detached("omarchy-menu system", env)
+
+        def bump(self):
+            if self.timer:
+                GLib.source_remove(self.timer)
+            self.timer = GLib.timeout_add_seconds(60, self.hide)
+
+        def hide(self, *_):
+            for attr in ("timer", "tick"):
+                if getattr(self, attr):
+                    GLib.source_remove(getattr(self, attr))
+                    setattr(self, attr, None)
+            if self.win:
+                self.win.destroy()
+                self.win = None
+            return False
+
+    MPV_HISTORY = os.path.expanduser("~/.local/bin/mpv-history")
+    MPV_HISTORY_LIST = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                                    "mpv-history", "list.json")
+    MPV_HISTORY_WEB = os.path.join(os.path.dirname(MPV_HISTORY_LIST), "list-web.json")
+
+    def ago(ts):
+        if not ts:
+            return ""
+        d = time.time() - ts
+        if d < 90:
+            return "just now"
+        if d < 3600:
+            return f"{int(d // 60)} min ago"
+        if d < 86400:
+            return f"{int(d // 3600)} h ago"
+        if d < 7 * 86400:
+            return time.strftime("%a %H:%M", time.localtime(ts))
+        return time.strftime("%d %b", time.localtime(ts))
+
+    def hms(sec):
+        if not sec or sec <= 0:
+            return "--:--"
+        sec = int(sec)
+        h, rem = divmod(sec, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+    class MpvHistoryPopup:
+        """Recently watched videos (2026-10-03, "show the history of mpv player…
+        buttons to open their folder location in thunar, when I touch on their
+        thumbnail, they preview play at 20X speed"). Data and thumbnails come from
+        ~/.local/bin/mpv-history (history.jsonl written by the mpv script).
+
+        The 20x preview decodes reference frames only (-skip_frame bidir, ~5 % of
+        one core for 720p HEVC; full decode cannot reach 20x on this CPU), the fps
+        filter turns them into one frame per STEP s of video, and the reader shows
+        one frame every STEP/SPEED s of wall time, so the clock really runs 20x."""
+        WIDTH = 780
+        TW, TH = 192, 108
+        SPEED = 20
+        STEP = 2.0                 # s of video per shown frame -> 10 fps on screen
+        IDLE = 90                  # s without a touch before it closes (not while previewing)
+
+        def __init__(self):
+            self.win = None
+            self.timer = None
+            self.env = dict(os.environ)
+            self.gen = 0
+            self.data = []
+            self.rows = {}         # path -> dict(widgets)
+            self.preview = None    # dict(path, proc, stop, tick)
+            self.query = ""
+            self.tab = "files"     # "files" (any player) | "web" (browser videos), his 2026-11-06 "have 2 tabs"
+            self.tabs = {}
+
+        # ── layout ──
+        def show(self, env, x_local, mon):
+            self.hide()
+            self.env, self.x, self.mon = env or self.env, x_local, mon
+            self.gen += 1
+            win = layer_window("bar-touch-mpv-history", mon)
+            # NO keyboard until the filter box is tapped (2026-11-06: with ON_DEMAND from the
+            # start Hyprland focused the panel on open and his typing elsewhere landed in the
+            # filter, "8" and "e" seen in screenshots). A tap on the box turns it on.
+            GtkLayerShell.set_keyboard_mode(win, GtkLayerShell.KeyboardMode.NONE)
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            outer.get_style_context().add_class("bt-pop")
+            outer.set_size_request(self.WIDTH, -1)
+
+            head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            head.pack_start(label("Recently watched", "bt-title", wrap=False), False, False, 0)
+            self.count = label("", "bt-dim", wrap=False)
+            head.pack_start(self.count, False, False, 4)
+            close = Gtk.Button(label="✕")
+            close.get_style_context().add_class("bt-btn")
+            close.get_style_context().add_class("bt-close")
+            close.connect("clicked", lambda *a: self.hide())
+            head.pack_end(close, False, False, 0)
+            self.search = Gtk.SearchEntry()
+            self.search.set_placeholder_text("Filter by name…")
+            self.search.get_style_context().add_class("bt-entry")
+            self.search.set_size_request(260, -1)
+            self.search.set_text(self.query)
+            self.search.connect("search-changed", self.on_search)
+            self.search.connect("button-press-event", self.want_keyboard)
+            self.search.connect("touch-event", self.want_keyboard)
+            head.pack_end(self.search, False, False, 0)
+            outer.pack_start(head, False, False, 0)
+
+            # two tabs (2026-11-06): files played in any player | videos played in the browser
+            tabs = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            self.tabs = {}
+            for key, text in (("files", "\U000f0fce  Videos"), ("web", "\U000f059f  Browser")):
+                b = Gtk.Button(label=text)
+                b.get_style_context().add_class("bt-btn")
+                b.get_style_context().add_class("bt-mh-tab")
+                b.connect("clicked", lambda _b, k=key: (self.bump(), self.switch_tab(k)))
+                tabs.pack_start(b, False, False, 0)
+                self.tabs[key] = b
+            self.mark_tab()
+            outer.pack_start(tabs, False, False, 0)
+
+            self.note = "refreshing…"
+            self.status = label(self.note, "bt-dim")
+            outer.pack_start(self.status, False, False, 0)
+            self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroller.add(self.list)
+            mon_h = mon["height"] / (mon.get("scale") or 1)
+            self.max_h = int(max(260, min(mon_h - 150, 760)))
+            scroller.set_min_content_height(min(3 * 128, self.max_h))
+            self.scroller = scroller
+            scroller.get_vadjustment().connect("value-changed", lambda *_: self.bump())
+            outer.pack_start(scroller, True, True, 0)
+            win.add(outer)
+            place_below_bar(win, self.WIDTH + 30, x_local, mon)
+            win.show_all()
+            self.win = win
+            self.bump()
+            self.load_tab()
+
+        def mark_tab(self):
+            for k, b in self.tabs.items():
+                (b.get_style_context().add_class if k == self.tab
+                 else b.get_style_context().remove_class)("selected")
+
+        def switch_tab(self, key):
+            if key == self.tab or not self.win:
+                return
+            self.stop_preview()
+            self.tab = key
+            self.gen += 1                  # drop a refresh still running for the other tab
+            self.data = []
+            self.rows = {}
+            for child in self.list.get_children():
+                child.destroy()
+            self.mark_tab()
+            self.note = "refreshing…"
+            self.apply_filter()
+            self.load_tab()
+
+        def load_tab(self):
+            # 2026-11-05: the last good list at once (a dead Pi share once left this
+            # panel on "Reading…" and then empty), then refresh in the background.
+            cached, self.cached_at = self.read_cache()
+            if cached is not None:
+                self.fill(self.gen, cached)
+            self.reload()
+
+        def read_cache(self):
+            try:
+                path = MPV_HISTORY_WEB if self.tab == "web" else MPV_HISTORY_LIST
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                return (data if isinstance(data, list) else None), os.path.getmtime(path)
+            except (OSError, ValueError):
+                return None, 0
+
+        def reload(self):
+            gen = self.gen
+
+            def work():
+                out = sh_out([MPV_HISTORY, "list", "--limit", "60"] + (["--web"] if self.tab == "web" else []),
+                             timeout=10)
+                try:
+                    data = json.loads(out) if out.strip() else None
+                except ValueError:
+                    data = None
+                if data is None:
+                    # never swap rows for an empty list because the refresh failed
+                    GLib.idle_add(self.refresh_failed, gen)
+                    return
+                GLib.idle_add(self.fill, gen, data, True)
+                # thumbnails, newest first, one at a time (cached after the first run)
+                for e in data:
+                    if gen != self.gen:
+                        return
+                    if (not e.get("thumb") and e.get("exists") and not e.get("unreachable")
+                            and e.get("kind") != "web"):
+                        path = sh_out([MPV_HISTORY, "thumb", e["path"]], timeout=30).strip()
+                        if path:
+                            GLib.idle_add(self.set_thumb, gen, e["path"], path)
+            threading.Thread(target=work, daemon=True).start()
+
+        def refresh_failed(self, gen):
+            if gen != self.gen or not self.win:
+                return False
+            when = time.strftime("%H:%M", time.localtime(self.cached_at)) if self.cached_at else ""
+            self.note = (f"could not refresh: showing the list from {when}" if self.rows and when
+                         else "could not read the history: tap ✕ and open again")
+            self.apply_filter()
+            return False
+
+        def fill(self, gen, data, fresh=False):
+            if gen != self.gen or not self.win:
+                return False
+            if fresh:
+                n_rem = sum(1 for e in data if e.get("remote"))
+                n_off = sum(1 for e in data if e.get("unreachable") and not e.get("remote"))
+                bits = []
+                if n_rem:
+                    bits.append(f"Not on the home network: {n_rem} Pi videos play through the desktop "
+                                "(slower to start)")
+                if n_off:
+                    bits.append(f"{n_off} on a share that is not answering")
+                self.note = "  ·  ".join(bits)
+            if data == self.data and self.rows:
+                self.apply_filter()        # the refresh matched the cache: keep the rows (and any preview)
+                return False
+            self.stop_preview()
+            self.data = data
+            self.rows = {}
+            for child in self.list.get_children():
+                child.destroy()
+            for e in data:
+                self.list.pack_start(self.row(e), False, False, 0)
+            self.apply_filter()
+            self.win.show_all()
+            self.apply_filter()
+            return False
+
+        def row(self, e):
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            box.get_style_context().add_class("bt-mh-row")
+            # thumbnail = a button: a tap starts / stops the 20x preview in place
+            img = Gtk.Image()
+            img.set_size_request(self.TW, self.TH)
+            if e.get("thumb"):
+                self._load_into(img, e["thumb"])
+            else:
+                img.set_from_icon_name("video-x-generic", Gtk.IconSize.DIALOG)
+            over = Gtk.Overlay()
+            over.add(img)
+            badge = label("", "bt-mh-badge", wrap=False)
+            badge.set_halign(Gtk.Align.END)
+            badge.set_valign(Gtk.Align.END)
+            badge.set_no_show_all(True)
+            over.add_overlay(badge)
+            thumb_btn = Gtk.Button()
+            thumb_btn.add(over)
+            thumb_btn.get_style_context().add_class("bt-mh-thumb")
+            thumb_btn.set_relief(Gtk.ReliefStyle.NONE)
+            thumb_btn.connect("clicked", lambda *_: (self.bump(), self.toggle_preview(e)))
+            web = e.get("kind") == "web"
+            if not e.get("exists") or web:      # browser rows: no file to preview
+                thumb_btn.set_sensitive(False)
+            box.pack_start(thumb_btn, False, False, 0)
+
+            mid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            name = label(e["name"], "bt-mh-name", wrap=True)
+            name.set_lines(2)
+            name.set_ellipsize(Pango.EllipsizeMode.END)
+            name.set_max_width_chars(42)
+            mid.pack_start(name, False, False, 0)
+            bits = [ago(e.get("last_ts"))]
+            if e.get("plays", 0) > 1:
+                bits.append(f"played {e['plays']}×")
+            if e.get("playing"):
+                bits.append("playing now")
+            elif e.get("open"):
+                bits.append("not closed cleanly")
+            if web:
+                bits += [e.get("player") or "", e.get("dir") or ""]      # firefox · youtube.com
+            else:
+                if e.get("player") and e.get("player") != "mpv":
+                    bits.append(e["player"])                             # vlc, celluloid, …
+                folder = os.path.basename(e.get("dir") or "") or e.get("dir") or ""
+                bits.append(folder)
+            meta = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            if e.get("unreachable"):
+                # the file is not gone. "Pi · via desktop" (blue): plays through the desktop
+                # (dotfiles/network/nas.json); yellow only when no other way is known.
+                meta.pack_start(label(e.get("offline") or "offline",
+                                      "bt-mh-remote" if e.get("remote") else "bt-mh-offline", wrap=False),
+                                False, False, 0)
+            elif not e.get("exists"):
+                meta.pack_start(label("missing", "bt-mh-missing", wrap=False), False, False, 0)
+            m = label("  ·  ".join(b for b in bits if b), "bt-dim", wrap=False)
+            m.set_ellipsize(Pango.EllipsizeMode.END)
+            meta.pack_start(m, True, True, 0)
+            mid.pack_start(meta, False, False, 0)
+            dur, pos = e.get("duration"), e.get("position")
+            bar = Gtk.ProgressBar()
+            bar.get_style_context().add_class("bt-mh-progress")
+            frac = (pos / dur) if (dur and pos) else 0.0
+            bar.set_fraction(max(0.0, min(1.0, frac)))
+            mid.pack_start(bar, False, False, 2)
+            if e.get("finished"):
+                ptxt = f"watched to the end  ·  {hms(dur)}"
+            elif pos and dur:
+                ptxt = f"{hms(pos)} / {hms(dur)}  ·  {int(frac * 100)} %"
+            else:
+                ptxt = hms(dur)
+            prog = label(ptxt, "bt-mh-pos", wrap=False)
+            mid.pack_start(prog, False, False, 0)
+            box.pack_start(mid, True, True, 0)
+
+            btns = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            resume = bool(pos and not e.get("finished") and pos > 5)
+            play = Gtk.Button(label=("▶  Resume" if resume else ("▶  Open" if web else "▶  Play")))
+            play.get_style_context().add_class("bt-btn")
+            play.get_style_context().add_class("bt-mh-btn")
+            # offline rows stay tappable: the tap says why instead of hanging mpv
+            play.set_sensitive(bool(e.get("exists") or e.get("unreachable")))
+            play.connect("clicked", lambda *_: self.act("open", e))
+            btns.pack_start(play, False, False, 0)
+            fold = Gtk.Button(label="\uf07c  Folder")
+            fold.get_style_context().add_class("bt-btn")
+            fold.get_style_context().add_class("bt-mh-btn")
+            fold.set_sensitive(bool(e.get("dir_exists") or e.get("unreachable")))
+            fold.connect("clicked", lambda *_: self.act("folder", e))
+            if not web:                         # a web page has no folder
+                btns.pack_start(fold, False, False, 0)
+            box.pack_end(btns, False, False, 0)
+            if not e.get("exists") and not e.get("remote"):
+                box.set_opacity(0.55)
+            self.rows[e["path"]] = {"box": box, "img": img, "badge": badge, "thumb": e.get("thumb") or "",
+                                    "entry": e}
+            return box
+
+        def _load_into(self, img, path):
+            from gi.repository import GdkPixbuf
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, self.TW, self.TH, True)
+                img.set_from_pixbuf(pb)
+            except GLib.Error:
+                pass
+
+        def set_thumb(self, gen, path, thumb):
+            r = self.rows.get(path)
+            if gen != self.gen or not self.win or not r:
+                return False
+            r["thumb"] = thumb
+            if not (self.preview and self.preview["path"] == path):
+                self._load_into(r["img"], thumb)
+            return False
+
+        def want_keyboard(self, *_):
+            if self.win:
+                GtkLayerShell.set_keyboard_mode(self.win, GtkLayerShell.KeyboardMode.ON_DEMAND)
+                self.search.grab_focus()
+            return False
+
+        # ── filter ──
+        def on_search(self, entry):
+            self.query = entry.get_text()
+            self.bump()
+            self.apply_filter()
+
+        def apply_filter(self):
+            q = (self.query or "").lower().split()
+            shown = 0
+            for path, r in self.rows.items():
+                hay = (r["entry"]["name"] + " " + r["entry"].get("dir", "")).lower()
+                ok = all(w in hay for w in q)
+                r["box"].set_visible(ok)
+                shown += ok
+            total = len(self.rows)
+            self.count.set_text(f"{shown} of {total}" if q else f"{total} files")
+            empty = ("Nothing yet: videos you play in Firefox / Chrome appear here." if self.tab == "web"
+                     else "Nothing yet: videos you play in mpv, VLC or any player appear here.")
+            msg = self.note if total else (self.note if self.note == "refreshing…" else empty)
+            self.status.set_text(msg or "")
+            self.status.set_visible(bool(msg))
+            self.scroller.set_min_content_height(min(max(shown, 1) * 128, self.max_h))
+
+        # ── actions ──
+        def act(self, what, e):
+            env = self.env
+            if e.get("kind") == "web":
+                self.hide()
+                pos = e.get("position") if not e.get("finished") else 0
+                log(f"mpv-history: open page {e['path']} at {pos}")
+                run_detached(f"{MPV_HISTORY} open {shlex.quote(e['path'])} {float(pos or 0):.0f}", env)
+                return
+            if e.get("unreachable") and not e.get("remote"):
+                # mpv-history re-checks the share: if it is back it opens, else it notifies
+                self.bump()
+                log(f"mpv-history: {what} on an offline share {e['path']}")
+                run_detached(f"{MPV_HISTORY} {what} {shlex.quote(e['path'])}", env)
+                return
+            self.hide()
+            log(f"mpv-history: {what} {e['path']}")
+            run_detached(f"{MPV_HISTORY} {what} {shlex.quote(e['path'])}", env)
+
+        # ── 20x preview inside the thumbnail ──
+        def toggle_preview(self, e):
+            same = self.preview and self.preview["path"] == e["path"]
+            self.stop_preview()
+            if not same:
+                self.start_preview(e)
+
+        def start_preview(self, e):
+            r = self.rows.get(e["path"])
+            if not r:
+                return
+            pos, dur = e.get("position") or 0, e.get("duration") or 0
+            start = 0.0
+            if pos and not e.get("finished") and pos > 60:
+                start = pos - 60           # a minute before where you stopped
+            vf = (f"fps={1 / self.STEP},scale={self.TW}:{self.TH}:force_original_aspect_ratio=decrease,"
+                  f"pad={self.TW}:{self.TH}:(ow-iw)/2:(oh-ih)/2")
+            cmd = ["ffmpeg", "-nostdin", "-v", "error", "-threads", "2", "-skip_frame", "bidir",
+                   "-ss", f"{start:.1f}", "-i", e["path"], "-an", "-sn", "-dn", "-vf", vf,
+                   "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                        stdin=subprocess.DEVNULL)
+            except OSError as exc:
+                log(f"mpv-history preview failed: {exc}")
+                return
+            stop = threading.Event()
+            pv = {"path": e["path"], "proc": proc, "stop": stop, "frames": 0}
+            self.preview = pv
+            r["badge"].set_text(f"×{self.SPEED}  {hms(start)}")
+            r["badge"].show()
+            r["box"].get_style_context().add_class("previewing")
+            log(f"mpv-history: preview {self.SPEED}x from {hms(start)} {e['path']}")
+            size = self.TW * self.TH * 3
+            interval = self.STEP / self.SPEED
+
+            def reader():
+                nxt = time.monotonic()
+                i = 0
+                while not stop.is_set():
+                    buf = b""
+                    while len(buf) < size:
+                        chunk = proc.stdout.read(size - len(buf))
+                        if not chunk:
+                            break
+                        buf += chunk
+                    if len(buf) < size or stop.is_set():
+                        break
+                    t = start + i * self.STEP
+                    GLib.idle_add(self.show_frame, pv, buf, t)
+                    i += 1
+                    nxt += interval
+                    delay = nxt - time.monotonic()
+                    if delay > 0:
+                        stop.wait(delay)
+                    else:
+                        nxt = time.monotonic()
+                GLib.idle_add(self.preview_ended, pv)
+            threading.Thread(target=reader, daemon=True).start()
+
+        def show_frame(self, pv, buf, t):
+            if self.preview is not pv or not self.win:
+                return False
+            from gi.repository import GdkPixbuf
+            r = self.rows.get(pv["path"])
+            if not r:
+                return False
+            pb = GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(buf), GdkPixbuf.Colorspace.RGB,
+                                                 False, 8, self.TW, self.TH, self.TW * 3)
+            r["img"].set_from_pixbuf(pb)
+            r["badge"].set_text(f"×{self.SPEED}  {hms(t)}")
+            pv["frames"] += 1
+            return False
+
+        def preview_ended(self, pv):
+            if self.preview is pv:
+                log(f"mpv-history: preview ended after {pv['frames']} frames")
+                self.stop_preview()
+            return False
+
+        def stop_preview(self):
+            pv, self.preview = self.preview, None
+            if not pv:
+                return
+            pv["stop"].set()
+            try:
+                pv["proc"].kill()
+                pv["proc"].wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            r = self.rows.get(pv["path"])
+            if r and self.win:
+                r["badge"].hide()
+                r["box"].get_style_context().remove_class("previewing")
+                if r["thumb"]:
+                    self._load_into(r["img"], r["thumb"])
+                else:
+                    r["img"].set_from_icon_name("video-x-generic", Gtk.IconSize.DIALOG)
+
+        def bump(self):
+            if self.timer:
+                GLib.source_remove(self.timer)
+            self.timer = GLib.timeout_add_seconds(self.IDLE, self.idle_close)
+
+        def idle_close(self):
+            if self.preview:
+                return True                # keep open while a preview plays
+            self.timer = None
+            self.hide()
+            return False
+
+        def hide(self, *_):
+            self.stop_preview()
+            self.gen += 1
+            if self.timer:
+                GLib.source_remove(self.timer)
+                self.timer = None
+            if self.win:
+                self.win.destroy()
+                self.win = None
+            self.rows = {}
+            return False
+
+    # ── on-screen keyboard (2026-10-03) ──
+    KEYSYM_CHARS = {
+        "space": " ", "comma": ",", "period": ".", "slash": "/", "backslash": "\\", "semicolon": ";",
+        "apostrophe": "'", "grave": "`", "minus": "-", "equal": "=", "bracketleft": "[", "bracketright": "]",
+        "exclam": "!", "at": "@", "numbersign": "#", "dollar": "$", "percent": "%", "asciicircum": "^",
+        "ampersand": "&", "asterisk": "*", "parenleft": "(", "parenright": ")", "underscore": "_", "plus": "+",
+        "braceleft": "{", "braceright": "}", "bar": "|", "colon": ":", "quotedbl": '"', "asciitilde": "~",
+        "less": "<", "greater": ">", "question": "?",
+    }
+
+    def xkb_labels(layout, variant):
+        """{evdev keycode: (level-1 char, level-2 char)} and the layout's display
+        name, from libxkbcommon's own compiler (`xkbcli compile-keymap`), so the
+        keys show what Hyprland will really type for that layout. Returns
+        ({}, "") if the compiler is missing: the keys then fall back to QWERTY."""
+        cmd = ["xkbcli", "compile-keymap", "--layout", layout]
+        if variant:
+            cmd += ["--variant", variant]
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return {}, ""
+        codes, names = {}, {}
+        for m in re.finditer(r"<(\w+)>\s*=\s*(\d+);", out):
+            codes[m.group(1)] = int(m.group(2)) - 8
+        sym_section = out[out.find("xkb_symbols"):]
+        name_m = re.search(r'name\[1\]\s*=\s*"([^"]*)"', sym_section)
+        for m in re.finditer(r"key\s+<(\w+)>\s*\{[^\[\]]*\[([^\]]*)\]", sym_section):
+            syms = [s.strip() for s in m.group(2).split(",")]
+            chars = []
+            for s in syms[:2]:
+                if s in KEYSYM_CHARS:
+                    chars.append(KEYSYM_CHARS[s])
+                elif len(s) == 1:
+                    chars.append(s)
+                else:
+                    chars.append("")
+            while len(chars) < 2:
+                chars.append("")
+            if m.group(1) in codes:
+                names[codes[m.group(1)]] = (chars[0], chars[1])
+        return names, (name_m.group(1) if name_m else f"{layout} {variant}".strip())
+
+    QWERTY = {E.KEY_GRAVE: ("`", "~"), E.KEY_1: ("1", "!"), E.KEY_2: ("2", "@"), E.KEY_3: ("3", "#"),
+              E.KEY_4: ("4", "$"), E.KEY_5: ("5", "%"), E.KEY_6: ("6", "^"), E.KEY_7: ("7", "&"),
+              E.KEY_8: ("8", "*"), E.KEY_9: ("9", "("), E.KEY_0: ("0", ")"), E.KEY_MINUS: ("-", "_"),
+              E.KEY_EQUAL: ("=", "+"), E.KEY_LEFTBRACE: ("[", "{"), E.KEY_RIGHTBRACE: ("]", "}"),
+              E.KEY_BACKSLASH: ("\\", "|"), E.KEY_SEMICOLON: (";", ":"), E.KEY_APOSTROPHE: ("'", '"'),
+              E.KEY_COMMA: (",", "<"), E.KEY_DOT: (".", ">"), E.KEY_SLASH: ("/", "?")}
+    for _i, _c in enumerate("qwertyuiop"):
+        QWERTY[E.KEY_Q + _i] = (_c, _c.upper())
+    for _i, _c in enumerate("asdfghjkl"):
+        QWERTY[E.KEY_A + _i] = (_c, _c.upper())
+    for _i, _c in enumerate("zxcvbnm"):
+        QWERTY[E.KEY_Z + _i] = (_c, _c.upper())
+
+    class KeyboardPopup:
+        """The on-screen keyboard (2026-10-03, "an on-screen keyboard … it should pop
+        up from the bottom of the screen … use just the touch screen to type on it
+        … a toggle for switching between the keyboard layouts which are already
+        present"). Lives on the layout icon (hyprland/language): tap = show / hide,
+        long press = card.
+
+        It is a layer-shell window anchored to the bottom with an exclusive zone
+        (windows shrink above it) and NO keyboard focus of its own, so the window
+        he was typing in keeps the focus. Keys go through a uinput keyboard
+        ("bar-touch-keyboard"), which Hyprland treats like a plugged-in keyboard:
+        the active xkb layout decides what a keycode types, so the keycaps are
+        labelled from libxkbcommon for that layout (Dvorak shows Dvorak). The
+        layout key switches EVERY keyboard (`switchxkblayout all`) so the physical
+        keyboard, the bar icon and the keycaps always agree. Unlike the other
+        popups it is persistent: a touch elsewhere (the text field!) must not close
+        it; only its own hide key, its bar icon, or a Hyprland restart do."""
+        persistent = True
+        KEY_H = 58           # px: finger-sized (touch-native rule: >= 44)
+        UNIT = 74            # px per key unit
+        MODS = {E.KEY_LEFTSHIFT: "Shift", E.KEY_RIGHTSHIFT: "Shift", E.KEY_LEFTCTRL: "Ctrl",
+                E.KEY_RIGHTCTRL: "Ctrl", E.KEY_LEFTALT: "Alt", E.KEY_RIGHTALT: "Alt", E.KEY_LEFTMETA: "Super"}
+        SPECIAL = {E.KEY_ESC: "Esc", E.KEY_BACKSPACE: "⌫", E.KEY_TAB: "Tab", E.KEY_CAPSLOCK: "Caps",
+                   E.KEY_ENTER: "Enter ⏎", E.KEY_SPACE: "", E.KEY_DELETE: "Del", E.KEY_HOME: "Home",
+                   E.KEY_END: "End", E.KEY_PAGEUP: "PgUp", E.KEY_PAGEDOWN: "PgDn", E.KEY_UP: "↑",
+                   E.KEY_DOWN: "↓", E.KEY_LEFT: "←", E.KEY_RIGHT: "→", E.KEY_LEFTMETA: "Super"}
+        # (keycode, width in units) per row; None = a gap of one unit
+        ROWS = [
+            [(E.KEY_ESC, 1.25), (E.KEY_GRAVE, 1), (E.KEY_1, 1), (E.KEY_2, 1), (E.KEY_3, 1), (E.KEY_4, 1),
+             (E.KEY_5, 1), (E.KEY_6, 1), (E.KEY_7, 1), (E.KEY_8, 1), (E.KEY_9, 1), (E.KEY_0, 1),
+             (E.KEY_MINUS, 1), (E.KEY_EQUAL, 1), (E.KEY_BACKSPACE, 2)],
+            [(E.KEY_TAB, 1.75), (E.KEY_Q, 1), (E.KEY_W, 1), (E.KEY_E, 1), (E.KEY_R, 1), (E.KEY_T, 1),
+             (E.KEY_Y, 1), (E.KEY_U, 1), (E.KEY_I, 1), (E.KEY_O, 1), (E.KEY_P, 1), (E.KEY_LEFTBRACE, 1),
+             (E.KEY_RIGHTBRACE, 1), (E.KEY_BACKSLASH, 1.5)],
+            [(E.KEY_CAPSLOCK, 2), (E.KEY_A, 1), (E.KEY_S, 1), (E.KEY_D, 1), (E.KEY_F, 1), (E.KEY_G, 1),
+             (E.KEY_H, 1), (E.KEY_J, 1), (E.KEY_K, 1), (E.KEY_L, 1), (E.KEY_SEMICOLON, 1),
+             (E.KEY_APOSTROPHE, 1), (E.KEY_ENTER, 2.25)],
+            [(E.KEY_LEFTSHIFT, 2.5), (E.KEY_Z, 1), (E.KEY_X, 1), (E.KEY_C, 1), (E.KEY_V, 1), (E.KEY_B, 1),
+             (E.KEY_N, 1), (E.KEY_M, 1), (E.KEY_COMMA, 1), (E.KEY_DOT, 1), (E.KEY_SLASH, 1),
+             (E.KEY_RIGHTSHIFT, 2.75)],
+            [(E.KEY_LEFTCTRL, 1.5), (E.KEY_LEFTMETA, 1.25), (E.KEY_LEFTALT, 1.25), (E.KEY_SPACE, 6.75),
+             (E.KEY_RIGHTALT, 1.25), (E.KEY_RIGHTCTRL, 1.5), None, (E.KEY_LEFT, 1), (E.KEY_DOWN, 1),
+             (E.KEY_RIGHT, 1)],
+        ]
+        NAV = [[(E.KEY_DELETE, 1), (E.KEY_PAGEUP, 1)], [(E.KEY_HOME, 1), (E.KEY_PAGEDOWN, 1)],
+               [(E.KEY_END, 1), None], [None, (E.KEY_UP, 1)]]
+
+        def __init__(self, daemon):
+            self.d = daemon
+            self.win = None
+            self.env = dict(os.environ)
+            self.layouts = []            # [(layout, variant, short, display name, {code: (c1, c2)})]
+            self.index = 0
+            self.latched = {}            # keycode -> "once" | "lock" (modifiers held down)
+            self.caps = False
+            self.labels = {}             # keycode -> (small label, big label)
+            self.layout_btn = None
+            self.mod_btns = {}           # keycode -> button
+            self.down = set()
+            codes = sorted({c for row in self.ROWS + self.NAV for k in row if k for c in [k[0]]})
+            try:
+                self.ui = UInput({E.EV_KEY: codes}, name="bar-touch-keyboard")
+            except OSError as exc:
+                log(f"keyboard: uinput failed: {exc}")
+                self.ui = None
+            GLib.timeout_add(2500, self.sync_device)
+
+        # ── layouts (Hyprland's, in order) ──
+        def read_layouts(self):
+            lays = ((hypr_json("getoption input:kb_layout") or {}).get("str") or "us").split(",")
+            vars_ = ((hypr_json("getoption input:kb_variant") or {}).get("str") or "").split(",")
+            out = []
+            for i, lay in enumerate(lays):
+                lay = lay.strip()
+                var = vars_[i].strip() if i < len(vars_) else ""
+                names, display = xkb_labels(lay, var)
+                if not names:
+                    names, display = dict(QWERTY), f"{lay} {var}".strip()
+                short = (var[:2] if var else lay[:2]).upper()
+                out.append((lay, var, short, display, names))
+            self.layouts = out or [("us", "", "US", "English (US)", dict(QWERTY))]
+
+        def main_keyboard(self):
+            kbs = (hypr_json("devices") or {}).get("keyboards") or []
+            for kb in kbs:
+                if kb.get("main"):
+                    return kb
+            return kbs[0] if kbs else {}
+
+        def read_index(self):
+            kb = self.main_keyboard()
+            self.index = int(kb.get("active_layout_index") or 0)
+            self.caps = bool(kb.get("capsLock"))
+            if self.layouts and self.index >= len(self.layouts):
+                self.index = 0
+
+        def sync_device(self):
+            """Our uinput keyboard starts on layout 0; put it on the layout the main
+            keyboard uses so the first key typed matches the keycaps."""
+            kb = self.main_keyboard()
+            if kb and kb.get("name") != "bar-touch-keyboard":
+                hypr(f"switchxkblayout bar-touch-keyboard {int(kb.get('active_layout_index') or 0)}")
+            return False
+
+        def switch_layout(self, *_):
+            if not self.layouts:
+                return
+            self.index = (self.index + 1) % len(self.layouts)
+            hypr(f"switchxkblayout all {self.index}")
+            log(f"keyboard: layout -> {self.layouts[self.index][3]}")
+            self.relabel()
+
+        # ── window ──
+        def show(self, env, x_local, mon):
+            self.hide()
+            self.env = env or self.env
+            self.read_layouts()
+            self.read_index()
+            self.sync_device()
+            win = layer_window("bar-touch-keyboard", mon, bottom=True)
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            outer.get_style_context().add_class("bt-pop")
+            outer.get_style_context().add_class("bt-kbd")
+            body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+            main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            self.labels, self.mod_btns = {}, {}
+            for row in self.ROWS:
+                main.pack_start(self.row(row), False, False, 0)
+            body.pack_start(main, False, False, 0)
+            nav = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            for row in self.NAV:
+                nav.pack_start(self.row(row), False, False, 0)
+            body.pack_start(nav, False, False, 0)
+            tools = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            hide = Gtk.Button()
+            hide.add(label("⌨ ▾\nhide", "bt-kbd-cap", wrap=False, xalign=0.5))
+            hide.get_style_context().add_class("bt-key")
+            hide.get_style_context().add_class("bt-key-tool")
+            hide.set_size_request(int(self.UNIT * 2.2), self.KEY_H * 2 + 4)
+            hide.connect("clicked", lambda *_: self.hide())
+            tools.pack_start(hide, False, False, 0)
+            self.layout_btn = Gtk.Button()
+            self.layout_lab = label("", "bt-kbd-cap", markup=True, wrap=False, xalign=0.5)
+            self.layout_lab.set_justify(Gtk.Justification.CENTER)
+            self.layout_btn.add(self.layout_lab)
+            self.layout_btn.get_style_context().add_class("bt-key")
+            self.layout_btn.get_style_context().add_class("bt-key-tool")
+            self.layout_btn.set_size_request(int(self.UNIT * 2.2), self.KEY_H * 2 + 4)
+            self.layout_btn.connect("clicked", self.switch_layout)
+            tools.pack_start(self.layout_btn, False, False, 0)
+            body.pack_start(tools, False, False, 0)
+            outer.pack_start(body, False, False, 0)
+            win.add(outer)
+            win.show_all()
+            self.win = win
+            self.relabel()
+            log("keyboard: shown")
+
+        def row(self, keys):
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            for k in keys:
+                if k is None:
+                    gap = Gtk.Box()
+                    gap.set_size_request(self.UNIT, self.KEY_H)
+                    box.pack_start(gap, False, False, 0)
+                    continue
+                code, w = k
+                btn = Gtk.Button()
+                cap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+                small = label("", "bt-kbd-small", wrap=False, xalign=0.5)
+                big = label("", "bt-kbd-cap", wrap=False, xalign=0.5)
+                cap.pack_start(small, False, False, 0)
+                cap.pack_start(big, True, True, 0)
+                btn.add(cap)
+                btn.get_style_context().add_class("bt-key")
+                if code in self.MODS or code == E.KEY_CAPSLOCK:
+                    btn.get_style_context().add_class("bt-key-mod")
+                    self.mod_btns[code] = btn
+                elif code in self.SPECIAL:
+                    btn.get_style_context().add_class("bt-key-special")
+                btn.set_size_request(int(self.UNIT * w + 4 * (w - 1)), self.KEY_H)
+                self.labels[code] = (small, big)
+                if code in self.MODS:
+                    btn.connect("clicked", self.on_mod, code)
+                else:
+                    btn.connect("pressed", self.on_press, code)
+                    btn.connect("released", self.on_release, code)
+                    btn.connect("clicked", self.on_clicked, code)
+                box.pack_start(btn, False, False, 0)
+            return box
+
+        def relabel(self):
+            if not self.win or not self.layouts:
+                return
+            names = self.layouts[self.index][4]
+            shifted = any(c in (E.KEY_LEFTSHIFT, E.KEY_RIGHTSHIFT) for c in self.latched)
+            for code, (small, big) in self.labels.items():
+                if code in self.MODS:
+                    small.set_text("")
+                    how = self.latched.get(code)
+                    big.set_text(self.MODS[code] + (" ●" if how == "lock" else " ○" if how else ""))
+                    continue
+                if code in self.SPECIAL:
+                    small.set_text("")
+                    big.set_text(self.SPECIAL[code] + (" ●" if code == E.KEY_CAPSLOCK and self.caps else ""))
+                    continue
+                c1, c2 = names.get(code, ("", ""))
+                if c1.isalpha():
+                    upper = shifted != self.caps
+                    small.set_text("")
+                    big.set_text(c2 if upper else c1)
+                else:
+                    small.set_text(c2)
+                    big.set_text(c1)
+            for code, btn in self.mod_btns.items():
+                ctx = btn.get_style_context()
+                on = code in self.latched or (code == E.KEY_CAPSLOCK and self.caps)
+                (ctx.add_class if on else ctx.remove_class)("active-mod")
+            lay = self.layouts[self.index]
+            nxt = self.layouts[(self.index + 1) % len(self.layouts)]
+            self.layout_lab.set_markup(f"<span size='x-large'><b>{GLib.markup_escape_text(lay[2])}</b></span>\n"
+                                       f"<span size='small'>{GLib.markup_escape_text(lay[3])}</span>\n"
+                                       f"<span size='small'>tap: {GLib.markup_escape_text(nxt[2])}</span>"
+                                       if len(self.layouts) > 1 else
+                                       f"<span size='x-large'><b>{GLib.markup_escape_text(lay[2])}</b></span>\n"
+                                       f"<span size='small'>{GLib.markup_escape_text(lay[3])}</span>")
+
+        # ── keys ──
+        def key(self, code, value):
+            if not self.ui:
+                return
+            self.ui.write(E.EV_KEY, code, value)
+            self.ui.syn()
+
+        def on_mod(self, _btn, code):
+            """Tap = hold for the next key (○), tap again = lock (●), again = off."""
+            how = self.latched.get(code)
+            if how is None:
+                self.latched[code] = "once"
+                self.key(code, 1)
+            elif how == "once":
+                self.latched[code] = "lock"
+            else:
+                del self.latched[code]
+                self.key(code, 0)
+            self.relabel()
+
+        def on_press(self, _btn, code):
+            self.down.add(code)
+            self.key(code, 1)
+
+        def on_release(self, _btn, code):
+            if code in self.down:
+                self.down.discard(code)
+                self.key(code, 0)
+                self.after_key(code)
+
+        def on_clicked(self, _btn, code):
+            # "clicked" without a press/release pair (e.g. activated by GTK itself)
+            if code in self.down:
+                return
+            self.key(code, 1)
+            self.key(code, 0)
+            self.after_key(code)
+
+        def after_key(self, code):
+            if code == E.KEY_CAPSLOCK:
+                self.caps = not self.caps
+            once = [c for c, how in self.latched.items() if how == "once"]
+            for c in once:
+                del self.latched[c]
+                self.key(c, 0)
+            if once or code == E.KEY_CAPSLOCK:
+                self.relabel()
+
+        def release_all(self):
+            for code in list(self.latched):
+                self.key(code, 0)
+            self.latched.clear()
+            for code in list(self.down):
+                self.key(code, 0)
+            self.down.clear()
+
+        def hide(self, *_):
+            self.release_all()
+            if self.win:
+                self.win.destroy()
+                self.win = None
+                log("keyboard: hidden")
+            return False
+
+
+    class Overview:
+        def __init__(self):
+            self.win = None
+
+        def toggle(self):
+            if self.win:
+                self.hide()
+            else:
+                self.show()
+
+        def show(self):
+            mon = touch_monitor()
+            clients = [c for c in (hypr_json("clients") or []) if c.get("mapped") and not c.get("hidden")]
+            active = (hypr_json("activewindow") or {}).get("address")
+            # Same order as Alt+Tab (hypr-alt-tab): the current desktop (every
+            # workspace shown on a monitor) first, most-recently-used first within
+            # it, then the rest by recency. Touch twin of Alt+Tab, 2026-09-30.
+            shown = {m.get("activeWorkspace", {}).get("id") for m in (hypr_json("monitors") or [])
+                     if not m.get("disabled")}
+            clients.sort(key=lambda c: (c.get("workspace", {}).get("id") not in shown,
+                                        c.get("focusHistoryID", 999)))
+            win = layer_window("bar-touch-overview", mon, anchor_all=True, keyboard=True)
+            win.connect("key-press-event", lambda w, ev: (self.hide(), True)[1]
+                        if ev.keyval == Gdk.KEY_Escape else False)
+            bg = Gtk.EventBox()
+            bg.connect("button-press-event", lambda *a: (self.hide(), True)[1])
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            col.set_margin_top(40); col.set_margin_start(40); col.set_margin_end(40); col.set_margin_bottom(40)
+            col.pack_start(label(f"Open windows ({len(clients)})", "bt-ov-head", wrap=False), False, False, 0)
+            col.pack_start(label("Tap a window to switch to it, ✕ to close it (most recent first). "
+                                 "Tap empty space or press Esc to leave.",
+                                 "bt-ov-hint", wrap=False), False, False, 0)
+            flow = Gtk.FlowBox()
+            flow.set_selection_mode(Gtk.SelectionMode.NONE)
+            flow.set_max_children_per_line(5)
+            flow.set_column_spacing(14); flow.set_row_spacing(14)
+            flow.set_homogeneous(True)
+            flow.set_valign(Gtk.Align.START)
+            theme = Gtk.IconTheme.get_default()
+            # workspace-labels (2026-11-02): each tile shows its workspace's label,
+            # the touch path to see labels without switching.
+            try:
+                with open(os.path.expanduser("~/.local/state/workspace-labels/labels.json")) as f:
+                    ws_labels = {k: v.get("label", "") for k, v in json.load(f).items()}
+            except (OSError, ValueError):
+                ws_labels = {}
+            for c in clients:
+                cls = c.get("class") or c.get("initialClass") or "?"
+                ws = c.get("workspace", {}).get("name", "?")
+                # headline only (labels are multiline since 2026-11-06: headline + bullets)
+                # one label per digit: ws N+10 (workspace-pair's second half) shows desk N's label
+                wid = c.get("workspace", {}).get("id") or 0
+                wsl = ws_labels.get(str(wid - 10 if wid > 10 else wid), "").split("\n", 1)[0].strip()
+                btn = Gtk.Button()
+                btn.get_style_context().add_class("bt-tile")
+                if c.get("address") == active:
+                    btn.get_style_context().add_class("current")
+                inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+                top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+                icon_name = next((n for n in (cls, cls.lower(), cls.split(".")[-1].lower())
+                                  if theme.has_icon(n)), "application-x-executable")
+                top.pack_start(Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.DIALOG), False, False, 0)
+                top.pack_start(label(f"Workspace {ws}\n{cls}", "bt-dim", wrap=False), False, False, 0)
+                inner.pack_start(top, False, False, 0)
+                if wsl:                       # the workspace's label headline, its own wrapped line
+                    h = label(wsl, "bt-tile-ws")
+                    h.set_lines(2); h.set_ellipsize(Pango.EllipsizeMode.END); h.set_max_width_chars(30)
+                    inner.pack_start(h, False, False, 0)
+                t = label(c.get("title") or cls, "bt-tile-title")
+                t.set_lines(2); t.set_ellipsize(Pango.EllipsizeMode.END); t.set_max_width_chars(30)
+                inner.pack_start(t, False, False, 0)
+                btn.add(inner)
+                btn.connect("clicked", self.focus, c.get("address"))
+                # ✕ = the touch twin of Super+W: the focused window goes through
+                # hypr-close-ordered (same next-focus rule), others just close.
+                x = Gtk.Button(label="\u2715")
+                x.get_style_context().add_class("bt-btn")
+                x.get_style_context().add_class("bt-tile-close")
+                x.set_halign(Gtk.Align.END); x.set_valign(Gtk.Align.START)
+                x.connect("clicked", self.close, c.get("address"), c.get("address") == active)
+                over = Gtk.Overlay()
+                over.add(btn)
+                over.add_overlay(x)
+                flow.add(over)
+            if not clients:
+                col.pack_start(label("No open windows.", "bt-ov-hint"), False, False, 0)
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroller.add(flow)
+            col.pack_start(scroller, True, True, 0)
+            bg.add(col)
+            win.add(bg)
+            win.show_all()
+            self.win = win
+
+        def focus(self, _btn, address):
+            self.hide()
+            if address:
+                hypr(f"dispatch focuswindow address:{address}")
+
+        def close(self, _btn, address, is_active):
+            if not address:
+                return
+            if is_active:
+                subprocess.run([os.path.expanduser("~/.local/bin/hypr-close-ordered")], timeout=3)
+            else:
+                hypr(f"dispatch closewindow address:{address}")
+            log(f"overview close {address}")
+            # Redraw once the window is gone (a "save changes?" prompt keeps it).
+            GLib.timeout_add(250, lambda: (self.win and (self.hide(), self.show()), False)[1])
+
+        def hide(self):
+            if self.win:
+                self.win.destroy()
+                self.win = None
+
+    # ── walker menus (omarchy-menu, the power menu, the launcher) by finger ──
+    class WalkerTouch:
+        """Make walker's list answer a finger (2026-10-11).
+
+        walker 2.x (src/ui/window.rs) calls list.set_can_target(false) whenever its
+        window opens, and only turns the list back on after its EventControllerMotion
+        sees the pointer move twice to different spots (so a resting cursor cannot
+        hover-select an entry and Enter run it). A touch tap is no pointer motion, so
+        it falls through the list to the window: taps on entries do nothing, a tap
+        outside the box still closes the menu. Walker has no setting for this.
+
+        Fix: on Hyprland's `openlayer>>walker` event the daemon wiggles its uinput
+        mouse 1 px right/left/right/left, which counts as two motions. Where the
+        cursor already rests on walker's monitor away from the centred box it stays
+        put (no visible change, no entry hover-selected). Otherwise it is first moved
+        to the monitor's left edge, but only if the touchscreen was used in the last
+        WALKER_TOUCH_RECENT s (the menu was opened by finger); a mouse/keyboard user's
+        cursor is never moved. If a finger then lands on a menu that is still not
+        primed (opened by keyboard), it is primed at touch-down and that tap, which
+        GTK already sent nowhere, is replayed as a mouse click at the same spot,
+        only if walker is still open WALKER_REPLAY_DELAY ms after the lift.
+        """
+
+        def __init__(self, daemon):
+            self.d = daemon
+            self.open = False
+            self.primed = False
+            self.gen = 0
+            threading.Thread(target=self.listen, daemon=True, name="walker-events").start()
+
+        def listen(self):
+            sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+            path = os.path.join(RUNTIME, "hypr", sig, ".socket2.sock")
+            failed = False
+            while True:
+                try:
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s.connect(path)
+                    if failed:
+                        log("walker: hyprland event socket back")
+                    failed = False
+                    buf = b""
+                    while True:
+                        chunk = s.recv(65536)
+                        if not chunk:
+                            break
+                        buf += chunk
+                        *lines, buf = buf.split(b"\n")
+                        for line in lines:
+                            if line == b"openlayer>>" + WALKER_NS.encode():
+                                GLib.idle_add(self.on_open)
+                            elif line == b"closelayer>>" + WALKER_NS.encode():
+                                GLib.idle_add(self.on_close)
+                    s.close()
+                except OSError as exc:
+                    if not failed:
+                        log(f"walker: hyprland event socket failed: {exc}")
+                    failed = True
+                time.sleep(2)
+
+        def on_open(self):
+            self.open, self.primed = True, False
+            self.gen += 1
+            # Give walker a moment to map and lay out before the pointer moves.
+            GLib.timeout_add(120, self.prime_on_open, self.gen)
+            return False
+
+        def on_close(self):
+            self.open = self.primed = False
+            self.gen += 1
+            return False
+
+        def prime_on_open(self, gen):
+            if gen == self.gen and self.open and not self.primed:
+                recent = time.monotonic() - self.d.last_touch < WALKER_TOUCH_RECENT
+                self.prime(allow_move=recent, why="menu opened" + (" by finger" if recent else ""))
+            return False
+
+        @staticmethod
+        def monitor():
+            """The monitor dict walker's layer is on, or None if it is not open."""
+            layers = hypr_json("layers") or {}
+            for name, info in layers.items():
+                for level in (info.get("levels") or {}).values():
+                    for surf in level:
+                        if surf.get("namespace") == WALKER_NS:
+                            for m in hypr_json("monitors") or []:
+                                if m.get("name") == name:
+                                    return m
+            return None
+
+        def prime(self, allow_move, why):
+            mon = self.monitor()
+            if mon is None:
+                return None
+            scale = mon.get("scale") or 1
+            w, h = mon["width"] / scale, mon["height"] / scale
+            if mon.get("transform", 0) % 2:
+                w, h = h, w
+            pos = hypr_json("cursorpos") or {}
+            cx, cy = pos.get("x", -1), pos.get("y", -1)
+            on_mon = mon["x"] <= cx < mon["x"] + w and mon["y"] <= cy < mon["y"] + h
+            if not (on_mon and abs(cx - (mon["x"] + w / 2)) > WALKER_BOX_HALF):
+                if not allow_move:
+                    log(f"walker: {why}; cursor over the menu or another monitor, left alone")
+                    return None
+                hypr(f"dispatch movecursor {int(mon['x'] + 40)} {int(mon['y'] + h / 2)}")
+                time.sleep(0.08)
+            for dx in (1, -1, 1, -1):
+                self.d.ui.write(E.EV_REL, E.REL_X, dx)
+                self.d.ui.syn()
+                time.sleep(0.03)
+            self.primed = True
+            log(f"walker: {why}; list primed for touch on {mon.get('name')}")
+            return mon
+
+        def touch_down(self, s):
+            """A finger landed. If it is on a walker menu nobody primed yet, prime it now
+            and mark the touch for replay (touch mode only: mouse mode clicks anyway)."""
+            if not self.open or self.primed:
+                return
+            mon = self.prime(allow_move=True, why="finger on an unprimed menu")
+            s.walker_replay = (mon is not None and not self.d.mouse and not s.in_bar
+                               and mon.get("name") == s.mon.get("name"))
+
+        def touch_up(self, s):
+            if (getattr(s, "walker_replay", False) and s.max_fingers == 1 and not s.consumed
+                    and s.moved <= MOVE_TOL and (s.t_up or time.monotonic()) - s.t0 < LONG_PRESS):
+                GLib.timeout_add(WALKER_REPLAY_DELAY, self.replay, s.x0, s.y0)
+
+        def replay(self, x, y):
+            if self.monitor() is None:
+                log("walker: tap already answered (menu closed), no replay")
+                return False
+            hypr(f"dispatch movecursor {int(x)} {int(y)}")
+            time.sleep(0.05)
+            self.d.click(E.BTN_LEFT)
+            log(f"walker: lost tap replayed as a click at {int(x)},{int(y)}")
+            return False
+
+    # ── touch input ──
+    class TouchDev:
+        def __init__(self, dev):
+            self.dev = dev
+            self.slot = 0
+            self.ids = {}
+            self.pos = {}
+            ax = dev.absinfo(E.ABS_MT_POSITION_X)
+            ay = dev.absinfo(E.ABS_MT_POSITION_Y)
+            self.maxx, self.maxy = max(ax.max, 1), max(ay.max, 1)
+            self.watch = None
+            self.grabbed = False
+
+        def contacts(self):
+            return [self.pos[s] for s in sorted(self.ids) if self.ids[s] >= 0 and s in self.pos
+                    and None not in self.pos[s]]
+
+    class Session:
+        def __init__(self, dev, mon, raw):
+            self.dev, self.mon = dev, mon
+            self.t0 = time.monotonic()
+            self.t_up = None
+            self.fingers = self.max_fingers = len(raw)
+            self.x0, self.y0, self.lx0, self.ly0 = daemon.map_point(dev, mon, raw[0])
+            self.x, self.y, self.lx, self.ly = self.x0, self.y0, self.lx0, self.ly0
+            self.moved = 0.0
+            self.in_bar = self.ly0 <= daemon.bar_h + 1
+            self.consumed = False
+            self.dragging = False
+            self.bar_held = False
+            self.two = None
+            self.last_move = 0.0
+            self.clicked = False     # waybar reported a module click for this touch
+            self.workspace = None    # active workspace id at touch-down (bar taps only)
+            self.walker_replay = False  # tap lost on an unprimed walker menu: replay it
+
+    class Daemon:
+        def __init__(self):
+            self.devs = {}
+            self.session = None
+            self.last = None
+            self.pending = None
+            self.mouse = False
+            self.bar_h = 26
+            self.env = dict(os.environ)
+            self.toast, self.overview, self.volume = Toast(), Overview(), VolumePopup()
+            self.popups = {"volume": self.volume, "wifi": WifiPopup(), "bluetooth": BluetoothPopup(),
+                           "battery": BatteryPopup(), "mpv-history": MpvHistoryPopup(),
+                           "keyboard": KeyboardPopup(self)}
+            self.card = Card(self)
+            self.unanswered = []     # (time, x) of recent bar taps waybar never clicked
+            self.waybar_restarted = 0.0
+            self.ui = UInput({E.EV_KEY: [E.BTN_LEFT, E.BTN_RIGHT, E.BTN_MIDDLE],
+                              E.EV_REL: [E.REL_X, E.REL_Y, E.REL_WHEEL]}, name="bar-touch-mouse")
+            self.last_touch = 0.0    # monotonic time of the last finger-down on any touchscreen
+            self.walker = WalkerTouch(self)
+
+        # coordinates: raw panel -> global logical and monitor-local logical
+        def map_point(self, dev, mon, raw):
+            u, v = raw[0] / dev.maxx, raw[1] / dev.maxy
+            if mon.get("transform", 0) == 2:
+                u, v = 1 - u, 1 - v
+            scale = mon.get("scale") or 1
+            lx, ly = u * mon["width"] / scale, v * mon["height"] / scale
+            return mon["x"] + lx, mon["y"] + ly, lx, ly
+
+        # ── devices ──
+        def scan(self):
+            for path in evdev.list_devices():
+                if path in self.devs:
+                    continue
+                try:
+                    dev = evdev.InputDevice(path)
+                except OSError:
+                    continue
+                caps = dev.capabilities(absinfo=False).get(E.EV_ABS, [])
+                only = [n for n in os.environ.get("BAR_TOUCH_DEVICES", "").split(",") if n]
+                if (E.ABS_MT_POSITION_X not in caps or E.INPUT_PROP_DIRECT not in dev.input_props()
+                        or (only and dev.name not in only)):
+                    dev.close()
+                    continue
+                td = TouchDev(dev)
+                # DEFAULT priority, never HIGH: a HIGH source is dispatched while GDK's
+                # Wayland source still holds a prepared read, and any window created
+                # from it deadlocks in wl_display_roundtrip (reproduced 2026-09-24).
+                td.watch = GLib.io_add_watch(dev.fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_ERR | GLib.IO_HUP,
+                                             self.on_input, td)
+                self.devs[path] = td
+                log(f"touchscreen: {dev.name} ({path})")
+                if self.mouse:
+                    self.grab(td, True)
+            return True
+
+        def drop(self, td):
+            if td.watch:
+                GLib.source_remove(td.watch)
+            try:
+                td.dev.close()
+            except OSError:
+                pass
+            self.devs.pop(td.dev.path, None)
+            log(f"touchscreen gone: {td.dev.path}")
+            # A device that vanishes mid-touch never sends its lift. Left alone, its
+            # session stays open and frame() ignores every other screen for good:
+            # all taps become "mouse", no card, no popup (2026-09-25, after the
+            # virtual test screen was removed while the daemon lagged under load).
+            if self.session is not None and self.session.dev is td:
+                log("touch session dropped with its device")
+                self.session = None
+                self.release_buttons()
+
+        def grab(self, td, on):
+            try:
+                if on and not td.grabbed:
+                    td.dev.grab(); td.grabbed = True
+                elif not on and td.grabbed:
+                    td.dev.ungrab(); td.grabbed = False
+            except OSError as exc:
+                log(f"grab({on}) failed on {td.dev.path}: {exc}")
+
+        def set_mouse(self, on):
+            if on == self.mouse:
+                return
+            self.release_buttons()
+            self.mouse = on
+            for td in list(self.devs.values()):
+                self.grab(td, on)
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(MOUSE_FLAG, "w") as f:
+                f.write("on\n" if on else "off\n")
+            subprocess.run(["pkill", f"-RTMIN+{MOUSE_SIGNAL}", "-x", "waybar"])
+            log(f"mouse mode {'ON' if on else 'OFF'}")
+
+        # ── evdev ──
+        def on_input(self, _fd, cond, td):
+            if cond & (GLib.IO_ERR | GLib.IO_HUP):
+                self.drop(td)
+                return False
+            try:
+                events = list(td.dev.read())
+            except BlockingIOError:
+                return True
+            except OSError:
+                self.drop(td)
+                return False
+            for ev in events:
+                if ev.type == E.EV_ABS:
+                    if ev.code == E.ABS_MT_SLOT:
+                        td.slot = ev.value
+                    elif ev.code == E.ABS_MT_TRACKING_ID:
+                        td.ids[td.slot] = ev.value
+                        if ev.value < 0:
+                            td.ids.pop(td.slot, None)
+                    elif ev.code == E.ABS_MT_POSITION_X:
+                        td.pos[td.slot] = (ev.value, td.pos.get(td.slot, (None, None))[1])
+                    elif ev.code == E.ABS_MT_POSITION_Y:
+                        td.pos[td.slot] = (td.pos.get(td.slot, (None, None))[0], ev.value)
+                elif ev.type == E.EV_SYN:
+                    if ev.code == E.SYN_REPORT:
+                        self.frame(td)
+                    elif ev.code == E.SYN_DROPPED:
+                        td.ids.clear()
+                        self.frame(td)
+            return True
+
+        def frame(self, td):
+            raw = td.contacts()
+            s = self.session
+            if s is None:
+                if raw:
+                    mon = touch_monitor()
+                    self.bar_h = bar_height(mon)
+                    self.session = Session(td, mon, raw)
+                    self.last_touch = time.monotonic()
+                    self.walker.touch_down(self.session)
+                    self.outside_touch(self.session)
+                    self.begin(self.session)
+                return
+            if s.dev is not td:
+                # Safety net for any other way a session loses its lift: a touch on
+                # another screen 3 s after the open session last moved replaces it.
+                if raw and time.monotonic() - getattr(s, "t_last", s.t0) > 3.0:
+                    log("stale touch session replaced")
+                    self.session = None
+                    self.release_buttons()
+                    self.frame(td)
+                return
+            s.t_last = time.monotonic()
+            if not raw:
+                s.t_up = time.monotonic()
+                s.fingers = 0
+                self.session, self.last = None, s
+                self.end(s)
+                return
+            s.fingers = len(raw)
+            s.max_fingers = max(s.max_fingers, s.fingers)
+            s.x, s.y, s.lx, s.ly = self.map_point(td, s.mon, raw[0])
+            s.moved = max(s.moved, ((s.x - s.x0) ** 2 + (s.y - s.y0) ** 2) ** 0.5)
+            if self.mouse:
+                self.mouse_motion(s, raw)
+
+        # ── gesture phases ──
+        def begin(self, s):
+            if s.in_bar and not self.mouse:
+                s.workspace = (hypr_json("activeworkspace") or {}).get("id")
+            if self.mouse:
+                if s.in_bar:
+                    hypr(f"dispatch movecursor {int(s.x0)} {int(s.y0)}")
+                    self.button(E.BTN_LEFT, 1)
+                    s.bar_held = True
+                else:
+                    GLib.timeout_add(int(LONG_PRESS * 1000), self.mouse_long, s)
+
+        def mouse_motion(self, s, raw):
+            if s.in_bar or s.consumed:
+                return
+            if s.fingers >= 2 and not s.dragging:
+                pts = [self.map_point(s.dev, s.mon, r) for r in raw[:2]]
+                cx, cy = sum(p[0] for p in pts) / 2, sum(p[1] for p in pts) / 2
+                if s.two is None:
+                    s.two = (cx, cy)
+                    return
+                dx, dy = cx - s.two[0], cy - s.two[1]
+                if dy < -SWIPE_MIN and abs(dy) > 1.5 * abs(dx):
+                    s.consumed = True
+                    log("two-finger swipe up: overview")
+                    GLib.idle_add(lambda: (self.overview.toggle(), False)[1])
+                return
+            if s.two is not None or s.max_fingers > 1:
+                return
+            if not s.dragging and s.moved > MOVE_TOL:
+                hypr(f"dispatch movecursor {int(s.x0)} {int(s.y0)}")
+                self.button(E.BTN_LEFT, 1)
+                s.dragging = True
+            if s.dragging:
+                now = time.monotonic()
+                if now - s.last_move >= 0.008:
+                    s.last_move = now
+                    hypr(f"dispatch movecursor {int(s.x)} {int(s.y)}")
+
+        def mouse_long(self, s):
+            if (self.session is s and s.max_fingers == 1 and not s.dragging and not s.consumed
+                    and s.moved <= MOVE_TOL):
+                s.consumed = True
+                hypr(f"dispatch movecursor {int(s.x0)} {int(s.y0)}")
+                self.click(E.BTN_RIGHT)
+            return False
+
+        def end(self, s):
+            self.walker.touch_up(s)
+            if self.mouse:
+                if s.bar_held:
+                    self.button(E.BTN_LEFT, 0)
+                elif s.dragging:
+                    hypr(f"dispatch movecursor {int(s.x)} {int(s.y)}")
+                    self.button(E.BTN_LEFT, 0)
+                elif not s.consumed and s.max_fingers == 1 and s.moved <= MOVE_TOL:
+                    hypr(f"dispatch movecursor {int(s.x0)} {int(s.y0)}")
+                    self.click(E.BTN_LEFT)
+            p = self.pending
+            if p and p["session"] is s and not p["done"]:
+                p["done"] = True
+                if s.moved <= BAR_MOVE_TOL:
+                    self.tap(p)
+            if s.in_bar and self.open_windows():
+                # A bar touch that no module claims (empty bar, workspace numbers,
+                # tray) also closes the popup. Waybar's click can land after the
+                # lift, so wait before deciding.
+                GLib.timeout_add(1000, self.bar_touch_unclaimed, s)
+            if s.in_bar and not self.mouse and s.max_fingers == 1 and s.moved <= BAR_MOVE_TOL:
+                GLib.timeout_add(1000, self.check_bar_answered, s)
+
+        # ── dismissing popups: a touch anywhere else closes them ──
+        def open_windows(self):
+            wins = [w for w in (self.toast, self.card, *self.popups.values())
+                    if w.win and not getattr(w, "persistent", False)]
+            return wins
+
+        def dismiss_all(self, why):
+            """Close every transient popup. The on-screen keyboard ("persistent") is
+            not one: a touch in the text field he is typing into must not hide it.
+            It closes from its own hide key or its bar icon (open_popup)."""
+            if self.open_windows():
+                log(f"popups closed: {why}")
+            self.toast.hide()
+            self.card.hide()
+            for popup in self.popups.values():
+                if not getattr(popup, "persistent", False):
+                    popup.hide()
+
+        def outside_touch(self, s):
+            """Touch-down outside every open popup closes them. Bar touches are left
+            to the click (same icon = close, another icon = switch) and to
+            bar_touch_unclaimed; the overview handles its own taps."""
+            if s.in_bar or not self.open_windows():
+                return
+            layers = hypr_json("layers") or {}
+            for mon in layers.values():
+                for level in (mon.get("levels") or {}).values():
+                    for ly in level:
+                        ns = ly.get("namespace", "")
+                        if not ns.startswith("bar-touch-") or ns == "bar-touch-overview":
+                            continue
+                        if (ly["x"] <= s.x0 < ly["x"] + ly["w"]
+                                and ly["y"] <= s.y0 < ly["y"] + ly["h"]):
+                            return
+            self.dismiss_all(f"touch outside at {int(s.x0)},{int(s.y0)}")
+
+        def bar_touch_unclaimed(self, s):
+            if not s.clicked:
+                self.dismiss_all("bar touch with no module click")
+            return False
+
+        # ── touch-dead waybar ──
+        def check_bar_answered(self, s):
+            """A bar tap waybar never answered. Workspace numbers do not call bar-touch,
+            so a tap that switched workspace was answered too."""
+            if s.clicked:
+                self.unanswered.clear()
+                return False
+            if s.workspace is not None and (hypr_json("activeworkspace") or {}).get("id") != s.workspace:
+                self.unanswered.clear()
+                return False
+            now = time.monotonic()
+            self.unanswered = [(t, x) for t, x in self.unanswered if now - t < DEAD_WINDOW]
+            self.unanswered.append((now, s.x0))
+            same = sum(1 for _, x in self.unanswered if abs(x - s.x0) <= DEAD_SPOT)
+            log(f"bar tap at x={int(s.x0)} unanswered ({same} here, {len(self.unanswered)} in {DEAD_WINDOW}s)")
+            if same >= DEAD_SAME_SPOT or len(self.unanswered) >= DEAD_ANY:
+                self.restart_waybar(f"{len(self.unanswered)} bar taps unanswered")
+            return False
+
+        def restart_waybar(self, why):
+            now = time.monotonic()
+            self.unanswered.clear()
+            if now - self.waybar_restarted < DEAD_COOLDOWN:
+                log(f"waybar touch-dead ({why}), restarted {int(now - self.waybar_restarted)}s ago: waiting")
+                return
+            self.waybar_restarted = now
+            log(f"waybar touch-dead ({why}): restarting waybar")
+            run_detached(os.path.expanduser("~/.local/bin/restart-waybar"))
+            run_detached("notify-send -a bar-touch 'Top bar stopped answering touch' "
+                         "'Restarted it. Tap again in a moment.'")
+
+        # ── virtual mouse ──
+        def button(self, btn, value):
+            self.ui.write(E.EV_KEY, btn, value)
+            self.ui.syn()
+
+        def click(self, btn):
+            self.button(btn, 1)
+            time.sleep(0.02)
+            self.button(btn, 0)
+
+        def release_buttons(self):
+            for btn in (E.BTN_LEFT, E.BTN_RIGHT):
+                self.button(btn, 0)
+
+        # ── bar clicks ──
+        def on_click(self, msg):
+            name, env = msg.get("module", ""), msg.get("env") or self.env
+            now = time.monotonic()
+            s = self.session
+            for sess in (s, self.last):
+                if sess is not None:
+                    sess.clicked = True
+            if s is not None and now - s.t0 < 2.0 and s.max_fingers == 1:
+                p = {"module": name, "env": env, "session": s, "done": False}
+                self.pending = p
+                wait = LONG_PRESS - (now - s.t0)
+                GLib.timeout_add(max(0, int(wait * 1000)), self.bar_long, p)
+                return "touch"
+            last = self.last
+            if last is not None and last.t_up and now - last.t_up < RECENT and last.max_fingers == 1:
+                p = {"module": name, "env": env, "session": last, "done": True}
+                if last.moved > BAR_MOVE_TOL:
+                    return "cancelled"
+                if last.t_up - last.t0 >= LONG_PRESS:
+                    self.long_press(p)
+                else:
+                    self.tap(p)
+                return "touch"
+            _, touch = module_spec(name)
+            popup = self.popups.get(touch.get("popup"))
+            if popup:
+                # Mouse clicks get the same popup as a finger: the TUIs it replaces
+                # (wiremix, impala, bluetui) are not wanted at all (2026-09-25).
+                self.open_popup(popup, env, *self.cursor_spot())
+            else:
+                self.dismiss_all(f"mouse click on {name}")
+                if touch.get("tap-card"):
+                    self.act_and_card(name, env, *self.cursor_spot())
+                elif touch.get("click"):
+                    run_click(touch, with_target_window(name, env))
+            return "mouse"
+
+        def cursor_spot(self):
+            """(monitor-local x, monitor) under the mouse pointer."""
+            pos = hypr_json("cursorpos") or {}
+            x, y = pos.get("x", 0), pos.get("y", 0)
+            for m in hypr_json("monitors") or []:
+                scale = m.get("scale") or 1
+                if m["x"] <= x < m["x"] + m["width"] / scale and m["y"] <= y < m["y"] + m["height"] / scale:
+                    return x - m["x"], m
+            mon = touch_monitor()
+            return x - mon["x"], mon
+
+        def open_popup(self, popup, env, x_local, mon):
+            if popup.win:
+                # its own icon again: close, like a menu
+                self.dismiss_all("same icon again")
+                popup.hide()
+                return
+            self.toast.hide()
+            self.card.hide()
+            for other in self.popups.values():
+                if not getattr(other, "persistent", False):
+                    other.hide()          # the on-screen keyboard stays under a card or a list
+            popup.show(env, x_local, mon)
+
+        def bar_long(self, p):
+            s = p["session"]
+            if not p["done"] and self.session is s and s.moved <= BAR_MOVE_TOL:
+                p["done"] = True
+                self.long_press(p)
+            return False
+
+        def tap(self, p):
+            s = p["session"]
+            _, touch = module_spec(p["module"])
+            log(f"tap: {p['module']} -> {touch.get('popup') or touch.get('click') or '(no action)'}")
+            popup = self.popups.get(touch.get("popup"))
+            if popup:
+                self.open_popup(popup, p["env"], s.lx0, s.mon)
+                return
+            self.dismiss_all(f"tap on {p['module']}")
+            if touch.get("tap-card"):
+                self.act_and_card(p["module"], p["env"], s.lx0, s.mon)
+                return
+            self.act_and_report(p["module"], with_target_window(p["module"], p["env"]), s.lx0, s.mon,
+                                cmd=touch.get("click"), label_text=touch.get("click-label"))
+
+        def act_and_card(self, name, env, x_local, mon):
+            """"tap-card": a tap or click only opens the card; its first button runs
+            the action. Voice typing, 2026-09-25: "tap: start or stop recording"
+            should be the trigger, a tap that already recorded was not intuitive."""
+            self.card.show(name, env, x_local, mon)
+
+        def long_press(self, p):
+            s = p["session"]
+            log(f"long press: {p['module']}")
+            self.dismiss_all(f"long press on {p['module']}")
+            self.card.show(p["module"], p["env"], s.lx0, s.mon)
+
+        def act_and_report(self, name, env, x_local, mon, cmd=None, label_text=None):
+            """Run cmd (if any), then toast the module's state before -> after."""
+            title = title_of(name)
+
+            _, touch = module_spec(name)
+            if cmd and touch.get("toast") is False:
+                # No toast wanted: run the action at once. Reading the state first
+                # only delayed the tap (a process spawn) for a toast never shown.
+                run_click(touch, env) if cmd == touch.get("click") else run_detached(cmd, env)
+                return
+
+            def work():
+                before, _ = module_state(name, env)
+                after = before
+                if cmd:
+                    proc = subprocess.Popen(["sh", "-c", cmd], env=env, start_new_session=True,
+                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL)
+                    try:
+                        proc.wait(timeout=1.5)
+                    except subprocess.TimeoutExpired:
+                        threading.Thread(target=proc.wait, daemon=True).start()
+                    for delay in (0.15, 0.4, 0.8):
+                        time.sleep(delay)
+                        after, _ = module_state(name, env)
+                        if after != before:
+                            break
+                # No popup when the tap opened something (state unchanged: the new
+                # window is the feedback) or when the module opts out ("toast": false).
+                _, touch = module_spec(name)
+                if touch.get("toast") is False or (cmd and after == before):
+                    return
+                GLib.idle_add(self.toast.show, title, after, x_local, mon)
+            threading.Thread(target=work, daemon=True).start()
+
+        # ── control socket ──
+        def serve(self):
+            try:
+                os.unlink(SOCK)
+            except OSError:
+                pass
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(SOCK)
+            os.chmod(SOCK, 0o600)
+            srv.listen(8)
+
+            def loop():
+                while True:
+                    conn, _ = srv.accept()
+                    threading.Thread(target=self.handle_conn, args=(conn,), daemon=True).start()
+            threading.Thread(target=loop, daemon=True).start()
+
+        def handle_conn(self, conn):
+            try:
+                conn.settimeout(2)
+                data = b""
+                while True:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+                msg = json.loads(data or b"{}")
+                done = threading.Event()
+                box = {}
+
+                def on_main():
+                    try:
+                        box["reply"] = self.dispatch(msg)
+                    except Exception as exc:  # never kill the daemon on a bad request
+                        log(f"request {msg.get('cmd')} failed: {exc!r}")
+                        box["reply"] = {"error": repr(exc)}
+                    done.set()
+                    return False
+                GLib.idle_add(on_main)
+                done.wait(2)
+                conn.sendall(json.dumps(box.get("reply", {})).encode())
+            except (OSError, ValueError) as exc:
+                log(f"bad request: {exc}")
+            finally:
+                conn.close()
+
+        def dispatch(self, msg):
+            cmd = msg.get("cmd")
+            if cmd == "click":
+                verdict = self.on_click(msg)
+                log(f"click {msg.get('module')}: {verdict}")
+                return {"verdict": verdict}
+            if cmd == "mouse":
+                want = msg.get("set", "toggle")
+                self.set_mouse(not self.mouse if want == "toggle" else want == "on")
+                return {"mouse": self.mouse}
+            if cmd == "overview":
+                self.overview.toggle()
+                return {}
+            if cmd == "status":
+                kbd = self.popups.get("keyboard")
+                return {"mouse": self.mouse, "devices": [f"{t.dev.name} {t.dev.path} grabbed={t.grabbed}"
+                                                         for t in self.devs.values()],
+                        "bar_h": self.bar_h, "touching": self.session is not None,
+                        "keyboard": bool(kbd and kbd.win)}
+            return {"error": f"unknown cmd {cmd}"}
+
+    daemon = Daemon()
+    daemon.serve()
+    daemon.scan()
+    GLib.timeout_add_seconds(5, daemon.scan)
+    if mouse_mode_on():
+        daemon.set_mouse(True)
+
+    def quit_(*_):
+        daemon.release_buttons()
+        for td in list(daemon.devs.values()):
+            daemon.grab(td, False)
+        Gtk.main_quit()
+    import signal
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        add_signal = GLibUnix.signal_add
+    except (ValueError, ImportError):
+        add_signal = GLib.unix_signal_add
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        add_signal(GLib.PRIORITY_DEFAULT, sig, quit_)
+    log(f"bar-touch daemon up; mouse mode {'ON' if daemon.mouse else 'OFF'}")
+    Gtk.main()
+
+
+def main():
+    args = sys.argv[1:] or ["status"]
+    cmd = args[0]
+    if cmd == "daemon":
+        cmd_daemon()
+    elif cmd == "click" and len(args) > 1:
+        cmd_click(args[1])
+    elif cmd == "mouse":
+        cmd_mouse(args[1] if len(args) > 1 else "toggle")
+    elif cmd == "mouse-status":
+        cmd_mouse_status()
+    elif cmd == "overview":
+        if send({"cmd": "overview"}) is None:
+            sys.exit("bar-touch daemon is not running")
+    elif cmd == "status":
+        reply = send({"cmd": "status"})
+        print(json.dumps(reply, indent=2) if reply is not None else "bar-touch daemon is not running")
+    else:
+        print(__doc__.split("Usage:")[1].strip(), file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

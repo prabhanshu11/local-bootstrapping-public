@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Stand-in for a `claude -p` call that never answers (offline after resume):
+prints the init line, then hangs. Use with WSL_FIRST_EVENT_S=5 to test the
+watchdog quickly."""
+import json, time
+print(json.dumps({"type": "system", "subtype": "init"}), flush=True)
+import sys; print("API error: connect ETIMEDOUT (simulated)", file=sys.stderr, flush=True)
+time.sleep(600)

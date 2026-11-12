@@ -1,0 +1,14 @@
+# ~/.config/mako/config links here on every machine (install.sh SYMLINKS; the
+# sync replaces Omarchy's stock link to the theme's mako.ini, kept as config.bak:
+# LB_STOCK_LINKS in scripts/lib/reconcile.sh). Theme switching still works:
+# current/theme follows omarchy-theme-set (which runs makoctl reload), so this
+# include loads the active theme's colours and Omarchy's core.ini, whose
+# [mode=do-not-disturb] the desktop's wall-guard relies on.
+include=~/.config/omarchy/current/theme/mako.ini
+
+# Chrome web notifications (ads/promos from sites): show for 1 minute,
+# left-click opens the site as usual (right-click dismisses). Added 2026-11-07;
+# both machines 2026-11-10 ("yes to chrome rule"). No invisible= here, so DND hides them.
+[app-name="Google Chrome"]
+default-timeout=60000
+ignore-timeout=1

@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# close-all-guard — make sure nothing can close every window at once.
+#
+# Why this exists (2026-10-26): Omarchy binds Ctrl+Alt+Delete to
+# omarchy-hyprland-window-close-all, which sends closewindow to EVERY client
+# with no confirmation. One stray chord at 12:16 closed all terminals, Firefox,
+# Chrome and 8 Claude sessions. Doc:
+# docs/issues/ctrl-alt-delete-closed-all-windows-2026-10-26.md
+#
+# Layers (each one alone is enough):
+#   1. bindings-no-close-all.conf unbinds the chord at every config load.
+#   2. This script deletes the close-all script itself, so even a bind that
+#      sneaks back (Omarchy update, new default file) runs nothing.
+#   3. This script inspects the LIVE binds and unbinds any that would run it.
+# Triggered by close-all-guard.path (the moment the script reappears) and by
+# close-all-guard.timer (every minute, catches a bind that comes back alone).
+#
+# omarchy-cmd-reboot/-shutdown also call the script; without it they just skip
+# the graceful close and reboot anyway (no `set -e` there).
+#
+# Usage: close-all-guard          # check and repair
+#        close-all-guard --check  # report only; exit 1 if anything is unsafe
+
+set -u
+CHECK_ONLY=0
+[[ "${1:-}" == "--check" ]] && CHECK_ONLY=1
+
+SCRIPT_NAME=omarchy-hyprland-window-close-all
+OMARCHY_PATH="${OMARCHY_PATH:-$HOME/.local/share/omarchy}"
+LOG="$HOME/.local/state/close-all-guard.log"
+mkdir -p "$(dirname "$LOG")"
+unsafe=0
+
+log() { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
+alert() {
+    log "$*"
+    command -v notify-send >/dev/null && notify-send -u critical "close-all-guard" "$*" 2>/dev/null || true
+}
+
+# --- Layer 2: the script file(s) -------------------------------------------
+paths=("$OMARCHY_PATH/bin/$SCRIPT_NAME")
+while IFS= read -r p; do paths+=("$p"); done < <(type -ap "$SCRIPT_NAME" 2>/dev/null)
+for p in $(printf '%s\n' "${paths[@]}" | sort -u); do
+    [[ -e "$p" || -L "$p" ]] || continue
+    unsafe=1
+    if (( CHECK_ONLY )); then
+        log "UNSAFE: $p exists"
+    elif rm -f -- "$p"; then
+        alert "Removed $p (it had come back)"
+    else
+        alert "FAILED to remove $p"
+    fi
+done
+
+# --- Layer 3: live binds ---------------------------------------------------
+# Any bind that runs the script, or a closewindow dispatcher with no specific
+# target, is removed for this session. Skipped quietly when Hyprland is not up.
+if command -v hyprctl >/dev/null && binds=$(timeout 5 hyprctl binds -j 2>/dev/null) && [[ -n "$binds" ]]; then
+    while IFS=$'\t' read -r mods key desc; do
+        [[ -n "$key" ]] || continue
+        unsafe=1
+        if (( CHECK_ONLY )); then
+            log "UNSAFE: live bind ${mods:-<none>}+$key ($desc)"
+        else
+            timeout 5 hyprctl keyword unbind "$mods, $key" >/dev/null 2>&1
+            alert "Unbound live ${mods:-<none>}+$key ($desc) — it would close all windows"
+        fi
+    done < <(jq -r --arg s "$SCRIPT_NAME" '
+        def mods: [ (if (.modmask/1|floor) % 2 >= 1 then "SHIFT" else empty end),
+                    (if (.modmask/4|floor) % 2 >= 1 then "CTRL" else empty end),
+                    (if (.modmask/8|floor) % 2 >= 1 then "ALT" else empty end),
+                    (if (.modmask/64|floor) % 2 >= 1 then "SUPER" else empty end) ] | join(" ");
+        .[] | select((.arg | contains($s)) or (.arg | test("close-?all"; "i")))
+            | [mods, .key, (if (.description // "") == "" then .arg else .description end)] | @tsv' <<< "$binds")
+fi
+
+if (( CHECK_ONLY )); then
+    (( unsafe )) && exit 1
+    echo "close-all-guard: safe (no close-all script, no live close-all bind)"
+fi
+exit 0

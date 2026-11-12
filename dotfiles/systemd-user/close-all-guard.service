@@ -1,0 +1,9 @@
+[Unit]
+Description=close-all-guard — keep Ctrl+Alt+Delete from closing every window
+After=graphical-session.target
+# See dotfiles/local-bin/close-all-guard and
+# docs/issues/ctrl-alt-delete-closed-all-windows-2026-10-26.md
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/close-all-guard

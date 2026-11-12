@@ -1,0 +1,210 @@
+#!/bin/bash
+# ydotool-layout - Layout-aware ydotool wrapper
+#
+# Intercepts ydotool key commands and translates QWERTY-assumed keycodes
+# to the correct keycodes for the current keyboard layout.
+#
+# Problem: Applications using ydotool hardcode QWERTY keycodes.
+#          In Dvorak, keycode 47 produces '>' not 'v', breaking Ctrl+V.
+#
+# Solution: Translate keycodes based on current layout:
+#          1. Reverse lookup: QWERTY keycode → character
+#          2. Forward lookup: character → current layout keycode
+#
+# Usage:
+#   ydotool-layout key 29:1 47:1 47:0 29:0   # Ctrl+V (translated)
+#   ydotool-layout type "hello"               # Passed through unchanged
+#
+# Install as system ydotool replacement for transparent operation.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+KEYMAPS_DIR="${KEYMAPS_DIR:-/home/prabhanshu/.local/bin/keymaps}"
+
+# Find the real ydotool binary
+find_real_ydotool() {
+    # Check for our renamed original
+    if [[ -x "/usr/bin/ydotool.real" ]]; then
+        echo "/usr/bin/ydotool.real"
+        return
+    fi
+
+    # Check standard location (when not installed system-wide)
+    if [[ -x "/usr/bin/ydotool" ]]; then
+        # Make sure it's not us (avoid infinite loop)
+        local resolved
+        resolved=$(readlink -f "/usr/bin/ydotool" 2>/dev/null || echo "/usr/bin/ydotool")
+        if [[ "$resolved" != "$(readlink -f "$0")" ]]; then
+            echo "/usr/bin/ydotool"
+            return
+        fi
+    fi
+
+    # Fallback: search PATH excluding our directory
+    local dir
+    while IFS= read -r dir; do
+        if [[ "$dir" != "$SCRIPT_DIR" && -x "$dir/ydotool" ]]; then
+            local resolved
+            resolved=$(readlink -f "$dir/ydotool" 2>/dev/null || echo "$dir/ydotool")
+            if [[ "$resolved" != "$(readlink -f "$0")" ]]; then
+                echo "$dir/ydotool"
+                return
+            fi
+        fi
+    done <<< "$(echo "$PATH" | tr ':' '\n')"
+
+    echo "Error: Cannot find real ydotool binary" >&2
+    exit 1
+}
+
+REAL_YDOTOOL="${REAL_YDOTOOL:-$(find_real_ydotool)}"
+
+# Ensure ydotool socket is set
+if [[ -z "${YDOTOOL_SOCKET:-}" ]]; then
+    export YDOTOOL_SOCKET="/run/user/$(id -u)/.ydotool_socket"
+fi
+
+# Detect current keyboard layout
+detect_layout() {
+    local layout
+    layout=$(hyprctl devices -j 2>/dev/null | jq -r '
+        .keyboards[] |
+        select(.main == true or (.name | ascii_downcase | contains("keyboard"))) |
+        .active_keymap' 2>/dev/null | head -1)
+
+    case "$layout" in
+        *[Dd]vorak*)
+            echo "dvorak"
+            ;;
+        *)
+            echo "us"
+            ;;
+    esac
+}
+
+# Load QWERTY reverse map (keycode → character)
+declare -A QWERTY_REVERSE
+load_qwerty_reverse() {
+    local mapfile="$KEYMAPS_DIR/us-reverse.map"
+
+    if [[ ! -f "$mapfile" ]]; then
+        return 1
+    fi
+
+    while IFS='=' read -r keycode char; do
+        [[ "$keycode" =~ ^#.*$ || -z "$keycode" ]] && continue
+        # Strip comments and whitespace
+        char="${char%%#*}"
+        char="${char%% *}"
+        char="${char%%$'\t'*}"
+        [[ -z "$char" ]] && continue
+        QWERTY_REVERSE["$keycode"]="$char"
+    done < "$mapfile"
+}
+
+# Load current layout map (character → keycode)
+declare -A CURRENT_LAYOUT
+load_current_layout() {
+    local layout="$1"
+    local mapfile="$KEYMAPS_DIR/${layout}.map"
+
+    if [[ ! -f "$mapfile" ]]; then
+        return 1
+    fi
+
+    while IFS='=' read -r char keycode; do
+        [[ "$char" =~ ^#.*$ || -z "$char" ]] && continue
+        # Strip comments and whitespace
+        keycode="${keycode%%#*}"
+        keycode="${keycode%% *}"
+        keycode="${keycode%%$'\t'*}"
+        [[ -z "$keycode" ]] && continue
+        CURRENT_LAYOUT["$char"]="$keycode"
+    done < "$mapfile"
+}
+
+# Translate a single keycode from QWERTY to current layout
+translate_keycode() {
+    local keycode="$1"
+
+    # Look up what character this keycode represents in QWERTY
+    local char="${QWERTY_REVERSE[$keycode]:-}"
+
+    if [[ -z "$char" ]]; then
+        # Not a translatable key (modifier, special key, number, or unknown)
+        # Pass through unchanged
+        echo "$keycode"
+        return
+    fi
+
+    # Look up the keycode for this character in current layout
+    local new_keycode="${CURRENT_LAYOUT[$char]:-}"
+
+    if [[ -z "$new_keycode" ]]; then
+        # Character not in current layout map, pass through
+        echo "$keycode"
+        return
+    fi
+
+    echo "$new_keycode"
+}
+
+# Main logic
+main() {
+    # If not a 'key' command, pass through directly
+    # This handles: type, click, mousemove, etc.
+    if [[ "${1:-}" != "key" ]]; then
+        exec "$REAL_YDOTOOL" "$@"
+    fi
+
+    # Detect current layout
+    local layout
+    layout=$(detect_layout)
+
+    # If US/QWERTY, no translation needed - pass through for performance
+    if [[ "$layout" == "us" ]]; then
+        exec "$REAL_YDOTOOL" "$@"
+    fi
+
+    # Load keymaps
+    if ! load_qwerty_reverse; then
+        echo "Warning: Could not load QWERTY reverse map, passing through" >&2
+        exec "$REAL_YDOTOOL" "$@"
+    fi
+
+    if ! load_current_layout "$layout"; then
+        echo "Warning: Could not load $layout map, passing through" >&2
+        exec "$REAL_YDOTOOL" "$@"
+    fi
+
+    # Process key arguments
+    shift  # Remove 'key'
+    local -a translated_args=()
+    local original_args=("$@")
+
+    for arg in "$@"; do
+        if [[ "$arg" =~ ^([0-9]+):([01])$ ]]; then
+            # Format: keycode:state (e.g., 47:1 for key down, 47:0 for key up)
+            local keycode="${BASH_REMATCH[1]}"
+            local state="${BASH_REMATCH[2]}"
+            local new_keycode
+            new_keycode=$(translate_keycode "$keycode")
+            translated_args+=("${new_keycode}:${state}")
+        else
+            # Not a keycode:state format, pass through unchanged
+            translated_args+=("$arg")
+        fi
+    done
+
+    # Debug output
+    if [[ "${DEBUG:-}" == "1" ]]; then
+        echo "ydotool-layout: Layout=$layout" >&2
+        echo "ydotool-layout: Original: key ${original_args[*]}" >&2
+        echo "ydotool-layout: Translated: key ${translated_args[*]}" >&2
+    fi
+
+    exec "$REAL_YDOTOOL" key "${translated_args[@]}"
+}
+
+main "$@"

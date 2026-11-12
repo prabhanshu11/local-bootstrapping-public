@@ -1,0 +1,1 @@
+ACTION=="change", SUBSYSTEM=="power_supply", ATTR{type}=="Mains", ENV{POWER_SUPPLY_TRIGGER}="1", RUN+="/home/prabhanshu/.local/bin/power-profile-monitor switch"

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# fix-active-border — Detect and fix low-contrast active window borders in Hyprland
+#
+# Compares active vs inactive border colors. If they're too similar
+# (Euclidean RGB distance < threshold), overrides active border with
+# a high-visibility fallback. Runs on startup and config reload.
+
+set -euo pipefail
+
+FALLBACK_BORDER="rgba(ff8800ee) rgba(ff2200ee) 45deg"
+MIN_DISTANCE=80  # Euclidean RGB distance threshold (max ~441)
+
+# Only run under Hyprland
+if ! command -v hyprctl &>/dev/null || ! hyprctl monitors &>/dev/null 2>&1; then
+    exit 0
+fi
+
+# Extract first AARRGGBB color from hyprctl getoption output
+# Format: "custom type: AARRGGBB [AARRGGBB...] Xdeg"
+get_color_rgb() {
+    local option="$1"
+    local raw
+    raw=$(hyprctl getoption "$option" 2>/dev/null | head -1)
+    # Extract first hex color (AARRGGBB format)
+    local hex
+    hex=$(echo "$raw" | grep -oP '[0-9a-fA-F]{8}' | head -1)
+    if [[ -z "$hex" ]]; then
+        echo "0 0 0"
+        return
+    fi
+    # AARRGGBB: skip first 2 chars (alpha), extract RR GG BB
+    local r=$((16#${hex:2:2}))
+    local g=$((16#${hex:4:2}))
+    local b=$((16#${hex:6:2}))
+    echo "$r $g $b"
+}
+
+# Compute squared Euclidean distance between two RGB colors (no sqrt needed)
+rgb_distance_sq() {
+    local r1=$1 g1=$2 b1=$3 r2=$4 g2=$5 b2=$6
+    local dr=$((r1 - r2))
+    local dg=$((g1 - g2))
+    local db=$((b1 - b2))
+    echo $((dr*dr + dg*dg + db*db))
+}
+
+read -r ar ag ab <<< "$(get_color_rgb general:col.active_border)"
+read -r ir ig ib <<< "$(get_color_rgb general:col.inactive_border)"
+
+MIN_DISTANCE_SQ=$((MIN_DISTANCE * MIN_DISTANCE))  # Compare squared to avoid sqrt
+distance_sq=$(rgb_distance_sq "$ar" "$ag" "$ab" "$ir" "$ig" "$ib")
+
+if (( distance_sq < MIN_DISTANCE_SQ )); then
+    echo "[fix-active-border] Active ($ar,$ag,$ab) too close to inactive ($ir,$ig,$ib) — distance²=$distance_sq < $MIN_DISTANCE_SQ"
+    echo "[fix-active-border] Applying fallback: $FALLBACK_BORDER"
+    hyprctl keyword general:col.active_border "$FALLBACK_BORDER"
+else
+    echo "[fix-active-border] Border contrast OK — distance²=$distance_sq (active: $ar,$ag,$ab / inactive: $ir,$ig,$ib)"
+fi

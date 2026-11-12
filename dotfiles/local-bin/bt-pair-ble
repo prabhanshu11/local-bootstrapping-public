@@ -1,0 +1,87 @@
+#!/bin/bash
+# bt-pair-ble - BLE HID device pairing helper
+# Handles the persistent agent pattern required for BLE mice/keyboards
+#
+# Usage: bt-pair-ble <MAC_ADDRESS>
+#        bt-pair-ble scan
+#
+# Requires: bluez-utils, bluez-hid2hci
+
+set -euo pipefail
+
+usage() {
+    echo "Usage: bt-pair-ble <MAC_ADDRESS>"
+    echo "       bt-pair-ble scan"
+    echo ""
+    echo "Examples:"
+    echo "  bt-pair-ble scan                    # Scan for nearby devices"
+    echo "  bt-pair-ble 02:00:00:00:00:03      # Pair with specific device"
+    exit 1
+}
+
+scan_devices() {
+    echo "Scanning for BLE devices (15 seconds)..."
+    echo "Put your device in pairing mode now."
+    echo ""
+    bluetoothctl --timeout 15 scan on 2>&1 | grep -E "NEW|CHG.*Name" || true
+    echo ""
+    echo "Known devices:"
+    bluetoothctl devices
+}
+
+pair_device() {
+    local MAC="$1"
+
+    # Validate MAC format
+    if ! [[ "$MAC" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+        echo "Error: Invalid MAC address format"
+        echo "Expected format: XX:XX:XX:XX:XX:XX"
+        exit 1
+    fi
+
+    echo "Pairing with $MAC..."
+    echo "Ensure device is in pairing mode."
+    echo ""
+
+    # Pair with persistent NoInputNoOutput agent
+    # Note: Don't remove device first - BLE devices disappear when removed
+    # Must scan during pairing to keep device discoverable
+    {
+        echo "power on"
+        sleep 0.5
+        echo "agent NoInputNoOutput"
+        sleep 0.5
+        echo "default-agent"
+        sleep 0.5
+        echo "scan on"
+        sleep 5
+        echo "trust $MAC"
+        sleep 0.5
+        echo "pair $MAC"
+        sleep 12
+        echo "connect $MAC"
+        sleep 3
+        echo "quit"
+    } | bluetoothctl 2>&1
+
+    echo ""
+    echo "=== Result ==="
+    bluetoothctl info "$MAC" 2>/dev/null | grep -E "Name|Paired|Bonded|Connected|Trusted" || echo "Device not found"
+}
+
+# Main
+if [[ $# -eq 0 ]]; then
+    usage
+fi
+
+case "$1" in
+    scan)
+        scan_devices
+        ;;
+    -h|--help)
+        usage
+        ;;
+    *)
+        pair_device "$1"
+        ;;
+esac

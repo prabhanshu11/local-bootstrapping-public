@@ -1,0 +1,28 @@
+#!/bin/bash
+# hyprwhspr-tray - Wrapper for hyprwhspr tray that adds shortcut to tooltip
+#
+# Calls the system hyprwhspr-tray.sh and modifies the JSON output to include
+# the voice typing shortcut (Super+`) in the tooltip.
+
+SYSTEM_TRAY="/usr/lib/hyprwhspr/config/hyprland/hyprwhspr-tray.sh"
+
+# Get the command (status, toggle, restart, etc.)
+cmd="${1:-status}"
+
+# Call the system tray script
+output=$("$SYSTEM_TRAY" "$cmd" 2>/dev/null)
+
+# If this is a status command, modify the tooltip to add the shortcut
+if [[ "$cmd" == "status" && -n "$output" ]]; then
+    # Add shortcut info to tooltip using jq if available, otherwise sed
+    if command -v jq &>/dev/null; then
+        # Use jq to properly modify the JSON
+        output=$(echo "$output" | jq -c '.tooltip = .tooltip + "\n\nSuper+`: Toggle voice typing"')
+    else
+        # Fallback: use sed to inject before the last quote of tooltip
+        # Find the tooltip field and append the shortcut
+        output=$(echo "$output" | sed 's/"tooltip":"\([^"]*\)"/"tooltip":"\1\\n\\nSuper+`: Toggle voice typing"/')
+    fi
+fi
+
+echo "$output"

@@ -1,0 +1,21 @@
+# Voice Typing Target - Manages the complete voice typing stack
+# Part of local-bootstrapping
+#
+# This target ensures all voice typing services start in the correct order:
+# 1. GPG secrets are unlocked
+# 2. Voice gateway starts with API key
+# 3. Voice controller and hyprwhspr are ready
+#
+# Usage:
+#   systemctl --user status voice-typing.target
+#   systemctl --user restart voice-typing.target
+
+[Unit]
+Description=Voice Typing Stack (hyprwhspr + gateway + controller)
+Documentation=https://github.com/prabhanshu11/omarchy-voice-typing
+Requires=gpg-secrets-loader.service
+After=gpg-secrets-loader.service graphical-session.target
+Wants=voice-gateway.service voice-toggle.service hyprwhspr.service
+
+[Install]
+WantedBy=graphical-session.target

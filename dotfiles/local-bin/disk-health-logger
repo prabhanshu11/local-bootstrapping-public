@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""disk-health-logger: week-long, low-impact record of btrfs commit stalls and system pressure.
+
+Why (2026-11-01, docs/issues/btrfs-commit-stall/README.md): btrfs commits took 25-35 s with full
+qgroup accounting; after `btrfs quota disable /` they took 38 ms. This logger records whether that
+holds for a week, for the review agent scheduled by disk-health-review.timer.
+
+Low impact by design (his words: "logs which themselves don't cause system to slow down"):
+- Samples every 5 s from /sys and /proc only (kernel memory, no disk I/O).
+- Aggregates to ONE row per minute, buffered in RAM; appends to disk every 15 min (and on stop),
+  one write() per flush, no fsync. Loss window on a crash: <= 15 min.
+- One probe per minute: rewrite 1 byte + fsync of a 1-byte file, run in a side thread so a stalled
+  probe never stalls sampling (a stall is recorded as "still running" with its age).
+- Nice 19 / idle I/O class / tiny CPU weight from the unit.
+
+Self-check against "everything slow together": durations come from CLOCK_MONOTONIC (hardware
+clocksource, not slowed by load), btrfs's own commit timer (kernel ktime), and the logger's own
+wake-up lag (how late a 5 s sleep returned) is logged as a direct measure of scheduler slowness.
+
+Output: ~/logs/disk-health/YYYY-MM-DD.csv (UTC dates), header in each new file.
+Usage: disk-health-logger [run|once]
+"""
+import os, signal, sys, threading, time, glob
+
+SAMPLE_S = 5
+FLUSH_S = int(os.environ.get("DISK_HEALTH_FLUSH_S", 900))
+OUT_DIR = os.path.expanduser(os.environ.get("DISK_HEALTH_DIR", "~/logs/disk-health"))
+PROBE = os.path.expanduser("~/.cache/disk-health-probe")
+COLS = ["utc", "commits", "commit_ms_max", "commit_ms_last", "cur_commit_ms_max", "fsync_ms",
+        "psi_io_some10_max", "psi_io_full10_max", "psi_mem_some10_max", "psi_cpu_some10_max",
+        "mem_avail_mb_min", "swap_used_mb", "dirty_mb_max", "load1", "wake_lag_ms_max",
+        "qgroups_on", "samples"]
+
+
+def btrfs_sysdir():
+    try:
+        uuid = os.popen("findmnt -no UUID /").read().strip()
+        d = f"/sys/fs/btrfs/{uuid}"
+        return d if os.path.isdir(d) else None
+    except Exception:
+        return None
+
+
+def read_kv(path):
+    out = {}
+    try:
+        for line in open(path):
+            p = line.split()
+            if len(p) >= 2:
+                out[p[0].rstrip(":")] = p[1]
+    except OSError:
+        pass
+    return out
+
+
+def psi(kind):
+    some = full = 0.0
+    try:
+        for line in open(f"/proc/pressure/{kind}"):
+            f = dict(x.split("=") for x in line.split()[1:])
+            if line.startswith("some"):
+                some = float(f["avg10"])
+            else:
+                full = float(f["avg10"])
+    except OSError:
+        pass
+    return some, full
+
+
+class Prober(threading.Thread):
+    """Runs one fsync probe at a time; exposes the last result or the age of a running one."""
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.ev = threading.Event()
+        self.started = None
+        self.last_ms = None
+        os.makedirs(os.path.dirname(PROBE), exist_ok=True)
+
+    def run(self):
+        while True:
+            self.ev.wait(); self.ev.clear()
+            t = time.monotonic(); self.started = t
+            try:
+                fd = os.open(PROBE, os.O_WRONLY | os.O_CREAT, 0o644)
+                os.pwrite(fd, b"x", 0); os.fsync(fd); os.close(fd)
+                self.last_ms = (time.monotonic() - t) * 1000
+            except OSError:
+                self.last_ms = -1
+            self.started = None
+
+    def kick(self):
+        if self.started is None:
+            self.ev.set()
+
+    def take(self):
+        """Result for this minute: last finished ms, or the running age if still stuck."""
+        if self.started is not None:
+            return (time.monotonic() - self.started) * 1000, True
+        v, self.last_ms = self.last_ms, None
+        return v, False
+
+
+def main(once=False):
+    sysd = btrfs_sysdir()
+    os.makedirs(OUT_DIR, exist_ok=True)
+    buf = []
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    prober = Prober(); prober.start()
+
+    def flush():
+        if not buf:
+            return
+        by_day = {}
+        for row in buf:
+            by_day.setdefault(row[0][:10], []).append(row)
+        for day, rows in by_day.items():
+            p = f"{OUT_DIR}/{day}.csv"
+            new = not os.path.exists(p)
+            data = (",".join(COLS) + "\n" if new else "") + "".join(",".join(map(str, r)) + "\n" for r in rows)
+            with open(p, "a") as f:
+                f.write(data)
+        buf.clear()
+
+    cs = read_kv(f"{sysd}/commit_stats") if sysd else {}
+    prev_commits = int(cs.get("commits", 0))
+    minute = None; agg = None; last_flush = time.monotonic()
+    next_t = time.monotonic()
+    while not stop.is_set():
+        now_m = time.monotonic()
+        lag = max(0.0, (now_m - next_t) * 1000)
+        cs = read_kv(f"{sysd}/commit_stats") if sysd else {}
+        commits = int(cs.get("commits", 0)); last = int(cs.get("last_commit_ms", 0)); cur = int(cs.get("cur_commit_ms", 0))
+        mi = read_kv("/proc/meminfo")
+        io_s, io_f = psi("io"); mem_s, _ = psi("memory"); cpu_s, _ = psi("cpu")
+        utc_min = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime())
+        if minute != utc_min:
+            if agg is not None:
+                f_ms, stuck = prober.take()
+                agg["fsync_ms"] = "" if f_ms is None else (f"{f_ms:.0f}+" if stuck else f"{f_ms:.1f}")
+                buf.append([agg[c] for c in COLS])
+            prober.kick()
+            minute = utc_min
+            agg = {c: 0 for c in COLS}; agg.update(utc=utc_min, mem_avail_mb_min=10**9, commit_ms_last="")
+        new = commits - prev_commits; prev_commits = commits
+        if new > 0:
+            agg["commits"] += new
+            agg["commit_ms_max"] = max(agg["commit_ms_max"], last)
+            agg["commit_ms_last"] = last
+        agg["cur_commit_ms_max"] = max(agg["cur_commit_ms_max"], cur)
+        agg["psi_io_some10_max"] = max(agg["psi_io_some10_max"], io_s)
+        agg["psi_io_full10_max"] = max(agg["psi_io_full10_max"], io_f)
+        agg["psi_mem_some10_max"] = max(agg["psi_mem_some10_max"], mem_s)
+        agg["psi_cpu_some10_max"] = max(agg["psi_cpu_some10_max"], cpu_s)
+        agg["mem_avail_mb_min"] = min(agg["mem_avail_mb_min"], int(mi.get("MemAvailable", 0)) // 1024)
+        agg["swap_used_mb"] = (int(mi.get("SwapTotal", 0)) - int(mi.get("SwapFree", 0))) // 1024
+        agg["dirty_mb_max"] = max(agg["dirty_mb_max"], int(mi.get("Dirty", 0)) // 1024)
+        agg["load1"] = open("/proc/loadavg").read().split()[0]
+        agg["wake_lag_ms_max"] = max(agg["wake_lag_ms_max"], round(lag))
+        agg["qgroups_on"] = int(bool(sysd) and os.path.isdir(f"{sysd}/qgroups"))
+        agg["samples"] += 1
+        if once:
+            print(dict(agg)); return
+        if time.monotonic() - last_flush >= FLUSH_S:
+            flush(); last_flush = time.monotonic()
+        next_t += SAMPLE_S
+        if next_t < time.monotonic():          # fell behind (system stalled): don't burst-catch-up
+            next_t = time.monotonic() + SAMPLE_S
+        stop.wait(max(0, next_t - time.monotonic()))
+    if agg is not None and agg["samples"]:
+        f_ms, stuck = prober.take()
+        agg["fsync_ms"] = "" if f_ms is None else (f"{f_ms:.0f}+" if stuck else f"{f_ms:.1f}")
+        buf.append([agg[c] for c in COLS])
+    flush()
+
+
+if __name__ == "__main__":
+    main(once=(sys.argv[1:2] == ["once"]))

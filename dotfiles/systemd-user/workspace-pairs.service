@@ -1,0 +1,22 @@
+# Keeps two-monitor virtual desktops in sync (see workspace-pairs-daemon).
+#
+# Same graphical-session pattern as voice-toggle.service:
+#   - After=graphical-session.target (wait for compositor)
+#   - WantedBy=graphical-session.target (start WITH compositor, not before)
+# Restart=always: the daemon exits when Hyprland's event socket closes
+# (compositor restart) and must come back with the new instance.
+
+[Unit]
+Description=Workspace pairs daemon - virtual desktops across monitors
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/workspace-pairs-daemon
+Restart=always
+RestartSec=3
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+[Install]
+WantedBy=graphical-session.target

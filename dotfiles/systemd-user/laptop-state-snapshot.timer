@@ -1,0 +1,12 @@
+[Unit]
+Description=Snapshot open windows and Claude Code sessions every 5 minutes
+
+[Timer]
+# OnCalendar, not OnUnitActiveSec — see power-profile-watchdog.timer for why
+# monotonic timers silently die on this machine.
+OnCalendar=*-*-* *:0/5:40
+AccuracySec=10s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

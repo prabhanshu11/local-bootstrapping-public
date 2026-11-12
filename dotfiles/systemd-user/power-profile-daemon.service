@@ -1,0 +1,21 @@
+[Unit]
+Description=power-profile-daemon: RAM-resident power-profile bar button (no disk on the tap path)
+Documentation=file://%h/Programs/local-bootstrapping/docs/issues/power-button-ram-resident-risk-analysis.md
+After=graphical-session.target dbus.socket
+PartOf=graphical-session.target
+
+[Service]
+Environment=PYTHONUNBUFFERED=1
+# Byte-compiled caches would be written beside the script under ~ (btrfs).
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=%h/.local/bin/power-profile-daemon daemon
+Restart=always
+RestartSec=1
+# Stay in RAM: swap here is zram (full) + a swapfile on the same btrfs device whose
+# commits stall for 25-35 s. MEMLOCK is 8 MB, so no mlockall; the memory
+# controller is delegated to user@1000, so these two lines do it.
+MemorySwapMax=0
+MemoryLow=64M
+
+[Install]
+WantedBy=graphical-session.target

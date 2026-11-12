@@ -1,0 +1,13 @@
+[Unit]
+Description=Poll for a wedged Wi-Fi link (associated but no IP)
+
+[Timer]
+# 30s after boot gives iwd + DHCP a fair chance before the first check
+# (a healthy boot has a lease ~10s after association).
+OnBootSec=30
+OnUnitActiveSec=15
+AccuracySec=5s
+Unit=wifi-wedge-watchdog.service
+
+[Install]
+WantedBy=timers.target
